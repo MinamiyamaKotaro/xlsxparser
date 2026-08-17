@@ -84,6 +84,11 @@ impl Sheet {
     /// 空セル（`value: None`, `style: None`）をプレースホルダーとして挿入する。
     /// これにより `iter_cells` が必ず起点セルを拾い、`json.rs` が row_span/col_span
     /// を含む結合情報を取りこぼさないことを保証する。
+    /// 終点座標（`region.end`）は `cells` に挿入されない仮想セルのため、
+    /// `insert_cell` 経由では `max_row`/`max_col` に反映されない。結合範囲の
+    /// 右下が実際の使用範囲の最大値になるケース（例: 実データはA1のみだが
+    /// A1:C3として結合されている）を取りこぼさないよう、ここで明示的に
+    /// 終点座標を用いて更新する。
     pub(crate) fn insert_merge(&mut self, region: MergedRegion) {
         if !self.cells.contains_key(&region.start) {
             self.insert_cell(region.start, Cell { value: None, style: None });
@@ -97,6 +102,8 @@ impl Sheet {
             }
         }
         self.merged_regions.insert(region.start, region);
+        self.max_row = self.max_row.max(region.end.row);
+        self.max_col = self.max_col.max(region.end.col);
     }
 
     /// 起点セルが属する結合範囲をO(1)で取得する（json.rsのrow_span/col_span算出用）。
@@ -129,11 +136,12 @@ impl Sheet {
 - `merged_region_at` が起点セル座標から対応する `MergedRegion` をO(1)で取得できることの確認（結合範囲を多数持つシートでの動作確認を含む）
 - `iter_cells` が起点セルのみを返し、仮想セル座標を含まないことの確認
 - `insert_cell` 呼び出しのたびに `max_row` / `max_col` が正しく更新されることの確認（`<dimension>` を信頼せずに算出できることの確認）
-- **値も書式も持たない結合範囲に対して `insert_merge` を呼んだ場合、起点セルが空セルとして `cells` に挿入され、`iter_cells` / `merged_region_at` から正しく参照できることの確認**（今回追加の回帰テスト観点）
+- **値も書式も持たない結合範囲に対して `insert_merge` を呼んだ場合、起点セルが空セルとして `cells` に挿入され、`iter_cells` / `merged_region_at` から正しく参照できることの確認**（PR #5 レビューで追加した回帰テスト観点）
+- **実データが `A1` のみだが `A1:C3` として結合されているケースで、`insert_merge` 呼び出し後に `max_row == 3` かつ `max_col == 3` となることの確認**（結合範囲の終点がシートの実質的な使用範囲を広げるケースの回帰テスト）
 
 ## 未決事項 / オープンクエスチョン
 
-1. ~~シート次元（使用範囲）の管理~~ → **解決**: サードパーティ製ツールが生成した `<dimension>` 要素は不正確・欠落することがあるため信頼しない。セル挿入のたびに `max_row` / `max_col` をインクリメンタルに更新し、`Sheet` の公開フィールドとして O(1) で取得できるようにする（[PR #5 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948235239)を踏まえて確定）。
+1. ~~シート次元（使用範囲）の管理~~ → **解決**: サードパーティ製ツールが生成した `<dimension>` 要素は不正確・欠落することがあるため信頼しない。セル挿入のたびに `max_row` / `max_col` をインクリメンタルに更新し、`Sheet` の公開フィールドとして O(1) で取得できるようにする（[PR #5 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948235239)を踏まえて確定）。`insert_merge` は起点セルだけでなく結合範囲の終点座標（`region.end`）でも `max_row`/`max_col` を更新する（仮想セルである終点は `cells` に挿入されないため `insert_cell` 経由では反映されず、別途明示的な更新が必要。[再レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948277539)で指摘・修正）。
 2. **`cells` のキー型**: `HashMap<CellRef, Cell>` と要求仕様書の例示 `HashMap<(u32, u32), Cell>` のどちらを採用するか。`CellRef` は `Hash` を実装済みのため型としては等価だが、可読性・API一貫性の観点でどちらにするか要確認。
 3. **重複／不正な結合範囲の扱い**: 悪意または破損したXLSXが重複する結合範囲を含む場合、`resolve/merge.rs` がどう振る舞うか（エラーで拒否するか、後勝ちで上書きするか）は未決定。本ファイルのAPI（`insert_merge` を複数回呼んだ場合は単純に上書きする実装を想定）は「後勝ち上書き」を前提にしている点に留意。
 4. **凍結行/列など`worksheet.xml`のその他メタデータ**: 要求仕様書では明示されていないが、`freezePane` などを将来的に扱う場合、`Sheet` に持たせるか別型に分離するかは未決定（現時点ではスコープ外として型に含めない）。可視性（`visibility`）については解決済み（workbook.md オープンクエスチョン1参照）。
