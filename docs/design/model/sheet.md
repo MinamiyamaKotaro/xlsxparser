@@ -25,8 +25,12 @@ pub struct MergedRegion {
 }
 
 impl MergedRegion {
-    pub fn row_span(&self) -> u32 { self.end.row - self.start.row + 1 }
-    pub fn col_span(&self) -> u32 { self.end.col - self.start.col + 1 }
+    // `start <= end` は呼び出し側（resolve/merge.rs）が保証すべき事前条件であり、
+    // 本型自体は強制しない。リリースビルドで u32 が静かにアンダーフローするのを
+    // 防ぐため、row_span/col_span では（debugビルドのみ）assertする
+    // （実装時に確定。PR #20 レビューを反映）。
+    pub fn row_span(&self) -> u32 { debug_assert!(self.start.row <= self.end.row); self.end.row - self.start.row + 1 }
+    pub fn col_span(&self) -> u32 { debug_assert!(self.start.col <= self.end.col); self.end.col - self.start.col + 1 }
 }
 
 /// シートの可視性（`workbook.xml` の `<sheet state="...">`）。
@@ -108,6 +112,8 @@ impl Sheet {
     /// A1:C3として結合されている）を取りこぼさないよう、ここで明示的に
     /// 終点座標を用いて更新する。
     pub(crate) fn insert_merge(&mut self, region: MergedRegion) {
+        debug_assert!(region.start.row <= region.end.row);
+        debug_assert!(region.start.col <= region.end.col);
         if !self.cells.contains_key(&region.start) {
             self.insert_cell(region.start, Cell { value: None, style: None });
         }
@@ -129,8 +135,16 @@ impl Sheet {
         self.merged_regions.get(&origin)
     }
 
-    /// 起点セルのみを走査するイテレータ（JSON生成用）。
-    pub fn iter_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)>;
+    /// 起点セルのみを走査するイテレータ（JSON生成用）。`merge_aliases` に
+    /// 含まれる座標は除外する: `parse/worksheet.rs` はストリームする
+    /// `<c>` 要素ごとに `Cell` を挿入するため、結合範囲内で後から
+    /// 仮想セルだと判明する座標（罫線のみのスタイルなど）も `cells` に
+    /// 含まれうる。よって `cells` が起点セルのみを保持するとは限らない
+    /// （実装時に修正。PR #20 レビュー。このフィルタが無いと、そうした
+    /// 仮想セルが `json.rs` の出力に起点セルの重複として漏れ出る）。
+    pub fn iter_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
+        self.cells.iter().filter(|(r, _)| !self.merge_aliases.contains_key(r)).map(|(&r, c)| (r, c))
+    }
 }
 ```
 
@@ -153,6 +167,7 @@ impl Sheet {
 - `MergedRegion::row_span` / `col_span` の境界値テスト（1x1範囲、大きい範囲）
 - `merged_region_at` が起点セル座標から対応する `MergedRegion` をO(1)で取得できることの確認（結合範囲を多数持つシートでの動作確認を含む）
 - `iter_cells` が起点セルのみを返し、仮想セル座標を含まないことの確認
+- **`insert_merge` で仮想／エイリアス座標になる前に `insert_cell` で `cells` に既存エントリがあった座標も、`iter_cells` から正しく除外されることの確認** — `parse/worksheet.rs` が結合範囲内（後に起点でないと判明する座標、例: 罫線のみのスタイル）に `<c>` 要素をストリームするケース（[PR #20 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/20#pullrequestreview-4949786605)で追加した回帰テスト観点。`iter_cells` に `merge_aliases` によるフィルタが無いと、このセルが起点セルの重複として `json.rs` の出力に漏れ出る）
 - `insert_cell` 呼び出しのたびに `max_row` / `max_col` が正しく更新されることの確認（`<dimension>` を信頼せずに算出できることの確認）
 - **値も書式も持たない結合範囲に対して `insert_merge` を呼んだ場合、起点セルが空セルとして `cells` に挿入され、`iter_cells` / `merged_region_at` から正しく参照できることの確認**（PR #5 レビューで追加した回帰テスト観点）
 - **実データが `A1` のみだが `A1:C3` として結合されているケースで、`insert_merge` 呼び出し後に `max_row == 3` かつ `max_col == 3` となることの確認**（結合範囲の終点がシートの実質的な使用範囲を広げるケースの回帰テスト）
