@@ -4,10 +4,10 @@ A lightweight, high-performance `.xlsx` (OOXML) parser library written in Rust.
 
 ## Motivation
 
-`xlsxparser` aims to be a fast, low-memory alternative to existing Rust
-spreadsheet crates (e.g. `umya-spreadsheet`), purpose-built for the kind of
-`.xlsx` files common in Japanese business systems: sheets with an extreme
-number of rows/columns ("方眼紙Excel") and heavy use of merged cells. The
+`xlsxparser` aims to be a fast, low-memory `.xlsx` parser, purpose-built for
+the kind of files common in Japanese business systems: sheets with an
+extreme number of rows/columns ("方眼紙Excel") and heavy use of merged
+cells. The
 goal is to parse and analyze such files without loading a full in-memory
 grid, and to expose the result as JSON that's easy to consume from a
 frontend or another system.
