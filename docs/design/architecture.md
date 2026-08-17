@@ -61,7 +61,11 @@ ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブ�
 
 ### `parse/`
 
-`quick-xml` などXMLパースライブラリへの依存を集約する層。XML要素から純粋な構造体への詰め替えのみを行い、ビジネスロジック（結合セル解決・共有文字列解決など）は持たない。XMLパース時の外部エンティティ展開無効化（XXE対策）は quick-xml の `Reader` 初期化設定であるため、quick-xml依存を集約する本層（`parse/mod.rs`）の責務とする。`parse/worksheet.rs` は行/セルデータと `<mergeCells>` 情報をストリームで順次送出する。
+`quick-xml` などXMLパースライブラリへの依存を集約する層。XML要素から純粋な構造体への詰め替えのみを行い、ビジネスロジック（結合セル解決・共有文字列解決など）は持たない。XMLパース時の外部エンティティ展開無効化（XXE対策）は quick-xml の `Reader` 初期化設定であるため、quick-xml依存を集約する本層（`parse/mod.rs`）の責務とする。
+
+- 各パーサー（`workbook.rs` / `worksheet.rs` 等）が個別に `Reader` を初期化すると設定漏れのリスクがあるため、`parse/mod.rs` にセキュアな `Reader` 生成専用のファクトリ関数（例: `create_secure_reader`）を設け、XXE対策の一元適用を強制する。`parse/` 配下の各モジュールはこのファクトリ経由でのみ `Reader` を取得する。
+
+`parse/worksheet.rs` は行/セルデータと `<mergeCells>` 情報をストリームで順次送出する。
 
 ### `model/`
 
