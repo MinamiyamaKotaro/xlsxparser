@@ -117,16 +117,23 @@ pub(crate) fn read_event<'a>(
 }
 
 /// Reads attribute `name` from `start`. Returns `Error::MissingRequiredElement`
-/// if it is absent. Whether the returned string is fully decoded/unescaped
-/// or kept as raw bytes is to be settled together with the quick-xml version
-/// selection (see Open Question 3).
+/// if it is absent. Fully decoded and unescaped (see Open Question 1 for the
+/// `Attribute::normalized_value` API this ended up using).
 pub(crate) fn required_attr(
     start: &BytesStart<'_>,
     path: &str,
     name: &'static str,
 ) -> Result<String, Error> {
-    let _ = (start, path, name);
-    unimplemented!()
+    for attr in start.attributes() {
+        let attr = attr.map_err(|err| Error::XmlParse { path: path.to_string(), source: Box::new(err) })?;
+        if attr.key.as_ref() == name.as_bytes() {
+            let value = attr
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .map_err(|err| Error::XmlParse { path: path.to_string(), source: Box::new(err) })?;
+            return Ok(value.into_owned());
+        }
+    }
+    Err(Error::MissingRequiredElement { path: path.to_string(), name })
 }
 
 /// Shared helper that extracts text-only content from the rich-text run
@@ -139,12 +146,36 @@ pub(crate) fn required_attr(
 /// interpret this exact same structure (OOXML defines the run layout of
 /// `<si>`/`<is>` identically), so it is centralized here to avoid
 /// duplicating the logic.
+///
+/// Takes `path` (for error context) rather than a caller-owned `buf` like
+/// the draft did: this function reads a variable, unbounded number of
+/// events up to the closing `</si>`/`</is>` tag, so it manages its own
+/// internal buffer rather than threading one through from the caller
+/// (finalized at implementation time). Called with the reader already
+/// positioned just after the opening `<si>`/`<is>` tag.
 pub(crate) fn concat_rich_text<R: BufRead>(
     reader: &mut Reader<R>,
-    buf: &mut Vec<u8>,
+    path: &str,
 ) -> Result<String, Error> {
-    let _ = (reader, buf);
-    unimplemented!()
+    let mut text = String::new();
+    let mut buf = Vec::new();
+    let mut skip_depth: u32 = 0; // inside <rPr>/<rPh>?
+    loop {
+        match read_event(reader, &mut buf, path)? {
+            Event::Start(e) if e.local_name().as_ref() == b"rPr" || e.local_name().as_ref() == b"rPh" => skip_depth += 1,
+            Event::End(e) if e.local_name().as_ref() == b"rPr" || e.local_name().as_ref() == b"rPh" => skip_depth -= 1,
+            Event::Text(e) if skip_depth == 0 => {
+                let decoded = e.decode().map_err(|err| Error::XmlParse { path: path.to_string(), source: Box::new(err) })?;
+                let unescaped = quick_xml::escape::unescape(&decoded).map_err(|err| Error::XmlParse { path: path.to_string(), source: Box::new(err) })?;
+                text.push_str(&unescaped);
+            }
+            Event::End(e) if e.local_name().as_ref() == b"si" || e.local_name().as_ref() == b"is" => break,
+            Event::Eof => return Err(Error::MissingRequiredElement { path: path.to_string(), name: "si/is closing tag" }),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(text)
 }
 ```
 
@@ -178,8 +209,12 @@ pub(crate) fn concat_rich_text<R: BufRead>(
 
 ## Open Questions
 
-1. **Finalizing the quick-xml version and `Reader` configuration API**: tied to [error.md Open Question 1](../error.en.md) and [container/mod.md Open Question 1](../container/mod.en.md). `Reader::config_mut()`'s availability and the names of its settings vary by version, so this file's code sample will need updating to match the actual API once `Cargo.toml` is set up. **`read_event`'s XXE mitigation (unconditionally rejecting `Event::DocType`), however, does not depend on how this open question resolves** (reflects [the security review](../../security/design-review.en.md) Finding 1). The `Event` enum's shape (the existence of the `DocType` variant) has stayed stable across quick-xml's major versions, so changes to configuration-API details like `Reader::config_mut()` have no bearing on this mitigation's effectiveness. That independence is exactly what fundamentally resolves the issue Finding 1 raised with the original design, which rested on "the `Reader`'s default behavior" as an implicit assumption.
+1. ~~Finalizing the quick-xml version and `Reader` configuration API~~ → **Resolved**: quick-xml 0.41. `Reader::config_mut().trim_text(false)` matches the draft exactly. Two API changes from the draft, both surfaced by the compiler as deprecation/missing-method errors rather than silent behavior differences:
+   - `Attribute::unescape_value()` is deprecated in favor of `Attribute::normalized_value(XmlVersion::Implicit1_0)`, used by `required_attr`. It performs the same decode+entity-unescape+AttValue-normalization as the old method.
+   - `BytesText` no longer has an `unescape()` method at all; text-event content now requires two explicit steps — `.decode()` (charset → UTF-8) then the free function `quick_xml::escape::unescape(&decoded)` (entity resolution) — used by `concat_rich_text`.
+
+   `read_event`'s XXE mitigation (unconditionally rejecting `Event::DocType`) was unaffected by either change, confirming the independence this open question anticipated (reflects [the security review](../../security/design-review.en.md) Finding 1): the `Event` enum's shape (the existence of the `DocType` variant) stayed stable across the version bump.
 2. ~~Where the XXE-non-applicability test lives~~ → **Resolved**: centralized in this file's unit tests (reflects the [PR #9 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)). Placing it alongside where `read_event` is defined lets it directly verify the core of the mitigation — that `Event::DocType` is reliably detected and rejected — without repeating it in individual `parse/*.rs` files.
-3. **`required_attr`'s return type**: returning `Cow<str>` or `&str` instead of an allocated `String` could avoid unnecessary allocation, but this is to be settled together with quick-xml's attribute-decoding API (version-dependent).
+3. ~~`required_attr`'s return type~~ → **Resolved for now**: kept as an allocated `String` (not `Cow<str>`/`&str`) for simplicity; `Attribute::normalized_value` already returns `Cow<str>` internally; revisit if profiling shows attribute allocation is a hot path.
 4. ~~How to resolve namespaces (e.g. `r:id`)~~ → **Resolved**: does not adopt `quick_xml::NsReader`'s namespace-URI-based resolution; simplifies to plain string-prefix matching (matching against an attribute name that includes the prefix, e.g. `"r:id"`, when calling `required_attr`) — reflects the [PR #9 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204). This prioritizes requirements chapter 1's "lightweight and fast" policy, given that every major producer (Excel, Google Sheets, LibreOffice, Apache POI, etc.) uses `r` as the relationships-namespace prefix without exception in practice. Even in the very rare case of a legally-formed document that declares the namespace under a different alias, the attribute simply comes back "not found," failing closed as `Error::MissingRequiredElement` rather than silently reading a wrong value.
 5. **`Reader` internal buffer sizing for large streams such as `worksheet.xml`**: quick-xml grows its buffer dynamically by default, but there is room to explicitly tune the initial buffer size for the "grid-paper Excel" sheet sizes the requirements target. To be settled during [worksheet.md](worksheet.en.md)'s design/implementation based on profiling.

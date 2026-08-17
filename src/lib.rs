@@ -8,6 +8,7 @@
 mod container;
 mod error;
 mod model;
+mod parse;
 
 pub use error::{Error, Result};
 pub use model::{

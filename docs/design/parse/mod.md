@@ -171,8 +171,12 @@ pub(crate) fn concat_rich_text<R: BufRead>(
 
 ## 未決事項 / オープンクエスチョン
 
-1. **quick-xmlのバージョン選定と `Reader` 設定APIの確定**: [error.md オープンクエスチョン1](../error.md)・[container/mod.md オープンクエスチョン1](../container/mod.md) と連動する論点。バージョンによって `Reader::config_mut()` の有無や設定項目名が異なるため、`Cargo.toml` 整備時に本ファイルのコード例を実際のAPIに合わせて更新する。**ただし `read_event` によるXXE対策（`Event::DocType` の無条件拒否）自体はこのオープンクエスチョンの解決結果に依存しない**（[セキュリティレビュー](../../security/design-review.md) Finding 1を反映）。`Event` enumの構造（`DocType` バリアントの存在）はquick-xmlの主要バージョンを通じて安定しており、`Reader::config_mut()` のような設定APIの詳細が変わってもXXE対策の実効性には影響しない。この独立性こそが、当初「`Reader` の既定動作という暗黙の前提」に依拠していた設計（Finding 1が指摘した課題）に対する根本的な解決である。
+1. ~~quick-xmlのバージョン選定と `Reader` 設定APIの確定~~ → **解決**: quick-xml 0.41を採用。`Reader::config_mut().trim_text(false)` はドラフト通り。ドラフトからのAPI差分は2点（コンパイルエラー/非推奨警告として顕在化、実装時に修正）:
+   - `Attribute::unescape_value()` は非推奨化されており、`Attribute::normalized_value(XmlVersion::Implicit1_0)` を用いる（`required_attr` で使用）。デコード・実体アンエスケープ・AttValue正規化を単一呼び出しで行う点は旧APIと同等
+   - `BytesText` は `unescape()` メソッドを持たなくなった。テキストイベントの内容は `.decode()`（文字コード→UTF-8）した上でフリー関数 `quick_xml::escape::unescape(&decoded)`（実体解決）を別途呼ぶ2段階が必要（`concat_rich_text` で使用）
+
+   `read_event` によるXXE対策（`Event::DocType` の無条件拒否）はこれらのAPI変更の影響を受けず、このオープンクエスチョンが想定していた独立性が実装でも確認された（[セキュリティレビュー](../../security/design-review.md) Finding 1を反映）。
 2. ~~XXE非該当の実証テストの置き場所~~ → **解決**: 本ファイルのユニットテストへ集約する（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を反映）。`read_event` が定義された箇所と同一ファイルに置くことで、対策の核心（`Event::DocType` を確実に検知・拒否すること）を直接検証できる。個々の `parse/*.rs` 側で重ねて実施しない。
-3. **`required_attr` の返り値の型**: `String`（アンエスケープ・アロケーション済み）ではなく `Cow<str>` や `&str` を返すことで不要なアロケーションを避けられる可能性があるが、quick-xmlの属性デコードAPI（バージョン依存）と合わせて確定させる。
+3. ~~`required_attr` の返り値の型~~ → **暫定解決**: シンプルさを優先し `String`（アロケーション済み）のまま実装した。`Attribute::normalized_value` 自体は内部で `Cow<str>` を返しており、属性アロケーションがホットパスと判明した場合に見直す。
 4. ~~名前空間（`r:id` 等）の解決方式~~ → **解決**: `quick_xml::NsReader` による名前空間URIベースの解決は採用せず、`"r:id"` のようなプレフィックス込みの文字列前方一致（`required_attr` へ渡す属性名にプレフィックスを含めて照合する）で簡略化する（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を反映）。Excel・Google スプレッドシート・LibreOffice・Apache POI等、主要な生成ツールがリレーションシップ名前空間のプレフィックスとして例外なく `r` を使用する実務上の慣行を踏まえ、要求仕様書1章が掲げる「軽量かつ高速」という方針を優先する。仮に別名プレフィックスで宣言された正当だが非常に稀なXMLが入力された場合でも、属性が「見つからない」扱いとなり `Error::MissingRequiredElement` として安全側（fail closed）に倒れるため、誤った値を静かに読み取ってしまうリスクはない。
 5. **`worksheet.xml` のような大容量ストリームに対する `Reader` の内部バッファサイズ**: quick-xmlはデフォルトでバッファを動的に拡張するが、要求仕様書が想定する「方眼紙Excel」規模のシートに対しては初期バッファサイズを明示的にチューニングする余地がある。[worksheet.md](worksheet.md) の設計・実装時にプロファイリング結果を踏まえて確定させる。
