@@ -63,14 +63,14 @@ pub struct Cell {
 }
 ```
 
-`ResolvedStyle` は `model/` 内の別型（`model/mod.rs` もしくは `resolve/style.rs` 側で定義予定）を想定するプレースホルダーで、本ファイルのスコープでは型の存在のみを仮定する。`DateTimeValue` も同様に、具体的な型が未確定なプレースホルダーである。
+`ResolvedStyle` は [`model/style.rs`](style.md) が定義する型（PR #8 レビュー指摘を反映し配置を確定）であり、本ファイルはその存在のみを仮定して使用する。`DateTimeValue` は本ファイル内で定義するプレースホルダーで、具体的な型は未確定である（未決事項4参照）。
 
 ## 依存関係
 
 - 依存先: なし（`model/` 内の兄弟モジュールにも依存しない、リーフモジュール）
 - 依存元: `model::Sheet`（`HashMap<(u32, u32), Cell>` のキーに `CellRef`相当のタプル、または `CellRef` 自体を使う）、`resolve/`、`json.rs`
 
-`resolve/style.rs` は `StyleSheet`（`HashMap<StyleId, Arc<ResolvedStyle>>` を想定）から該当スタイルの `Arc` を各セルへ `clone()` して割り当てる。各セルが `Arc` を通じて実データの所有権（の一部）を持つため、`StyleSheet` コンテナ自体はフェーズ4完了時に破棄でき、`pipeline.rs` が定める即時破棄の方針と、値のコピーを避けたいというメモリ効率要件を両立できる。`resolve/shared_strings.rs` と `Arc<str>` の関係も同様。
+`resolve/style.rs` は [`model/style.rs`](style.md) が定義する `StyleSheet`（`HashMap<StyleId, Arc<ResolvedStyle>>`）から該当スタイルの `Arc` を各セルへ `clone()` して割り当てる。各セルが `Arc` を通じて実データの所有権（の一部）を持つため、`StyleSheet` コンテナ自体はフェーズ4完了時に破棄でき、`pipeline.rs` が定める即時破棄の方針と、値のコピーを避けたいというメモリ効率要件を両立できる。`resolve/shared_strings.rs` と `Arc<str>` の関係も同様。
 
 ## エラー処理方針
 

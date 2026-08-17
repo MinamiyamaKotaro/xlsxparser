@@ -18,10 +18,11 @@ mod merge;
 mod style;
 
 pub use shared_strings::PendingSharedString;
-pub use style::{PendingStyle, ResolvedStyle, StyleId, StyleSheet};
+pub use style::PendingStyle;
 
 use crate::error::Error;
 use crate::model::sheet::{MergedRegion, Sheet};
+use crate::model::style::StyleSheet;
 
 /// Runs Phase 4 resolution over one sheet's worth of unresolved data.
 /// Intended to be called once per sheet by `pipeline.rs`.
@@ -65,6 +66,6 @@ There is no strong ordering requirement among the three sub-steps inside `resolv
 
 ## Open Questions
 
-1. **Which module builds `SharedStringTable` / `StyleSheet`**: `parse/shared_strings.rs` / `parse/styles.rs` are out of scope for this Issue (only the modules listed in architecture.md) and have not been designed yet. The concrete type and location of `SharedStringTable` (`parse::shared_strings` vs. `resolve::shared_strings`) will be finalized when `parse/shared_strings.rs` is designed. `StyleSheet` / `ResolvedStyle` / `StyleId` were defined preemptively in this document set ([style.md](style.en.md)), but consistency will need to be re-checked when `parse/styles.rs` is designed.
+1. **Which module builds `SharedStringTable`**: `parse/shared_strings.rs` is out of scope for this Issue (only the modules listed in architecture.md) and has not been designed yet. The concrete type and location of `SharedStringTable` (`parse::shared_strings` vs. `resolve::shared_strings`) will be finalized when `parse/shared_strings.rs` is designed. `StyleSheet` / `ResolvedStyle` / `StyleId` were defined preemptively on the [`model/style.rs`](../model/style.en.md) side (addresses PR #8 review feedback), but consistency will need to be re-checked when `parse/styles.rs` is designed.
 2. **Validity of the sub-step ordering**: There is currently no strong technical reason for the order "shared-string resolution → style application → merge resolution" beyond the loose requirement that a test should eventually confirm the numFmt date detection in style application does not accidentally overwrite the result of shared-string resolution (`CellValue::Text`). Whether running steps concurrently (not possible under the current design, since it would require simultaneous mutable access to `sheet`) is worthwhile will be reconsidered based on implementation-time profiling.
 3. **How `pending_shared_strings` / `pending_styles` are passed**: Since `parse/worksheet.rs` is not yet designed, it is undecided whether these lists are passed as a batched `Vec`, or resolved incrementally as part of streaming processing interleaved with `Sheet` construction. The current design assumes batched `Vec` passing, following architecture.md's one-directional pipeline policy of "run Phase 4 after Phase 3 completes."

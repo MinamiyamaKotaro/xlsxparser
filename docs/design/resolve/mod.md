@@ -18,10 +18,11 @@ mod merge;
 mod style;
 
 pub use shared_strings::PendingSharedString;
-pub use style::{PendingStyle, ResolvedStyle, StyleId, StyleSheet};
+pub use style::PendingStyle;
 
 use crate::error::Error;
 use crate::model::sheet::{MergedRegion, Sheet};
+use crate::model::style::StyleSheet;
 
 /// 1シート分の未解決データをまとめてフェーズ4の解決処理にかける。
 /// `pipeline.rs` がシートごとに1回呼び出す想定のエントリ関数。
@@ -65,6 +66,6 @@ pub fn resolve_sheet(
 
 ## 未決事項 / オープンクエスチョン
 
-1. **`SharedStringTable` / `StyleSheet` の構築元モジュール**: `parse/shared_strings.rs` / `parse/styles.rs` は本Issueのスコープ外（architecture.md 記載の予定モジュールのみ）でまだ設計されていない。`SharedStringTable` の具体的な型・配置場所（`parse::shared_strings` か `resolve::shared_strings` か）は `parse/shared_strings.rs` の設計時に確定させる。`StyleSheet` / `ResolvedStyle` / `StyleId` は本ドキュメント群（[style.md](style.md)）側で先行して定義したが、`parse/styles.rs` 設計時に整合を再確認する。
+1. **`SharedStringTable` の構築元モジュール**: `parse/shared_strings.rs` は本Issueのスコープ外（architecture.md 記載の予定モジュールのみ）でまだ設計されていない。`SharedStringTable` の具体的な型・配置場所（`parse::shared_strings` か `resolve::shared_strings` か）は `parse/shared_strings.rs` の設計時に確定させる。`StyleSheet` / `ResolvedStyle` / `StyleId` は [`model/style.rs`](../model/style.md) 側で先行して定義した（PR #8 レビュー指摘を反映）が、`parse/styles.rs` 設計時に整合を再確認する。
 2. **サブ処理間の実行順序の妥当性**: 現状「共有文字列解決 → スタイル適用 → 結合解決」の順に強い技術的根拠はなく、将来的にスタイル適用時のnumFmt日付判定が共有文字列解決結果（`CellValue::Text`）を誤って上書きしないことをテストで担保する必要がある程度の緩い依存しかない。並行実行（`sheet` への同時可変アクセスが必要なため現状の設計では不可）にする価値があるかは、実装時のプロファイリング結果を踏まえて再検討する。
 3. **`pending_shared_strings` / `pending_styles` の受け渡し方法**: `parse/worksheet.rs` が未設計のため、これらのリストが `Vec` としてまとめて受け渡されるのか、`Sheet` 構築とインターリーブしたストリーミング処理の一部として逐次解決されるのかは未確定。現状は「フェーズ3完了後にフェーズ4を実行する」という architecture.md の一方向パイプライン方針に従い、`Vec` としてまとめて受け渡す設計を仮定している。

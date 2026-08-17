@@ -36,6 +36,7 @@ src/
     cell.rs               # CellValue, Cell, CellRef (A1形式 <-> 座標)
     sheet.rs              # 疎行列 Sheet (HashMap<(u32, u32), Cell>)
     workbook.rs           # 解決済みの Workbook モデル
+    style.rs              # ResolvedStyle / StyleSheet / StyleId（parse/styles.rs と resolve/style.rs の共有語彙。PR #8 レビュー指摘を反映し新設）
 
   resolve/                  # フェーズ4: 分析と遅延解決（I/O非依存、model::Sheet のみで動作）
     mod.rs                # フェーズ4の解決処理のエントリポイント
@@ -81,7 +82,7 @@ ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブ�
 
 `Cell` / `Sheet` / `Workbook` などの純粋なRustデータ構造を定義する。XMLパースや解決ロジックへの依存を持たない。疎行列（`HashMap<(row, col), Cell>`）によりメモリを最適化する。
 
-- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [mod.md](model/mod.md) / [cell.md](model/cell.md) / [sheet.md](model/sheet.md) / [workbook.md](model/workbook.md)
+- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [mod.md](model/mod.md) / [cell.md](model/cell.md) / [sheet.md](model/sheet.md) / [workbook.md](model/workbook.md) / [style.md](model/style.md)
 
 ### `resolve/`
 

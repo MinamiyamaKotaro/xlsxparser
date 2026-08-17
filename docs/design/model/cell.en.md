@@ -66,14 +66,14 @@ pub struct Cell {
 }
 ```
 
-`ResolvedStyle` is a placeholder assuming another type within `model/` (planned to be defined either in `model/mod.rs` or on the `resolve/style.rs` side); this file only assumes the type exists, without defining it. `DateTimeValue` is likewise a placeholder whose concrete type is undecided.
+`ResolvedStyle` is a type defined by [`model/style.rs`](style.en.md) (its location was settled per PR #8 review feedback); this file only assumes the type exists and uses it, without defining it. `DateTimeValue` is a placeholder defined within this file, whose concrete type is undecided (see Open Question 4).
 
 ## Dependencies
 
 - Depends on: none (a leaf module with no dependency on any sibling module within `model/`)
 - Depended on by: `model::Sheet` (uses `CellRef`, or an equivalent tuple, as the key of `HashMap<(u32, u32), Cell>`), `resolve/`, `json.rs`
 
-`resolve/style.rs` clones the `Arc` for the relevant style out of `StyleSheet` (assumed to be `HashMap<StyleId, Arc<ResolvedStyle>>`) and assigns it to each cell. Because each cell holds (a share of) the actual data's ownership via `Arc`, the `StyleSheet` container itself can be dropped once Phase 4 completes — satisfying both `pipeline.rs`'s policy of immediate disposal and the memory-efficiency requirement of avoiding value copies. The same relationship holds between `resolve/shared_strings.rs` and `Arc<str>`.
+`resolve/style.rs` clones the `Arc` for the relevant style out of [`model/style.rs`](style.en.md)'s `StyleSheet` (`HashMap<StyleId, Arc<ResolvedStyle>>`) and assigns it to each cell. Because each cell holds (a share of) the actual data's ownership via `Arc`, the `StyleSheet` container itself can be dropped once Phase 4 completes — satisfying both `pipeline.rs`'s policy of immediate disposal and the memory-efficiency requirement of avoiding value copies. The same relationship holds between `resolve/shared_strings.rs` and `Arc<str>`.
 
 ## Error Handling Policy
 
