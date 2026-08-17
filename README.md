@@ -1,5 +1,8 @@
 # xlsxparser
 
+[![Rust CI](https://github.com/MinamiyamaKotaro/xlsxparser/actions/workflows/rust-ci.yml/badge.svg)](https://github.com/MinamiyamaKotaro/xlsxparser/actions/workflows/rust-ci.yml)
+[![Docs](https://github.com/MinamiyamaKotaro/xlsxparser/actions/workflows/docs.yml/badge.svg)](https://github.com/MinamiyamaKotaro/xlsxparser/actions/workflows/docs.yml)
+
 A lightweight, high-performance `.xlsx` (OOXML) parser library written in Rust.
 
 ## Motivation
