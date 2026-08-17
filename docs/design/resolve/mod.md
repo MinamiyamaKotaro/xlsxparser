@@ -17,12 +17,12 @@ mod shared_strings;
 mod merge;
 mod style;
 
-pub use shared_strings::PendingSharedString;
-pub use style::PendingStyle;
-
 use crate::error::Error;
 use crate::model::sheet::{MergedRegion, Sheet};
 use crate::model::style::StyleSheet;
+// PendingSharedString/PendingStyleはフェーズ3の出力データそのものであるため
+// parse/worksheet.rsが定義する（PR #9レビューを反映。依存関係セクション参照）。
+use crate::parse::worksheet::{PendingSharedString, PendingStyle};
 
 /// 1シート分の未解決データをまとめてフェーズ4の解決処理にかける。
 /// `pipeline.rs` がシートごとに1回呼び出す想定のエントリ関数。
@@ -48,7 +48,7 @@ pub fn resolve_sheet(
 
 ## 依存関係
 
-- 依存先: [`resolve/shared_strings.rs`](shared_strings.md), [`resolve/merge.rs`](merge.md), [`resolve/style.rs`](style.md)（すべて `mod` 宣言として）、[`model/sheet.rs`](../model/sheet.md)（`Sheet`, `MergedRegion`）、[`error.rs`](../error.md)。`parse::shared_strings::SharedStringTable`（未設計、オープンクエスチョン1参照）にも依存するが、これは architecture.md 設計方針2が禁じる「I/Oへの依存」ではなく「フェーズ3が既に構築済みの、メモリ上の構造化データへの依存」であるため、`resolve/` の I/O非依存方針とは矛盾しない（quick-xml や `std::fs` など実際のI/O・XML構造への依存は持たない）。
+- 依存先: [`resolve/shared_strings.rs`](shared_strings.md), [`resolve/merge.rs`](merge.md), [`resolve/style.rs`](style.md)（すべて `mod` 宣言として）、[`model/sheet.rs`](../model/sheet.md)（`Sheet`, `MergedRegion`）、[`error.rs`](../error.md)。[`parse::shared_strings::SharedStringTable`](../parse/shared_strings.md)、[`parse::worksheet::{PendingSharedString, PendingStyle}`](../parse/worksheet.md) にも依存するが、これは architecture.md 設計方針2が禁じる「I/Oへの依存」ではなく「フェーズ3が既に構築済みの、メモリ上の構造化データへの依存」であるため、`resolve/` の I/O非依存方針とは矛盾しない（quick-xml や `std::fs` など実際のI/O・XML構造への依存は持たない）。
 - 依存元: `pipeline.rs`（各シートのフェーズ3完了後に `resolve_sheet` を呼び出す）
 
 `resolve_sheet` 内の呼び出し順序（共有文字列解決 → スタイル適用 → 結合解決）に強い前後関係はない（各サブモジュールが読み書きするセルのフィールドが独立しているため）。結合解決を最後に置いているのは、[merge.md](merge.md) の `insert_merge` が呼び出し時点で起点セルが `cells` に存在することを前提とするための保険的な順序であり、共有文字列・スタイルの解決漏れがあった場合に問題を早期に検出しやすくする意図（詳細はオープンクエスチョン2参照）。
@@ -68,4 +68,4 @@ pub fn resolve_sheet(
 
 1. ~~`SharedStringTable` の構築元モジュール~~ → **解決**: [`parse/shared_strings.rs`](../parse/shared_strings.md) が `SharedStringTable` を定義・構築する。`StyleSheet` / `ResolvedStyle` / `StyleId` は [`model/style.rs`](../model/style.md) 側で先行して定義済み（PR #8 レビュー指摘を反映）であり、[`parse/styles.rs`](../parse/styles.md) 設計時に整合を確認済み。
 2. **サブ処理間の実行順序の妥当性**: 現状「共有文字列解決 → スタイル適用 → 結合解決」の順に強い技術的根拠はなく、将来的にスタイル適用時のnumFmt日付判定が共有文字列解決結果（`CellValue::Text`）を誤って上書きしないことをテストで担保する必要がある程度の緩い依存しかない。並行実行（`sheet` への同時可変アクセスが必要なため現状の設計では不可）にする価値があるかは、実装時のプロファイリング結果を踏まえて再検討する。
-3. ~~`pending_shared_strings` / `pending_styles` の受け渡し方法~~ → **解決**: [`parse/worksheet.rs`](../parse/worksheet.md) が `Vec` としてまとめて構築し、`resolve_sheet` へそのまま渡す設計とした（「フェーズ3完了後にフェーズ4を実行する」という architecture.md の一方向パイプライン方針どおり）。なお `PendingSharedString`/`PendingStyle` を `parse::worksheet` が `resolve::shared_strings`/`resolve::style` から直接 `use` する構造の是非は [parse/worksheet.md オープンクエスチョン1](../parse/worksheet.md) として別途未解決のまま残る。
+3. ~~`pending_shared_strings` / `pending_styles` の受け渡し方法~~ → **解決**: [`parse/worksheet.rs`](../parse/worksheet.md) が `Vec` としてまとめて構築し、`resolve_sheet` へそのまま渡す設計とした（「フェーズ3完了後にフェーズ4を実行する」という architecture.md の一方向パイプライン方針どおり）。`PendingSharedString`/`PendingStyle` 自体の型定義は [`parse/worksheet.rs`](../parse/worksheet.md) 側へ移設され（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を反映）、本ファイル・[`resolve/shared_strings.rs`](shared_strings.md)・[`resolve/style.rs`](style.md) はいずれもそれを `use` する側に統一された（[parse/worksheet.md オープンクエスチョン1](../parse/worksheet.md) を解決）。

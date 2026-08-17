@@ -31,10 +31,11 @@ const BUILTIN_DATE_TIME_NUMFMT_IDS: &[u32] = &[14, 15, 16, 17, 18, 19, 20, 21, 2
 pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleSheet, Error> {
     let mut xml_reader = create_secure_reader(reader);
     // 実装方針:
-    // 1. <numFmts>を先に読み、numFmtId -> formatCode のマップを構築する
-    //    （<numFmts>は<cellXfs>より前に出現するのがOOXMLの通例だが、
-    //    仕様上の出現順保証はないため、必要なら2パス読み取りとする。
-    //    オープンクエスチョン4参照）。
+    // 1. <numFmts>を先に読み、numFmtId -> formatCode のマップを構築する。
+    //    ECMA-376 Part 1（SpreadsheetML）§18.8.39 CT_Stylesheetの
+    //    xsd:sequenceがnumFmts, fonts, fills, borders, cellStyleXfs,
+    //    cellXfs, ... の出現順を仕様として強制するため、単純な1パスの
+    //    ストリーミングパースで足りる（オープンクエスチョン4を解決）。
     // 2. <cellXfs>の各<xf>についてnumFmtId属性（省略時は既定値0=General）を
     //    読み、is_date_time_formatで判定し、ResolvedStyleを構築する。
     // 3. <cellXfs>内のインデックス（0始まり）をStyleIdとしてStyleSheetへ格納する。
@@ -86,13 +87,13 @@ fn is_date_time_format(numfmt_id: u32, format_code: Option<&str>) -> bool {
 - `numFmtId` が組み込みにもカスタム定義にも見つからない場合に、エラーを返さず `is_date_time: false` へフォールバックすることの確認
 - `numFmtId` 属性が省略された `<xf>` がデフォルト値 `0`（`General`、非日付）として扱われることの確認
 - `<cellXfs>` 内の複数 `<xf>` から構築した `StyleSheet` のキー（`StyleId`）が `<cellXfs>` の0始まりインデックス順と一致することの確認（[resolve/style.md](../resolve/style.md) との結線）
-- `<numFmts>` が `<cellXfs>` より後に出現する `styles.xml`（XML仕様上は許容される順序）でも正しく解決できることの確認（オープンクエスチョン4の実装方針に対する回帰テスト観点）
+- 仕様上正当な順序（`<numFmts>` が `<cellXfs>` より前）の `styles.xml` が1パスで正しく解決できることの確認。逆順（`<numFmts>` が `<cellXfs>` より後）はECMA-376のスキーマ違反となる非準拠ファイルであり本設計の対象外だが、そのような入力が渡された場合でも `panic` せず、該当 `numFmtId` が「見つからない」ケースとして `is_date_time: false` へフォールバックし処理を継続できることの確認（オープンクエスチョン4の解決に対する回帰テスト観点）
 
 ## 未決事項 / オープンクエスチョン
 
 1. **ロケール依存・和暦を含む日付書式（`numFmtId` 27〜36等）への対応要否**: 要求仕様書が「日本の業務システム」を主眼としているため、和暦（令和等）を含むカスタム日付書式への対応要否は要求仕様書の詳細化と合わせて確定させる。
 2. **カスタム `formatCode` の日付/時刻判定ヒューリスティックの精度**: 条件付き書式の角括弧区間や、引用符・`\` でエスケープされたリテラル文字を正しく除外できるかは実装時の詳細設計に委ねる。誤判定の実害はエラー処理方針で述べたとおり限定的だが、精度そのものの向上余地は残る。
 3. **未定義の `numFmtId` 参照に対するフォールバックとエラー化のどちらが適切か**: 現状は不正確ながら壊れた `styles.xml` をできるだけ読み進める方針（グレースフルデグラデーション）を仮定しているが、[resolve/style.md](../resolve/style.md) の `Error::InvalidStyleId`（セル側の `cellXfs` インデックス自体が不正な場合）との一貫性を取り、`styles.xml` 内部の参照不整合そのものも明確なエラーとして拒否すべきという意見もありうる。
-4. **`<numFmts>` と `<cellXfs>` の読み取り順序**: OOXML上 `<numFmts>` は `<cellXfs>` より前に出現するのが通例だが、スキーマがこの順序を厳密に強制しているかは未確認。ストリーミングパースの1パスで完結させるか（`<numFmts>` が後から出現した場合に備え `<cellXfs>` 側の解決を一時的に保留する必要が生じる）、単純に2パス読み取りにするかは実装時に確定させる。
+4. ~~`<numFmts>` と `<cellXfs>` の読み取り順序~~ → **解決**: 単純な1パスのストリーミングパースで実装する（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を反映）。ECMA-376 Part 1（SpreadsheetML）§18.8.39 `CT_Stylesheet` の `xsd:sequence` が `numFmts`, `fonts`, `fills`, `borders`, `cellStyleXfs`, `cellXfs`, `cellStyles`, `dxfs`, `tableStyles`, `colors`, `extLst` の出現順を仕様として強制しており、`numFmts` が `cellXfs` より後に出現するファイルは仕様上無効なOOXMLドキュメントとなるため、2パス読み取りは不要と判断する。なお、この順序に従わない非準拠なファイルに実際に遭遇した場合でも、該当 `numFmtId` は「組み込みにもカスタム定義にも見つからない」ケースとしてエラー処理方針が定める `is_date_time: false` へのフォールバックが働くため、クラッシュせず安全側に縮退する。
 5. **フォント/塗りつぶし/罫線などの具体的なスタイル要素**: [model/style.md オープンクエスチョン1](../model/style.md) と同一の論点（未解決）。要求仕様書がセルスタイルとしてどこまでの要素をJSON出力に含める必要があるかは `json.rs` の設計、または要求仕様書自体の詳細化と合わせて確定させる。
 6. **`applyNumberFormat` 属性・`cellStyleXfs`（名前付きセルスタイルの継承）への対応**: 現状は `<xf>` の `applyNumberFormat` 属性の値に関わらず `numFmtId` を直接権威あるものとして扱い、`xfId` が指す `cellStyleXfs` からの継承チェーンは考慮しない簡略化を仮定している。要求仕様書がスコープとする範囲でこの簡略化が十分かは未確定。

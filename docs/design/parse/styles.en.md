@@ -32,10 +32,11 @@ const BUILTIN_DATE_TIME_NUMFMT_IDS: &[u32] = &[14, 15, 16, 17, 18, 19, 20, 21, 2
 pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleSheet, Error> {
     let mut xml_reader = create_secure_reader(reader);
     // Implementation plan:
-    // 1. Read <numFmts> first, building a numFmtId -> formatCode map (OOXML
-    //    conventionally places <numFmts> before <cellXfs>, but the schema
-    //    does not guarantee this ordering, so a two-pass read may be needed
-    //    — see Open Question 4).
+    // 1. Read <numFmts> first, building a numFmtId -> formatCode map. ECMA-376
+    //    Part 1 (SpreadsheetML) §18.8.39 CT_Stylesheet's xsd:sequence
+    //    mandates the order numFmts, fonts, fills, borders, cellStyleXfs,
+    //    cellXfs, ... as a schema requirement, so a simple single-pass
+    //    streaming parse suffices (resolves Open Question 4).
     // 2. For each <xf> in <cellXfs>, read the numFmtId attribute (defaults
     //    to 0 = General when absent), classify it via is_date_time_format,
     //    and build a ResolvedStyle.
@@ -89,13 +90,13 @@ This directly implements what [model/style.md Dependencies](../model/style.en.md
 - Verify that a `numFmtId` found neither among built-ins nor custom definitions falls back to `is_date_time: false` without returning an error
 - Verify that an `<xf>` with no `numFmtId` attribute is treated as the default `0` (`General`, not a date)
 - Verify that the `StyleSheet` keys (`StyleId`) built from multiple `<xf>` entries in `<cellXfs>` match their 0-based index order within `<cellXfs>` (wiring with [resolve/style.md](../resolve/style.en.md))
-- Verify correct resolution even for a `styles.xml` where `<numFmts>` appears after `<cellXfs>` (an ordering the XML schema permits) — a regression test against Open Question 4's implementation approach
+- Verify that a `styles.xml` with the schema-valid order (`<numFmts>` before `<cellXfs>`) resolves correctly in a single pass. The reverse order (`<numFmts>` after `<cellXfs>`) is non-conformant per the ECMA-376 schema and out of this design's scope, but verify that such input still never panics — the affected `numFmtId` falls back to `is_date_time: false` as a "not found" case and processing continues (a regression test for Open Question 4's resolution)
 
 ## Open Questions
 
 1. **Whether to support locale-dependent date formats including Japanese era (wareki) dates (`numFmtId` 27–36, etc.)**: since the requirements center on "Japanese business systems," whether to support custom date formats including the Japanese era (Reiwa, etc.) is to be settled together with a more detailed requirements pass.
 2. **Precision of the custom `formatCode` date/time-classification heuristic**: whether bracketed conditional-format sections and quote/`\`-escaped literal characters can be reliably excluded is left to implementation-time detail design. As noted in Error Handling Policy, the real-world impact of a misclassification is limited, but there remains room to improve precision itself.
 3. **Fallback vs. hard error for an undefined `numFmtId` reference**: currently assumes a graceful-degradation policy — reading as far as possible into an inaccurate or broken `styles.xml` — but there is a case for treating this internal reference inconsistency within `styles.xml` as a hard error too, for consistency with [resolve/style.md](../resolve/style.en.md)'s `Error::InvalidStyleId` (when a cell's own `cellXfs` index is itself invalid).
-4. **Read order for `<numFmts>` and `<cellXfs>`**: `<numFmts>` conventionally appears before `<cellXfs>` in OOXML, but it is unconfirmed whether the schema strictly enforces this ordering. Whether to complete this in a single streaming pass (which would require deferring `<cellXfs>`'s resolution if `<numFmts>` appears later) or simply do a two-pass read is to be settled at implementation time.
+4. ~~Read order for `<numFmts>` and `<cellXfs>`~~ → **Resolved**: implemented as a simple single-pass streaming parse (reflects the [PR #9 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)). ECMA-376 Part 1 (SpreadsheetML) §18.8.39 `CT_Stylesheet`'s `xsd:sequence` mandates the order `numFmts`, `fonts`, `fills`, `borders`, `cellStyleXfs`, `cellXfs`, `cellStyles`, `dxfs`, `tableStyles`, `colors`, `extLst` as a schema requirement, so a file with `numFmts` appearing after `cellXfs` is not valid OOXML in the first place — a two-pass read is unnecessary. Even if such a non-conformant file were actually encountered, the affected `numFmtId` simply falls into the "found neither among built-ins nor custom definitions" case, which the Error Handling Policy already has fall back to `is_date_time: false` — so it degrades gracefully rather than crashing.
 5. **Concrete style elements such as font/fill/border**: same open topic as [model/style.md Open Question 1](../model/style.en.md) (unresolved). How far into cell styling (font color, background color, borders, bold/italic, etc.) the JSON output needs to go is to be settled together with `json.rs`'s design, or a more detailed requirements pass.
 6. **Support for `applyNumberFormat` and `cellStyleXfs` (named cell-style inheritance)**: currently assumes a simplification where `numFmtId` is treated as authoritative regardless of an `<xf>`'s `applyNumberFormat` value, with no consideration of the inheritance chain from `cellStyleXfs` that `xfId` points to. Whether this simplification is sufficient within the requirements' scope is undecided.

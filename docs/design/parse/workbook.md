@@ -79,5 +79,5 @@ fn parse_visibility(state: Option<&str>) -> SheetVisibility {
 ## 未決事項 / オープンクエスチョン
 
 1. **`sheetId` 属性の扱い**: `<sheet sheetId="1">` はパースするが、[`model::Sheet`](../model/sheet.md) に対応するフィールドがないため現状は破棄する想定。将来的にラウンドトリップ用途等で保持が必要になった場合、`WorkbookSheetEntry` に追加するか別途保持するかは未確定。
-2. **`r:id` 属性の名前空間解決**: [parse/mod.md オープンクエスチョン4](mod.md) と同一の論点。
+2. ~~`r:id` 属性の名前空間解決~~ → **解決**: [parse/mod.md オープンクエスチョン4](mod.md) で確定した「`quick_xml::NsReader` は採用せず文字列前方一致で簡略化する」方針に従い、`"r:id"` という属性名で直接照合する。
 3. **`state` 属性の未知の値に対するフォールバック方針の妥当性**: 現状 `Visible` へフォールバックしているが、より安全側（誤って可視化しないよう `Hidden` 扱いにする）にすべきかは、実際の要件・利用ケース次第で未確定。

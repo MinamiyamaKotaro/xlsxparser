@@ -16,16 +16,11 @@ Design doc for `src/resolve/style.rs`. This handles the "cell style application"
 ```rust
 use crate::error::Error;
 use crate::model::cell::{CellValue, DateTimeValue};
-use crate::model::sheet::{CellRef, Sheet};
-use crate::model::style::{ResolvedStyle, StyleId, StyleSheet};
-
-/// A pending entry recorded when Phase 3 detects a cell with an `s` (style
-/// index) attribute.
-#[derive(Debug, Clone, Copy)]
-pub struct PendingStyle {
-    pub cell_ref: CellRef,
-    pub style_id: StyleId,
-}
+use crate::model::sheet::Sheet;
+use crate::model::style::{ResolvedStyle, StyleSheet};
+// PendingStyle is Phase 3's own output data, so parse/worksheet.rs defines
+// it (reflects the PR #9 review — see Dependencies).
+use crate::parse::worksheet::PendingStyle;
 
 /// For each entry in `pending`, looks up `ResolvedStyle` in `stylesheet` and
 /// sets it on the corresponding cell in `sheet`. Also converts
@@ -72,7 +67,7 @@ fn serial_to_date_time(serial: f64) -> Option<DateTimeValue> {
 
 ## Dependencies
 
-- Depends on: [`model/sheet.rs`](../model/sheet.en.md) (`Sheet::get_mut`, `CellRef`), [`model/cell.rs`](../model/cell.en.md) (`CellValue`, `DateTimeValue`), [`model/style.rs`](../model/style.en.md) (`ResolvedStyle`, `StyleSheet`, `StyleId` — moved out of this file, addressing PR #8 review feedback), [`error.rs`](../error.en.md)
+- Depends on: [`model/sheet.rs`](../model/sheet.en.md) (`Sheet::get_mut`), [`model/cell.rs`](../model/cell.en.md) (`CellValue`, `DateTimeValue`), [`model/style.rs`](../model/style.en.md) (`ResolvedStyle`, `StyleSheet` — moved out of this file, addressing PR #8 review feedback), [`error.rs`](../error.en.md), [`parse::worksheet::PendingStyle`](../parse/worksheet.en.md)
 - Depended on by: [`resolve/mod.rs`](mod.en.md) (called from `resolve_sheet`)
 
 Defining `StyleSheet` / `ResolvedStyle` / `StyleId` in [`model/style.rs`](../model/style.en.md) rather than in `resolve/style.rs` itself means `parse/styles.rs` (not yet designed — the entity that builds `StyleSheet`) and `resolve/style.rs` (the entity that applies it) both depend only on `model/` and never know about each other directly (addresses PR #8 review feedback — see [model/style.md](../model/style.en.md) for details).

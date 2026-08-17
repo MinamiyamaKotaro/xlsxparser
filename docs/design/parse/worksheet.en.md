@@ -8,8 +8,8 @@ Design doc for `src/parse/worksheet.rs`. Per [architecture.md](../architecture.e
 
 - Streams `xl/worksheets/sheetX.xml`'s `<sheetData>` row (`<row>`) by row, building a [`Cell`](../model/cell.en.md) for each `<c>` and inserting it via `Sheet::insert_cell`
 - Once one row's worth of data is fully processed (every `<c>` belonging to that row has been read and reflected via `insert_cell`), discards the parser's internal state for that row (attributes, text buffers, etc.) before moving on to the next row (implements the requirements' Phase 3 requirement; per architecture.md, "row-level XML node disposal is an internal implementation detail of `parse/worksheet.rs`; `pipeline.rs` does not control it")
-- When a `t="s"` (shared-string index reference) cell is detected, inserts a `Cell` with `value: None` via `insert_cell` while simultaneously recording a corresponding [`resolve::PendingSharedString`](../resolve/shared_strings.en.md)
-- When a cell carries an `s` (`cellXfs` index — style ID reference) attribute, records a corresponding [`resolve::PendingStyle`](../resolve/style.en.md)
+- When a `t="s"` (shared-string index reference) cell is detected, inserts a `Cell` with `value: None` via `insert_cell` while simultaneously recording a corresponding `PendingSharedString` (defined by this file; consumed by [`resolve/shared_strings.rs`](../resolve/shared_strings.en.md))
+- When a cell carries an `s` (`cellXfs` index — style ID reference) attribute, records a corresponding `PendingStyle` (defined by this file; consumed by [`resolve/style.rs`](../resolve/style.en.md))
 - `t="str"` (formula-computed string result) and `t="inlineStr"` (inline string) cells need no deferred resolution, so they are resolved directly to `CellValue::Text` during the stream and inserted via `insert_cell` (the division of labor already assumed by [resolve/shared_strings.md Responsibility/Scope](../resolve/shared_strings.en.md))
 - Collects `<mergeCells><mergeCell ref="A1:C3"/>...</mergeCells>`, which appears after the stream completes (after `</sheetData>`), converting each `ref` into `start`/`end` via [`CellRef::from_a1`](../model/cell.en.md) and gathering them into `Vec<MergedRegion>` (the stage that feeds into [`resolve/merge.rs`](../resolve/merge.en.md)'s validation and registration)
 - **Not responsible for**: actually resolving shared-string indices or style IDs ([`resolve/shared_strings.rs`](../resolve/shared_strings.en.md) / [`resolve/style.rs`](../resolve/style.en.md)), validating merge ranges or registering them into `Sheet` ([`resolve/merge.rs`](../resolve/merge.en.md) — this file only collects the `MergedRegion` list; it never calls `insert_merge`), parsing or retaining formulas (`<f>` elements — see Open Question 2)
@@ -20,10 +20,37 @@ Design doc for `src/parse/worksheet.rs`. Per [architecture.md](../architecture.e
 use crate::error::Error;
 use crate::model::cell::{Cell, CellRef, CellValue};
 use crate::model::sheet::{MergedRegion, Sheet};
+use crate::model::style::StyleId;
 use crate::parse::{concat_rich_text, convert_xml_error, create_secure_reader, required_attr};
-use crate::resolve::{PendingSharedString, PendingStyle};
 use std::io::BufRead;
 use std::sync::Arc;
+
+/// The pending entry Phase 3 records when it detects a `t="s"` cell.
+/// `model::CellValue` only ever admits an already-resolved `Text(Arc<str>)`
+/// and has no variant that holds a raw index (see
+/// [model/cell.md](../model/cell.en.md)), so at parse time the cell itself
+/// is inserted into `Sheet` with `value: None` (other fields such as style
+/// are set as usual), and the index is kept outside the sheet in this
+/// struct instead. [`resolve/shared_strings.rs`](../resolve/shared_strings.en.md)
+/// consumes this to resolve the actual string (per the [PR #9
+/// review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204),
+/// this type's definition was relocated here, since it is Phase 3's own
+/// output data — see Dependencies for the rationale).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingSharedString {
+    pub cell_ref: CellRef,
+    pub index: usize,
+}
+
+/// The pending entry Phase 3 records when it detects a cell carrying an `s`
+/// (style index) attribute. [`resolve/style.rs`](../resolve/style.en.md)
+/// consumes this to apply the `ResolvedStyle` (relocated for the same
+/// reason as `PendingSharedString` — see Dependencies).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingStyle {
+    pub cell_ref: CellRef,
+    pub style_id: StyleId,
+}
 
 /// `parse_worksheet`'s output. `sheet` itself is mutated directly through
 /// the `&mut` argument, so this only returns the three remaining pieces of
@@ -111,17 +138,19 @@ fn parse_number(text: &str) -> Result<f64, Error> {
 
 ## Dependencies
 
-- Depends on: [`parse/mod.rs`](mod.en.md) (`create_secure_reader`, `convert_xml_error`, `required_attr`, `concat_rich_text`), [`model/cell.rs`](../model/cell.en.md) (`Cell`, `CellRef`, `CellValue`), [`model/sheet.rs`](../model/sheet.en.md) (`Sheet::insert_cell`, `MergedRegion`), [`resolve/mod.rs`](../resolve/mod.en.md) (re-exports of `PendingSharedString`, `PendingStyle`), [`error.rs`](../error.en.md)
-- Depended on by: `pipeline.rs` (Phase 3 — called once per sheet, passing the return value straight through to [`resolve::resolve_sheet`](../resolve/mod.en.md))
+- Depends on: [`parse/mod.rs`](mod.en.md) (`create_secure_reader`, `convert_xml_error`, `required_attr`, `concat_rich_text`), [`model/cell.rs`](../model/cell.en.md) (`Cell`, `CellRef`, `CellValue`), [`model/sheet.rs`](../model/sheet.en.md) (`Sheet::insert_cell`, `MergedRegion`), [`model/style.rs`](../model/style.en.md) (`StyleId`, used as `PendingStyle`'s field type), [`error.rs`](../error.en.md). Depends on no module under `resolve/`
+- Depended on by: `pipeline.rs` (Phase 3 — called once per sheet, passing the return value straight through to [`resolve::resolve_sheet`](../resolve/mod.en.md)), [`resolve/shared_strings.rs`](../resolve/shared_strings.en.md) (`use`s this file's `PendingSharedString`), [`resolve/style.rs`](../resolve/style.en.md) (same, `PendingStyle`), [`resolve/mod.rs`](../resolve/mod.en.md) (references both types in `resolve_sheet`'s signature)
 
-**A design wrinkle surfaced while writing this file (see Open Question 1)**: because this file constructs `PendingSharedString` / `PendingStyle` directly (types defined by [`resolve/shared_strings.rs`](../resolve/shared_strings.en.md) / [`resolve/style.rs`](../resolve/style.en.md)), `parse::worksheet` ends up depending on `resolve::shared_strings` / `resolve::style`. Meanwhile [resolve/mod.md Dependencies](../resolve/mod.en.md) had already committed to `resolve/mod.rs` depending on `parse::shared_strings::SharedStringTable`. Laid out, the dependency direction is as follows, and it stays acyclic (a DAG):
+**Why `PendingSharedString` / `PendingStyle` are defined here**: the original draft defined both types on the consumer side ([`resolve/shared_strings.rs`](../resolve/shared_strings.en.md) / [`resolve/style.rs`](../resolve/style.en.md)), with this file `use`-ing them in reverse — an unnatural "parser layer (lower) → resolve layer (higher)" dependency (acyclic, but against the spirit of architecture.md design policy 2, separating the I/O layer (`container`/`parse`) from domain logic (`resolve`)). Per the [PR #9 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204), both types were relocated to this file (`parse/worksheet.rs`), matching what they actually are: Phase 3's own output data. This makes the dependency direction fully one-directional (a DAG), unifying it with the pattern [`resolve/shared_strings.rs`](../resolve/shared_strings.en.md) already established by depending on `parse::shared_strings::SharedStringTable` (per [resolve/mod.md Dependencies](../resolve/mod.en.md)) — "`resolve/` depends on already-built structured data from `parse/`":
 
 ```text
-parse::worksheet ─┬─▶ resolve::mod ─▶ resolve::shared_strings ─▶ parse::shared_strings
-                   └─▶ resolve::mod ─▶ resolve::style
+parse::worksheet ─┬─▶ resolve::shared_strings (uses PendingSharedString)
+                   ├─▶ resolve::style (uses PendingStyle)
+                   └─▶ resolve::mod (references PendingSharedString/PendingStyle in resolve_sheet's signature)
+parse::shared_strings ─▶ resolve::shared_strings (uses SharedStringTable)
 ```
 
-`parse::shared_strings` itself remains a leaf module with no dependency on either `parse::worksheet` or `resolve::mod`, so the path `parse::worksheet → resolve::* → parse::shared_strings` does not form a cycle. That said, having a module under `parse/` `use` types from `resolve/` directly runs somewhat against the spirit of architecture.md design policy 2 — separating the I/O layer (`container`/`parse`) from domain logic (`resolve`). This is the same kind of structural wrinkle that [model/style.rs](../model/style.en.md) already fixed once for `ResolvedStyle`/`StyleSheet` by relocating them out of `resolve/style.rs` into `model/`, breaking the direct dependency between `parse/styles.rs` and `resolve/style.rs` (per the PR #8 review). This design defers changing the already-settled type definitions and placement in [resolve/mod.md](../resolve/mod.en.md) / [resolve/shared_strings.md](../resolve/shared_strings.en.md) / [resolve/style.md](../resolve/style.en.md) — that's outside this Issue's scope — and instead records the dependency explicitly here, leaving it as Open Question 1 for a future review.
+The structure now fully matches the spirit of architecture.md design policy 2: no module under `parse/` `use`s any type from `resolve/` (resolves the former Open Question 1).
 
 ## Error Handling Policy
 
@@ -149,9 +178,9 @@ parse::worksheet ─┬─▶ resolve::mod ─▶ resolve::shared_strings ─▶
 
 ## Open Questions
 
-1. **Reconsidering where `PendingSharedString` / `PendingStyle` live**: as discussed under Dependencies, having `parse::worksheet` `use` `resolve::shared_strings` / `resolve::style` types directly stays acyclic but runs somewhat against the spirit of architecture.md design policy 2 (separating the I/O layer from domain logic). Following the precedent of [model/style.rs](../model/style.en.md) relocating `ResolvedStyle`/`StyleSheet` out of `resolve/style.rs` into `model/`, whether `PendingSharedString`/`PendingStyle` should likewise move to `resolve/mod.rs` (or a more neutral location) is treated as out of this Issue's scope, since it would require revisiting [resolve/mod.md](../resolve/mod.en.md), [resolve/shared_strings.md](../resolve/shared_strings.en.md), and [resolve/style.md](../resolve/style.en.md) — left for a separate future review.
+1. ~~Reconsidering where `PendingSharedString` / `PendingStyle` live~~ → **Resolved**: both types' definitions were relocated to this file (`parse/worksheet.rs`), with [`resolve/shared_strings.rs`](../resolve/shared_strings.en.md) / [`resolve/style.rs`](../resolve/style.en.md) each `use`-ing them (reflects the [PR #9 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)). See Dependencies for details.
 2. **Handling formulas (`<f>` elements)**: currently assumes their content is never parsed or retained at all (only `<v>`'s cached computed value is used). If a future requirement needs the formula text itself in the JSON output, whether to add `formula: Option<String>` to `Cell` or otherwise is to be settled together with a more detailed requirements pass.
 3. **Fallback policy for an unrecognized `t` attribute value**: currently falls back to keeping the raw `<v>` text as `CellValue::Text` as-is. This follows the same philosophy as [parse/workbook.md](workbook.en.md)'s `state`-attribute fallback (err on the side of not losing data), but there is a case for treating it as a hard `Error` instead.
 4. **Sequential column-position inference for cells omitting `r`**: per the OOXML spec, a `<c>`'s `r` attribute is optional, and when absent, sequential inference of column position from the preceding cell is permitted. This design currently does not support that, adopting the simplification of returning `Error::MissingRequiredElement` instead. Given [model/sheet.md](../model/sheet.en.md)'s already-noted concern that "`.xlsx` files generated by third-party tools may rely on looser parts of the spec," support may become necessary if a generator that actually omits `r` is encountered in practice.
 5. **`Reader` internal buffer size / performance tuning**: same topic as [parse/mod.md Open Question 5](mod.en.md). To be settled based on measured profiling against the "grid-paper Excel" sheet sizes the requirements target.
-6. **Namespace handling**: same topic as [parse/mod.md Open Question 4](mod.en.md). `worksheet.xml`'s own elements and attributes (`row`, `c`, `v`, `is`, `t`, `s`, `r`, `mergeCells`, `mergeCell`, `ref`) carry no prefix, so this file is expected to see no direct impact.
+6. ~~Namespace handling~~ → **Resolved**: follows the policy [parse/mod.md Open Question 4](mod.en.md) settled on — plain string-prefix matching, no `quick_xml::NsReader`. `worksheet.xml`'s own elements and attributes (`row`, `c`, `v`, `is`, `t`, `s`, `r`, `mergeCells`, `mergeCell`, `ref`) carry no prefix, so this file sees no direct impact.

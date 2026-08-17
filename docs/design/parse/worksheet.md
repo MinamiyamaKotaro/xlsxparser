@@ -8,8 +8,8 @@
 
 - `xl/worksheets/sheetX.xml` の `<sheetData>` を行（`<row>`）単位でストリーム処理し、`<c>`（セル）ごとに [`Cell`](../model/cell.md) を構築して `Sheet::insert_cell` で挿入する
 - 1行分のデータ（当該行に属する全 `<c>` の読み取りと `insert_cell` への反映）が完了した時点で、その行に関するパーサーの内部状態（属性・テキストバッファ等）を破棄し、次の行の処理へ移る（要求仕様書フェーズ3要件の実装。architecture.md 「行単位のXMLノード破棄は `parse/worksheet.rs` 内部の実装詳細であり、`pipeline.rs` はこれを制御しない」）
-- `t="s"`（共有文字列インデックス参照）セルを検出した場合、`value: None` の `Cell` を `insert_cell` で挿入すると同時に、対応する [`resolve::PendingSharedString`](../resolve/shared_strings.md) を記録する
-- `s`（`cellXfs` インデックス。スタイルID参照）属性を持つセルを検出した場合、対応する [`resolve::PendingStyle`](../resolve/style.md) を記録する
+- `t="s"`（共有文字列インデックス参照）セルを検出した場合、`value: None` の `Cell` を `insert_cell` で挿入すると同時に、対応する `PendingSharedString`（本ファイルが定義。[`resolve/shared_strings.rs`](../resolve/shared_strings.md) が消費する）を記録する
+- `s`（`cellXfs` インデックス。スタイルID参照）属性を持つセルを検出した場合、対応する `PendingStyle`（本ファイルが定義。[`resolve/style.rs`](../resolve/style.md) が消費する）を記録する
 - `t="str"`（数式の計算結果文字列）・`t="inlineStr"`（インラインストリング）セルは遅延解決を必要としないため、ストリーム中に直接 `CellValue::Text` として解決し `insert_cell` で挿入する（[resolve/shared_strings.md 責務・スコープ](../resolve/shared_strings.md) が既に前提としていた分担）
 - ストリーム完了後（`</sheetData>` の後）に出現する `<mergeCells><mergeCell ref="A1:C3"/>...</mergeCells>` を [`CellRef::from_a1`](../model/cell.md) で `start`/`end` に変換し、`Vec<MergedRegion>` として収集する（[`resolve/merge.rs`](../resolve/merge.md) が検証・登録する前段）
 - **含まない責務**: 共有文字列インデックス・スタイルIDの実際の解決（[`resolve/shared_strings.rs`](../resolve/shared_strings.md) / [`resolve/style.rs`](../resolve/style.md)）、結合範囲の妥当性検証・`Sheet` への登録そのもの（[`resolve/merge.rs`](../resolve/merge.md)。本ファイルは `MergedRegion` のリストを収集するのみで `insert_merge` は呼ばない）、数式（`<f>` 要素）の解析・保持（オープンクエスチョン2参照）
@@ -20,10 +20,35 @@
 use crate::error::Error;
 use crate::model::cell::{Cell, CellRef, CellValue};
 use crate::model::sheet::{MergedRegion, Sheet};
+use crate::model::style::StyleId;
 use crate::parse::{concat_rich_text, convert_xml_error, create_secure_reader, required_attr};
-use crate::resolve::{PendingSharedString, PendingStyle};
 use std::io::BufRead;
 use std::sync::Arc;
+
+/// フェーズ3が `t="s"` セルを検出した時点で記録する保留エントリ。
+/// `model::CellValue` は解決済みの `Text(Arc<str>)` のみを許容しインデックスを
+/// そのまま保持するバリアントを持たないため（[model/cell.md](../model/cell.md)）、
+/// パース時点ではセル自体を `value: None` のまま `Sheet` へ挿入し（スタイル等の
+/// 他フィールドは通常通り設定する）、インデックスは本構造体としてシートの
+/// 外側に保持しておく。[`resolve/shared_strings.rs`](../resolve/shared_strings.md)
+/// がこれを消費して実文字列へ解決する（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)
+/// を反映し、フェーズ3の出力データそのものとして本ファイルへ定義を移設した。
+/// 経緯は依存関係セクション参照）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingSharedString {
+    pub cell_ref: CellRef,
+    pub index: usize,
+}
+
+/// フェーズ3が `s`（style index）属性を持つセルを検出した時点で記録する
+/// 保留エントリ。[`resolve/style.rs`](../resolve/style.md) がこれを消費して
+/// `ResolvedStyle` を適用する（配置の経緯は `PendingSharedString` と同様。
+/// 依存関係セクション参照）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingStyle {
+    pub cell_ref: CellRef,
+    pub style_id: StyleId,
+}
 
 /// `parse_worksheet` の出力。`sheet` 自体は `&mut` 引数で直接書き換えるため、
 /// フェーズ4（[resolve/mod.rs](../resolve/mod.md) の `resolve_sheet`）がそのまま
@@ -109,17 +134,19 @@ fn parse_number(text: &str) -> Result<f64, Error> {
 
 ## 依存関係
 
-- 依存先: [`parse/mod.rs`](mod.md)（`create_secure_reader`, `convert_xml_error`, `required_attr`, `concat_rich_text`）、[`model/cell.rs`](../model/cell.md)（`Cell`, `CellRef`, `CellValue`）、[`model/sheet.rs`](../model/sheet.md)（`Sheet::insert_cell`, `MergedRegion`）、[`resolve/mod.rs`](../resolve/mod.md)（`PendingSharedString`, `PendingStyle` の再エクスポート）、[`error.rs`](../error.md)
-- 依存元: `pipeline.rs`（フェーズ3。シートごとに1回呼び出し、返り値を [`resolve::resolve_sheet`](../resolve/mod.md) へそのまま渡す）
+- 依存先: [`parse/mod.rs`](mod.md)（`create_secure_reader`, `convert_xml_error`, `required_attr`, `concat_rich_text`）、[`model/cell.rs`](../model/cell.md)（`Cell`, `CellRef`, `CellValue`）、[`model/sheet.rs`](../model/sheet.md)（`Sheet::insert_cell`, `MergedRegion`）、[`model/style.rs`](../model/style.md)（`StyleId`。`PendingStyle` のフィールド型として使う）、[`error.rs`](../error.md)。`resolve/` 配下のいずれのモジュールにも依存しない
+- 依存元: `pipeline.rs`（フェーズ3。シートごとに1回呼び出し、返り値を [`resolve::resolve_sheet`](../resolve/mod.md) へそのまま渡す）、[`resolve/shared_strings.rs`](../resolve/shared_strings.md)（本ファイルが定義する `PendingSharedString` を `use`）、[`resolve/style.rs`](../resolve/style.md)（同 `PendingStyle`）、[`resolve/mod.rs`](../resolve/mod.md)（`resolve_sheet` のシグネチャで両型を参照）
 
-**発見された設計上の留意点（オープンクエスチョン1参照）**: 本ファイルが `PendingSharedString` / `PendingStyle`（[`resolve/shared_strings.rs`](../resolve/shared_strings.md) / [`resolve/style.rs`](../resolve/style.md) が定義）を直接構築するため、`parse::worksheet` は `resolve::shared_strings` / `resolve::style` に依存する。一方 [resolve/mod.md 依存関係](../resolve/mod.md) は既に `resolve/mod.rs` が `parse::shared_strings::SharedStringTable` に依存すると確定させている。整理すると依存の向きは次の通りで、循環はしない（有向非巡回グラフを保つ）:
+**`PendingSharedString` / `PendingStyle` を本ファイルに定義する設計の経緯**: 当初案では両型を消費側（[`resolve/shared_strings.rs`](../resolve/shared_strings.md) / [`resolve/style.rs`](../resolve/style.md)）に定義し、本ファイルがそれを逆に `use` する構造だったが、これは「パーサー層（低レイヤー）→ 解決層（高レイヤー）」という不自然な逆方向依存を生む（循環はしないが、architecture.md 設計方針2が意図する「I/O層（`container`/`parse`）とドメインロジック（`resolve`）の分離」の精神に反する）。[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を受け、両型は「フェーズ3の出力データそのもの」であるという実体に即して本ファイル（`parse/worksheet.rs`）へ定義を移設した。これにより依存の向きは次のとおり完全に一方向（DAG）となり、[`resolve/shared_strings.rs`](../resolve/shared_strings.md) が既に `parse::shared_strings::SharedStringTable` に依存していた（[resolve/mod.md 依存関係](../resolve/mod.md)）のと同じ「`resolve/` が `parse/` の構築済み構造化データに依存する」というパターンへ統一される:
 
 ```text
-parse::worksheet ─┬─▶ resolve::mod ─▶ resolve::shared_strings ─▶ parse::shared_strings
-                   └─▶ resolve::mod ─▶ resolve::style
+parse::worksheet ─┬─▶ resolve::shared_strings（PendingSharedStringをuse）
+                   ├─▶ resolve::style（PendingStyleをuse）
+                   └─▶ resolve::mod（resolve_sheetのシグネチャでPendingSharedString/PendingStyleを参照）
+parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse）
 ```
 
-`parse::shared_strings` 自身は `parse::worksheet` にも `resolve::mod` にも依存しない葉モジュールのままであるため、`parse::worksheet → resolve::* → parse::shared_strings` という経路があっても循環にはならない。ただし `parse/` 配下のモジュールが `resolve/` 配下の型を直接 `use` するという構造は、architecture.md 設計方針2が意図する「I/O層（`container`/`parse`）とドメインロジック（`resolve`）の分離」の精神とはやや逆行しており、[model/style.rs](../model/style.md) が `ResolvedStyle`/`StyleSheet` を `resolve/style.rs` から `model/` へ移設して `parse/styles.rs` と `resolve/style.rs` の直接依存を解消した（PR #8 レビュー指摘）のと同種の構造上の歪みが `PendingSharedString`/`PendingStyle` にも残っている。本設計では既存の [resolve/mod.md](../resolve/mod.md) / [resolve/shared_strings.md](../resolve/shared_strings.md) / [resolve/style.md](../resolve/style.md) が確定済みの型定義・配置をこのIssueのスコープ内で変更することは見送り、依存関係として明示的に記録したうえでオープンクエスチョン1として次のレビューに委ねる。
+`parse/` 配下のいずれのモジュールも `resolve/` 配下の型を `use` しない、というarchitecture.md設計方針2の精神に完全に合致する構造になった（旧オープンクエスチョン1を解決）。
 
 ## エラー処理方針
 
@@ -147,9 +174,9 @@ parse::worksheet ─┬─▶ resolve::mod ─▶ resolve::shared_strings ─▶
 
 ## 未決事項 / オープンクエスチョン
 
-1. **`PendingSharedString` / `PendingStyle` の配置場所の再検討**: 依存関係セクションで述べたとおり、`parse::worksheet` が `resolve::shared_strings` / `resolve::style` の型を直接 `use` する構造は循環こそしないものの、architecture.md 設計方針2の精神（I/O層とドメインロジックの分離）とはやや逆行する。[model/style.rs](../model/style.md) が `ResolvedStyle`/`StyleSheet` を `resolve/style.rs` から `model/` へ移設した前例に倣い、`PendingSharedString`/`PendingStyle` も `resolve/mod.rs`（またはより中立的な置き場所）へ移すべきかは、[resolve/mod.md](../resolve/mod.md)・[resolve/shared_strings.md](../resolve/shared_strings.md)・[resolve/style.md](../resolve/style.md) 側の見直しを伴うため、本Issueのスコープ外の別レビューとして扱う。
+1. ~~`PendingSharedString` / `PendingStyle` の配置場所の再検討~~ → **解決**: 両型の定義を本ファイル（`parse/worksheet.rs`）へ移設し、[`resolve/shared_strings.rs`](../resolve/shared_strings.md) / [`resolve/style.rs`](../resolve/style.md) 側がそれぞれを `use` する構造とした（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を反映）。詳細は依存関係セクション参照。
 2. **数式（`<f>` 要素）の扱い**: 現状は内容を一切パース・保存せず読み飛ばす方針（`<v>` の計算済みキャッシュ値のみを採用）を仮定している。数式文字列そのものをJSON出力に含める要求が将来生じた場合、`Cell` に `formula: Option<String>` を追加するか等は要求仕様書の詳細化と合わせて確定させる。
 3. **未知の `t` 属性値へのフォールバック方針**: 現状は生の `<v>` テキストをそのまま `CellValue::Text` として保持するフォールバックとしているが、[parse/workbook.md](workbook.md) の `state` 属性フォールバックと同様の考え方（データを失わない側へ倒す）である一方、明確な `Error` とすべきという意見もありうる。
 4. **`r` 属性省略セルの列位置逐次推論**: OOXMLの仕様上、`<c>` の `r` 属性は省略可能で、省略時は直前セルからの列位置の逐次推論が許容されている。本設計は現状これに対応せず `Error::MissingRequiredElement` とする簡略化を採用しているが、[model/sheet.md](../model/sheet.md) が既に述べる「サードパーティ製ツールが生成した `.xlsx` は仕様の緩い部分に依存しうる」という懸念を踏まえると、実際に `r` を省略する生成ツールが存在する場合は対応が必要になる。
 5. **`Reader` の内部バッファサイズ・パフォーマンスチューニング**: [parse/mod.md オープンクエスチョン5](mod.md) と同一の論点。要求仕様書が想定する「方眼紙Excel」規模のシートに対する実測プロファイリングを踏まえて確定させる。
-6. **名前空間の扱い**: [parse/mod.md オープンクエスチョン4](mod.md) と同一の論点。`worksheet.xml` 自体の要素・属性（`row`, `c`, `v`, `is`, `t`, `s`, `r`, `mergeCells`, `mergeCell`, `ref`）に接頭辞は付かないため、本ファイルへの直接的な影響はないと見込む。
+6. ~~名前空間の扱い~~ → **解決**: [parse/mod.md オープンクエスチョン4](mod.md) で確定した「`quick_xml::NsReader` は採用せず文字列前方一致で簡略化する」方針に従う。`worksheet.xml` 自体の要素・属性（`row`, `c`, `v`, `is`, `t`, `s`, `r`, `mergeCells`, `mergeCell`, `ref`）に接頭辞は付かないため、本ファイルへの直接的な影響はない。

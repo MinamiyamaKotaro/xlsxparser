@@ -81,5 +81,5 @@ fn parse_visibility(state: Option<&str>) -> SheetVisibility {
 ## Open Questions
 
 1. **Handling of the `sheetId` attribute**: `<sheet sheetId="1">` is parsed but currently discarded, since [`model::Sheet`](../model/sheet.en.md) has no corresponding field. Whether it needs to be retained for future round-tripping use, and where (added to `WorkbookSheetEntry` or kept elsewhere), is undecided.
-2. **Namespace resolution for `r:id`**: same topic as [parse/mod.md Open Question 4](mod.en.md).
+2. ~~Namespace resolution for `r:id`~~ → **Resolved**: follows the policy [parse/mod.md Open Question 4](mod.en.md) settled on — plain string-prefix matching, no `quick_xml::NsReader` — matching directly against the attribute name `"r:id"`.
 3. **Soundness of falling back on an unrecognized `state` value**: currently falls back to `Visible`, but whether it should instead err on the safe side (treat it as `Hidden` so nothing is accidentally shown) is undecided pending actual requirements and use cases.

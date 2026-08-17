@@ -16,15 +16,11 @@
 ```rust
 use crate::error::Error;
 use crate::model::cell::{CellValue, DateTimeValue};
-use crate::model::sheet::{CellRef, Sheet};
-use crate::model::style::{ResolvedStyle, StyleId, StyleSheet};
-
-/// フェーズ3が `s`（style index）属性を持つセルを検出した時点で記録する保留エントリ。
-#[derive(Debug, Clone, Copy)]
-pub struct PendingStyle {
-    pub cell_ref: CellRef,
-    pub style_id: StyleId,
-}
+use crate::model::sheet::Sheet;
+use crate::model::style::{ResolvedStyle, StyleSheet};
+// PendingStyleはフェーズ3の出力データそのものであるため
+// parse/worksheet.rsが定義する（PR #9レビューを反映。依存関係セクション参照）。
+use crate::parse::worksheet::PendingStyle;
 
 /// `pending` の各エントリについて `stylesheet` から `ResolvedStyle` を引き、
 /// `sheet` の対応セルへ設定する。あわせて `is_date_time` な書式が
@@ -69,7 +65,7 @@ fn serial_to_date_time(serial: f64) -> Option<DateTimeValue> {
 
 ## 依存関係
 
-- 依存先: [`model/sheet.rs`](../model/sheet.md)（`Sheet::get_mut`, `CellRef`）、[`model/cell.rs`](../model/cell.md)（`CellValue`, `DateTimeValue`）、[`model/style.rs`](../model/style.md)（`ResolvedStyle`, `StyleSheet`, `StyleId`。PR #8 レビュー指摘を反映し本ファイルから移動）、[`error.rs`](../error.md)
+- 依存先: [`model/sheet.rs`](../model/sheet.md)（`Sheet::get_mut`）、[`model/cell.rs`](../model/cell.md)（`CellValue`, `DateTimeValue`）、[`model/style.rs`](../model/style.md)（`ResolvedStyle`, `StyleSheet`。PR #8 レビュー指摘を反映し本ファイルから移動）、[`error.rs`](../error.md)、[`parse::worksheet::PendingStyle`](../parse/worksheet.md)
 - 依存元: [`resolve/mod.rs`](mod.md)（`resolve_sheet` から呼び出される）
 
 `StyleSheet` / `ResolvedStyle` / `StyleId` を `resolve/style.rs` 自身ではなく [`model/style.rs`](../model/style.md) に定義したことで、`parse/styles.rs`（未設計。`StyleSheet` を構築する主体）と `resolve/style.rs`（適用する主体）がいずれも `model/` にのみ依存し、互いを直接知らない構造になる（PR #8 レビュー指摘を反映。詳細は[model/style.md](../model/style.md)参照）。

@@ -15,20 +15,11 @@ Design doc for `src/resolve/shared_strings.rs`. This handles the "shared string 
 ```rust
 use crate::error::Error;
 use crate::model::cell::CellValue;
-use crate::model::sheet::{CellRef, Sheet};
-use crate::parse::shared_strings::SharedStringTable; // parse/shared_strings.rs not yet designed (see Open Question 1)
-
-/// A pending entry recorded when Phase 3 detects a `t="s"` cell.
-/// `model::CellValue` only allows the resolved `Text(Arc<str>)` variant and
-/// has no variant that holds a raw index (see [model/cell.md](../model/cell.en.md)),
-/// so at parse time the cell itself is inserted into `Sheet` with
-/// `value: None` (other fields such as style are set as usual), and the
-/// index is kept outside the sheet in this struct instead.
-#[derive(Debug, Clone, Copy)]
-pub struct PendingSharedString {
-    pub cell_ref: CellRef,
-    pub index: usize,
-}
+use crate::model::sheet::Sheet;
+use crate::parse::shared_strings::SharedStringTable;
+// PendingSharedString is Phase 3's own output data, so parse/worksheet.rs
+// defines it (reflects the PR #9 review — see Dependencies).
+use crate::parse::worksheet::PendingSharedString;
 
 /// For each entry in `pending`, looks up the actual string in `table` and
 /// writes it back into the corresponding cell in `sheet` as `CellValue::Text`.
@@ -55,7 +46,7 @@ pub(crate) fn resolve(
 
 ## Dependencies
 
-- Depends on: [`model/sheet.rs`](../model/sheet.en.md) (`Sheet::get_mut`, `CellRef`), [`model/cell.rs`](../model/cell.en.md) (`CellValue::Text`), [`error.rs`](../error.en.md), `parse::shared_strings::SharedStringTable` (not yet designed — see Open Question 1)
+- Depends on: [`model/sheet.rs`](../model/sheet.en.md) (`Sheet::get_mut`), [`model/cell.rs`](../model/cell.en.md) (`CellValue::Text`), [`error.rs`](../error.en.md), [`parse::shared_strings::SharedStringTable`](../parse/shared_strings.en.md), [`parse::worksheet::PendingSharedString`](../parse/worksheet.en.md)
 - Depended on by: [`resolve/mod.rs`](mod.en.md) (called from `resolve_sheet`)
 
 Using `expect` rather than propagating an `Option`/`Result` from `get_mut` might appear to contradict [model/sheet.md](../model/sheet.en.md)'s policy that "`get`/`get_mut` represent a missing cell as `Option`, treating it as a normal case." The difference is that here, "the cell doesn't exist" does not originate from user input (the XLSX file) — it can only occur if `parse/worksheet.rs` recorded a `PendingSharedString` but forgot to call the matching `insert_cell`, i.e. an internal crate programming error (see Error Handling Policy for details).

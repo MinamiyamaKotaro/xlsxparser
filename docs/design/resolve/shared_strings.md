@@ -15,20 +15,11 @@
 ```rust
 use crate::error::Error;
 use crate::model::cell::CellValue;
-use crate::model::sheet::{CellRef, Sheet};
-use crate::parse::shared_strings::SharedStringTable; // parse/shared_strings.rs 未設計（オープンクエスチョン1参照）
-
-/// フェーズ3が `t="s"` セルを検出した時点で記録する保留エントリ。
-/// `model::CellValue` は解決済みの `Text(Arc<str>)` のみを許容し
-/// インデックスをそのまま保持するバリアントを持たないため（[model/cell.md](../model/cell.md)）、
-/// パース時点ではセル自体を `value: None` のまま `Sheet` へ挿入し
-/// （スタイル等の他フィールドは通常通り設定する）、インデックスは
-/// 本構造体としてシートの外側に保持しておく。
-#[derive(Debug, Clone, Copy)]
-pub struct PendingSharedString {
-    pub cell_ref: CellRef,
-    pub index: usize,
-}
+use crate::model::sheet::Sheet;
+use crate::parse::shared_strings::SharedStringTable;
+// PendingSharedStringはフェーズ3の出力データそのものであるため
+// parse/worksheet.rsが定義する（PR #9レビューを反映。依存関係セクション参照）。
+use crate::parse::worksheet::PendingSharedString;
 
 /// `pending` の各エントリについて `table` から実文字列を引き、
 /// `sheet` の対応セルへ `CellValue::Text` として書き戻す。
@@ -55,7 +46,7 @@ pub(crate) fn resolve(
 
 ## 依存関係
 
-- 依存先: [`model/sheet.rs`](../model/sheet.md)（`Sheet::get_mut`, `CellRef`）、[`model/cell.rs`](../model/cell.md)（`CellValue::Text`）、[`error.rs`](../error.md)、`parse::shared_strings::SharedStringTable`（未設計、オープンクエスチョン1参照）
+- 依存先: [`model/sheet.rs`](../model/sheet.md)（`Sheet::get_mut`）、[`model/cell.rs`](../model/cell.md)（`CellValue::Text`）、[`error.rs`](../error.md)、[`parse::shared_strings::SharedStringTable`](../parse/shared_strings.md)、[`parse::worksheet::PendingSharedString`](../parse/worksheet.md)
 - 依存元: [`resolve/mod.rs`](mod.md)（`resolve_sheet` から呼び出される）
 
 `get_mut` が `Option` ではなく `expect` でパニックしうる設計にしている点は、[model/sheet.md](../model/sheet.md) の「`get`/`get_mut` はセル不在を正常系として `Option` で表す」という方針と一見矛盾するように見えるが、ここでの前提は「セルが存在しない」ことがユーザ入力（XLSXファイル）由来ではなく、`parse/worksheet.rs` が `PendingSharedString` を記録した時点で対応する `insert_cell` を呼び忘れた場合にのみ発生する、クレート内部のプログラミングエラーである点が異なる（詳細はエラー処理方針参照）。

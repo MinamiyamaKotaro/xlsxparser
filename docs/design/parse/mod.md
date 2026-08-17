@@ -25,7 +25,7 @@ pub(crate) use relationships::{Relationship, RelationshipMap, TargetMode, parse_
 pub(crate) use shared_strings::{SharedStringTable, parse_shared_strings};
 pub(crate) use styles::parse_styles;
 pub(crate) use workbook::{WorkbookSheetEntry, parse_workbook_xml};
-pub(crate) use worksheet::{WorksheetParseOutput, parse_worksheet};
+pub(crate) use worksheet::{PendingSharedString, PendingStyle, WorksheetParseOutput, parse_worksheet};
 
 use crate::error::Error;
 use quick_xml::events::{BytesStart, Event};
@@ -128,12 +128,12 @@ pub(crate) fn concat_rich_text<R: BufRead>(
 - `convert_xml_error`: 通常のXML構文エラー（不正なタグの閉じ忘れ等）を渡した場合に `Error::XmlParse` へ変換され、`path` が正しく設定されることの確認
 - `required_attr`: 属性が存在する場合に値を取得できること、存在しない場合に `Error::MissingRequiredElement` を返すことの確認
 - `concat_rich_text`: 単一の `<t>`、複数の `<r><t>` ラン、および `<rPh>` を含む入力それぞれについて期待どおりの文字列が得られることの確認（詳細な網羅ケースは [shared_strings.md テスト方針](shared_strings.md) 側で行う。本ファイルでは結線の確認に留める）
-- DOCTYPE宣言と外部実体参照を含む悪意あるXML（XXE攻撃ペイロード）を `create_secure_reader` 経由でパースさせた場合に、外部ファイルの内容がパース結果に一切現れないことを確認する統合的なテスト（要求仕様書2章のXXE要件そのものの検証。個々の `parse/*.rs` 側でも実施するか本ファイルに集約するかは未決定、オープンクエスチョン2参照）
+- DOCTYPE宣言と外部実体参照を含む悪意あるXML（XXE攻撃ペイロード）を `create_secure_reader` 経由でパースさせた場合に、外部ファイルの内容がパース結果に一切現れないことを確認する統合的なテスト（要求仕様書2章のXXE要件そのものの検証。[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を踏まえ、本ファイルへ集約して実施し、個々の `parse/*.rs` 側では重ねて実施しない。XXE対策の核心は `create_secure_reader` が安全に構成された `Reader` を返すことにあり、このファクトリ関数が定義されている本ファイルでテストすることが最も直接的でメンテナンスしやすいため）
 
 ## 未決事項 / オープンクエスチョン
 
 1. **quick-xmlのバージョン選定と `Reader` 設定APIの確定**: [error.md オープンクエスチョン1](../error.md)・[container/mod.md オープンクエスチョン1](../container/mod.md) と連動する論点。バージョンによって `Reader::config_mut()` の有無や設定項目名が異なるため、`Cargo.toml` 整備時に本ファイルのコード例を実際のAPIに合わせて更新する。
-2. **XXE非該当の実証テストの置き場所**: 本ファイルに集約するか、個々の `parse/*.rs`（特に外部入力を最初に受け取る [relationships.rs](relationships.md)）側でも重ねて実施するかは未確定。
+2. ~~XXE非該当の実証テストの置き場所~~ → **解決**: 本ファイルのユニットテストへ集約する（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を反映）。`create_secure_reader` が定義された箇所と同一ファイルに置くことで、対策の核心（安全に構成された `Reader` を返すこと）を直接検証できる。個々の `parse/*.rs` 側で重ねて実施しない。
 3. **`required_attr` の返り値の型**: `String`（アンエスケープ・アロケーション済み）ではなく `Cow<str>` や `&str` を返すことで不要なアロケーションを避けられる可能性があるが、quick-xmlの属性デコードAPI（バージョン依存）と合わせて確定させる。
-4. **名前空間（`r:id` 等）の解決方式**: `workbook.xml` の `<sheet r:id="...">`、`worksheet.xml` セルの一部属性など、OOXMLの `r` 名前空間プレフィックスに依存する属性照合が [workbook.md](workbook.md) を含む複数モジュールに現れる。プレフィックス `r` は慣例的にほぼ固定されるが、技術的には `xmlns:foo="http://schemas.openxmlformats.org/officeDocument/2006/relationships"` のように別名で宣言される正当なXMLも存在するため、文字列前方一致ではなく名前空間URIベースで解決する `quick_xml::NsReader` を `create_secure_reader` の返り値として採用すべきかは未確定。採用する場合は `parse/` 配下全体のAPIに影響するため、本ファイルで一括して決定する必要がある。
+4. ~~名前空間（`r:id` 等）の解決方式~~ → **解決**: `quick_xml::NsReader` による名前空間URIベースの解決は採用せず、`"r:id"` のようなプレフィックス込みの文字列前方一致（`required_attr` へ渡す属性名にプレフィックスを含めて照合する）で簡略化する（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を反映）。Excel・Google スプレッドシート・LibreOffice・Apache POI等、主要な生成ツールがリレーションシップ名前空間のプレフィックスとして例外なく `r` を使用する実務上の慣行を踏まえ、要求仕様書1章が掲げる「軽量かつ高速」という方針を優先する。仮に別名プレフィックスで宣言された正当だが非常に稀なXMLが入力された場合でも、属性が「見つからない」扱いとなり `Error::MissingRequiredElement` として安全側（fail closed）に倒れるため、誤った値を静かに読み取ってしまうリスクはない。
 5. **`worksheet.xml` のような大容量ストリームに対する `Reader` の内部バッファサイズ**: quick-xmlはデフォルトでバッファを動的に拡張するが、要求仕様書が想定する「方眼紙Excel」規模のシートに対しては初期バッファサイズを明示的にチューニングする余地がある。[worksheet.md](worksheet.md) の設計・実装時にプロファイリング結果を踏まえて確定させる。
