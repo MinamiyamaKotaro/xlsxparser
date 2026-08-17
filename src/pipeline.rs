@@ -204,6 +204,33 @@ mod tests {
     }
 
     #[test]
+    fn package_absolute_relationship_target_resolves_like_openpyxl_output() {
+        // openpyxl writes the worksheet relationship as a package-absolute
+        // target (Target="/xl/worksheets/sheet1.xml") while leaving styles/
+        // sharedStrings relative — this exact mixed pattern previously made
+        // every openpyxl-produced .xlsx fail to parse (see
+        // parse::relationships::resolve_target_path's regression test for
+        // the unit-level case; this proves the whole pipeline handles it).
+        let rels_with_absolute_worksheet_target: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="/xl/worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"#;
+        let zip = build_zip(&[
+            (
+                "xl/_rels/workbook.xml.rels",
+                rels_with_absolute_worksheet_target,
+            ),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            ("xl/worksheets/sheet1.xml", WORKSHEET_XML),
+        ]);
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+        assert_eq!(workbook.sheets().len(), 1);
+    }
+
+    #[test]
     fn caller_supplied_size_limits_are_forwarded_to_the_container() {
         // Succeeds under the default limits...
         run(Cursor::new(minimal_xlsx()), SizeLimits::default()).unwrap();

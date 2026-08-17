@@ -96,6 +96,13 @@ pub(crate) fn parse_relationships(
 /// rather than using `std::path::Path`, avoiding OS-dependent path
 /// interpretation (e.g. Windows' `\` separator).
 ///
+/// Per OPC (ECMA-376 Part 2), a `target` starting with `/` is
+/// package-absolute and resolved from the package root, ignoring
+/// `base_dir` entirely, rather than being appended to it — tools such as
+/// openpyxl emit worksheet relationships this way (e.g.
+/// `Target="/xl/worksheets/sheet1.xml"`), so without this case every sheet
+/// in such a package would fail to resolve as a dangling relationship.
+///
 /// A `..` segment is handled naively by popping the previous segment; this
 /// function alone does not guarantee well-defined behavior for a `..` that
 /// goes deeper than `base_dir` (e.g. `base_dir` = `"xl"`, `target` =
@@ -104,7 +111,11 @@ pub(crate) fn parse_relationships(
 /// (`validate_entry_path`) of whatever path this function produces (defense
 /// in depth).
 fn resolve_target_path(base_dir: &str, target: &str) -> String {
-    let mut segments: Vec<&str> = base_dir.split('/').filter(|s| !s.is_empty()).collect();
+    let mut segments: Vec<&str> = if target.starts_with('/') {
+        Vec::new()
+    } else {
+        base_dir.split('/').filter(|s| !s.is_empty()).collect()
+    };
     for part in target.split('/') {
         match part {
             "" | "." => {}
@@ -205,6 +216,23 @@ mod tests {
         // Popping past an empty `segments` must not panic; the result is
         // whatever it is — final rejection is `container::get_entry`'s job.
         let result = resolve_target_path("xl", "../../evil");
+        assert_eq!(result, "evil");
+    }
+
+    #[test]
+    fn resolve_target_path_package_absolute_target_ignores_base_dir() {
+        // openpyxl-style: Target="/xl/worksheets/sheet1.xml" from a rels
+        // part anchored at "xl". Must resolve from the package root, not
+        // "xl" + "/xl/worksheets/sheet1.xml" = "xl/xl/worksheets/sheet1.xml".
+        assert_eq!(
+            resolve_target_path("xl", "/xl/worksheets/sheet1.xml"),
+            "xl/worksheets/sheet1.xml"
+        );
+    }
+
+    #[test]
+    fn resolve_target_path_package_absolute_target_with_excessive_parent_dir_does_not_panic() {
+        let result = resolve_target_path("xl", "/../../evil");
         assert_eq!(result, "evil");
     }
 }
