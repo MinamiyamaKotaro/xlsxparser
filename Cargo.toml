@@ -1,11 +1,15 @@
 [package]
 name = "xlsxparser"
-version = "0.0.0"
+version = "0.10.0"
 edition = "2021"
 description = "A lightweight, high-performance .xlsx (OOXML) parser library"
 repository = "https://github.com/MinamiyamaKotaro/xlsxparser"
 license = "MIT"
-publish = false
+# The tests/fixtures/*/*.xlsx binaries (~1.5MiB of the ~2.3MiB unpacked
+# package) exist only for `cargo test` inside a git checkout of this repo
+# and are irrelevant to a published crate's consumers — excluded to keep
+# a "lightweight" library's own published package lightweight.
+exclude = ["tests/fixtures/**/*.xlsx"]
 
 [dependencies]
 quick-xml = "0.41.0"
