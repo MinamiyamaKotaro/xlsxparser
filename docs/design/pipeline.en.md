@@ -7,6 +7,7 @@ Design doc for `src/pipeline.rs`. This is the orchestrator for the 5-phase pipel
 ## Responsibility / Scope
 
 - Owns a [`container::ZipContainer`](container/mod.en.md) and calls `get_entry` sequentially throughout Phases 1–4 (fully consuming one entry before fetching the next — following the sequential-access pattern [container/mod.md](container/mod.en.md) already enforces via `get_entry`'s type signature)
+- Forwards the `SizeLimits` ([lib.md](lib.en.md)) received from the caller (`lib.rs`) into `with_max_entry_size` / `with_max_total_size` ([container/mod.md](container/mod.en.md)) right after `ZipContainer::open_reader`, so callers can override the Zip Bomb size caps (security review Finding 2, Issue [#14](https://github.com/MinamiyamaKotaro/xlsxparser/issues/14))
 - **Phase 1**: fetches and parses `xl/_rels/workbook.xml.rels` and `xl/workbook.xml`, building a "routing plan" of sheet names, visibility, and backing file paths. It also identifies the relationships to `sharedStrings.xml` / `styles.xml` within `xl/_rels/workbook.xml.rels` by relationship type (`Relationship.rel_type`) — implementing the division of labor [relationships.md Not Responsible For](parse/relationships.en.md) assigned to the caller: "which `r:id` corresponds to which part kind is the caller's job"
 - Once the routing plan is built, lets the reader used for the rels read and the [`parse::RelationshipMap`](parse/relationships.en.md) go out of scope and be dropped (implements architecture.md's "dispose of the `_rels` scratch buffer immediately once the routing map is built at the end of Phase 1")
 - Once the routing plan is finalized, builds the [`SharedStringTable`](parse/shared_strings.en.md) and [`StyleSheet`](model/style.en.md) exactly once, before entering the per-sheet loop
@@ -17,6 +18,7 @@ Design doc for `src/pipeline.rs`. This is the orchestrator for the 5-phase pipel
 ## Key Types / Functions (draft)
 
 ```rust
+use crate::container::sanitize::SizeLimits;
 use crate::container::ZipContainer;
 use crate::error::Error;
 use crate::model::sheet::{Sheet, SheetVisibility};
@@ -44,9 +46,15 @@ struct SheetRoute {
 /// Question 2) calls this function. Generic over `Read + Seek` because it
 /// simply carries forward [container/mod.md](container/mod.en.md)'s
 /// `ZipContainer::open_reader` constraint (reading the ZIP central
-/// directory requires a seekable input).
-pub(crate) fn run<R: Read + Seek>(reader: R) -> Result<Workbook, Error> {
-    let mut container = ZipContainer::open_reader(reader)?;
+/// directory requires a seekable input). `limits` is the Zip Bomb size cap
+/// ([lib.md](lib.en.md)'s `SizeLimits`) — `lib.rs`'s `parse_workbook` /
+/// `parse_workbook_reader` pass `SizeLimits::default()`, while
+/// `parse_workbook_with_limits` / `parse_workbook_reader_with_limits` pass
+/// the caller-supplied value straight through.
+pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workbook, Error> {
+    let mut container = ZipContainer::open_reader(reader)?
+        .with_max_entry_size(limits.max_entry_size)
+        .with_max_total_size(limits.max_total_size);
 
     // --- Phase 1: relationship resolution and building the routing plan ---
     let rels_reader = container
@@ -157,6 +165,7 @@ pub(crate) fn run<R: Read + Seek>(reader: R) -> Result<Workbook, Error> {
 - Verify that for a book with multiple sheets, each ends up in `Workbook.sheets()` in the order `xl/workbook.xml`'s `<sheets>` defines them (wiring to [model/workbook.md](model/workbook.en.md)'s source-order policy)
 - Verify that if a later sheet (e.g. the second) fails to parse, the whole call returns `Err` rather than a `Workbook`, even though the first sheet was processed successfully (a regression test for fail-closed behavior)
 - Verify that a book containing `Hidden`/`VeryHidden` sheets still includes every sheet in `Workbook`, none excluded (wiring to [model/workbook.md Open Question 1](model/workbook.en.md))
+- Verify that passing `run` a `SizeLimits` whose `max_entry_size` is smaller than `DEFAULT_MAX_UNCOMPRESSED_SIZE` turns an input that would otherwise succeed into `Error::ZipBombDetected` (a wiring test confirming `SizeLimits` actually reaches `ZipContainer`; `with_max_entry_size`/`with_max_total_size`'s own logic is verified under [container/mod.md](container/mod.en.md))
 
 ## Open Questions
 

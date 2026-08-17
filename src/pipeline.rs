@@ -2,6 +2,7 @@
 //! `parse/`, `resolve/`, and `model/` in call order, and controls resource
 //! lifetimes (see `docs/design/architecture.en.md` design principle 3).
 
+use crate::container::sanitize::SizeLimits;
 use crate::container::ZipContainer;
 use crate::error::Error;
 use crate::model::{Sheet, SheetVisibility, Workbook};
@@ -27,9 +28,14 @@ struct SheetRoute {
 /// `Workbook`. `lib.rs`'s public API (`parse_workbook`, etc.) calls this
 /// function. Generic over `Read + Seek` since it simply carries
 /// forward `container::ZipContainer::open_reader`'s constraint (reading the
-/// ZIP central directory requires a seekable input).
-pub(crate) fn run<R: Read + Seek>(reader: R) -> Result<Workbook, Error> {
-    let mut container = ZipContainer::open_reader(reader)?;
+/// ZIP central directory requires a seekable input). `limits` is the Zip
+/// Bomb size cap; `lib.rs`'s default-cap functions pass
+/// `SizeLimits::default()`, while its `_with_limits` functions pass the
+/// caller-supplied value straight through.
+pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workbook, Error> {
+    let mut container = ZipContainer::open_reader(reader)?
+        .with_max_entry_size(limits.max_entry_size)
+        .with_max_total_size(limits.max_total_size);
 
     // --- Phase 1: relationship resolution and building the routing plan ---
     let rels_reader = container
@@ -177,7 +183,7 @@ mod tests {
 
     #[test]
     fn minimal_valid_xlsx_resolves_end_to_end() {
-        let workbook = run(Cursor::new(minimal_xlsx())).unwrap();
+        let workbook = run(Cursor::new(minimal_xlsx()), SizeLimits::default()).unwrap();
 
         assert_eq!(workbook.sheets().len(), 1);
         let sheet = &workbook.sheets()[0];
@@ -198,16 +204,33 @@ mod tests {
     }
 
     #[test]
+    fn caller_supplied_size_limits_are_forwarded_to_the_container() {
+        // Succeeds under the default limits...
+        run(Cursor::new(minimal_xlsx()), SizeLimits::default()).unwrap();
+
+        // ...but a caller-supplied max_entry_size small enough to reject
+        // xl/workbook.xml turns the same input into Error::ZipBombDetected,
+        // proving `limits` actually reaches `ZipContainer` rather than being
+        // silently ignored in favor of the DEFAULT_MAX_* constants.
+        let tiny_limits = SizeLimits {
+            max_entry_size: 1,
+            max_total_size: SizeLimits::default().max_total_size,
+        };
+        let err = run(Cursor::new(minimal_xlsx()), tiny_limits).unwrap_err();
+        assert!(matches!(err, Error::ZipBombDetected { .. }));
+    }
+
+    #[test]
     fn missing_workbook_rels_is_missing_relationship_part() {
         let zip = build_zip(&[("xl/workbook.xml", WORKBOOK_XML)]);
-        let err = run(Cursor::new(zip)).unwrap_err();
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
         assert!(matches!(err, Error::MissingRelationshipPart(_)));
     }
 
     #[test]
     fn missing_workbook_xml_is_invalid_package() {
         let zip = build_zip(&[("xl/_rels/workbook.xml.rels", RELS_XML)]);
-        let err = run(Cursor::new(zip)).unwrap_err();
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
         assert!(matches!(err, Error::InvalidPackage(_)));
     }
 
@@ -221,7 +244,7 @@ mod tests {
             ("xl/workbook.xml", WORKBOOK_XML),
             ("xl/styles.xml", STYLES_XML),
         ]);
-        let err = run(Cursor::new(zip)).unwrap_err();
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
         assert!(matches!(err, Error::DanglingRelationship { .. }));
     }
 
@@ -234,7 +257,7 @@ mod tests {
             // xl/styles.xml intentionally omitted, even though rels points to it.
             ("xl/worksheets/sheet1.xml", WORKSHEET_XML),
         ]);
-        let err = run(Cursor::new(zip)).unwrap_err();
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
         assert!(matches!(err, Error::InvalidPackage(_)));
     }
 
@@ -247,7 +270,7 @@ mod tests {
             ("xl/styles.xml", STYLES_XML),
             // xl/worksheets/sheet1.xml intentionally omitted.
         ]);
-        let err = run(Cursor::new(zip)).unwrap_err();
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
         assert!(matches!(err, Error::DanglingRelationship { .. }));
     }
 
@@ -271,7 +294,7 @@ mod tests {
             ("xl/styles.xml", STYLES_XML),
             ("xl/worksheets/sheet1.xml", workbook_no_strings),
         ]);
-        let workbook = run(Cursor::new(zip)).unwrap();
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
         assert_eq!(workbook.sheets().len(), 1);
     }
 
@@ -297,7 +320,7 @@ mod tests {
             ("xl/worksheets/sheet1.xml", blank_sheet),
             ("xl/worksheets/sheet2.xml", blank_sheet),
         ]);
-        let workbook = run(Cursor::new(zip)).unwrap();
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
         let names: Vec<&str> = workbook.sheets().iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["First", "Second"]);
     }
@@ -327,7 +350,7 @@ mod tests {
             ("xl/worksheets/sheet1.xml", good_sheet),
             ("xl/worksheets/sheet2.xml", broken_sheet),
         ]);
-        let err = run(Cursor::new(zip)).unwrap_err();
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
         assert!(matches!(err, Error::MissingRequiredElement { .. }));
     }
 
@@ -356,7 +379,7 @@ mod tests {
             ("xl/worksheets/sheet2.xml", blank_sheet),
             ("xl/worksheets/sheet3.xml", blank_sheet),
         ]);
-        let workbook = run(Cursor::new(zip)).unwrap();
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
         assert_eq!(workbook.sheets().len(), 3);
     }
 }

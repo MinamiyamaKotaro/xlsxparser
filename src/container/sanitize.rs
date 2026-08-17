@@ -6,13 +6,39 @@ use std::io::{self, Read};
 
 /// The default uncompressed-size cap for Phase 2, per individual entry (in
 /// bytes).
-pub const DEFAULT_MAX_UNCOMPRESSED_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB (provisional)
+pub const DEFAULT_MAX_UNCOMPRESSED_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB
 
 /// The default cumulative uncompressed-size cap for Phase 2, across the
 /// whole archive (in bytes). Defends against the variant of Zip Bomb built
 /// from many moderately-sized entries whose cumulative total becomes
 /// enormous.
-pub const DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB (provisional)
+pub const DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// Public configuration type callers use to set the Zip Bomb size caps.
+/// `lib.rs` re-exports this at the crate root and uses it as the argument
+/// to `parse_workbook_with_limits`/`parse_workbook_reader_with_limits`.
+/// `Default` reuses `DEFAULT_MAX_UNCOMPRESSED_SIZE` /
+/// `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE` as-is, so the default-cap public
+/// functions (`parse_workbook`/`parse_workbook_reader`) need only pass
+/// `SizeLimits::default()` rather than duplicating the values.
+#[derive(Debug, Clone, Copy)]
+pub struct SizeLimits {
+    /// The per-entry (sheet XML, etc.) uncompressed-size cap, in bytes.
+    /// Passed straight through to `ZipContainer::with_max_entry_size`.
+    pub max_entry_size: u64,
+    /// The archive-wide cumulative uncompressed-size cap, in bytes. Passed
+    /// straight through to `ZipContainer::with_max_total_size`.
+    pub max_total_size: u64,
+}
+
+impl Default for SizeLimits {
+    fn default() -> Self {
+        Self {
+            max_entry_size: DEFAULT_MAX_UNCOMPRESSED_SIZE,
+            max_total_size: DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE,
+        }
+    }
+}
 
 /// Validates that a ZIP entry name cannot escape the archive's logical root
 /// (Zip Slip protection). `container/mod.rs` calls this for every entry name
@@ -144,6 +170,13 @@ impl<R: Read> Read for BoundedReader<'_, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn size_limits_default_matches_the_default_constants() {
+        let limits = SizeLimits::default();
+        assert_eq!(limits.max_entry_size, DEFAULT_MAX_UNCOMPRESSED_SIZE);
+        assert_eq!(limits.max_total_size, DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE);
+    }
 
     #[test]
     fn validate_entry_path_rejects_traversal_and_malformed_names() {
