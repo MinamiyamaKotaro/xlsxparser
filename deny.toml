@@ -1,0 +1,25 @@
+# cargo-deny configuration. See https://embarkstudios.github.io/cargo-deny/
+#
+# Provisional scaffold for CI (Issue #16); revisit the [licenses] allow-list
+# once real dependencies (quick-xml, zip, ...) are added under Issue #15.
+
+[advisories]
+ignore = []
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

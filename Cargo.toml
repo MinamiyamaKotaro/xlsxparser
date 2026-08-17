@@ -1,0 +1,14 @@
+[package]
+name = "xlsxparser"
+version = "0.0.0"
+edition = "2021"
+description = "A lightweight, high-performance .xlsx (OOXML) parser library"
+repository = "https://github.com/MinamiyamaKotaro/xlsxparser"
+# license is TBD (see README.md "License"); set once decided.
+publish = false
+
+# Provisional scaffold for CI (Issue #16). Module implementation (Issue #15)
+# adds dependencies (quick-xml, zip, ...) and source files as each is built,
+# per docs/design/architecture.en.md.
+
+[dependencies]

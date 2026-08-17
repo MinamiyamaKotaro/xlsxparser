@@ -1,5 +1,9 @@
 /target
 
+# Library crate: Cargo.lock is not checked in (see Cargo book guidance for
+# libraries). CI generates its own lockfile per run.
+/Cargo.lock
+
 # Claude Code local config (not part of the published project)
 .claude/
 
