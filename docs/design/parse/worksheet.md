@@ -172,6 +172,13 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 - 不正なA1形式の `r` 属性・`mergeCell ref` 属性に対し `Error::InvalidCellRef` を返すことの確認
 - `<f>` 要素を含むセル（数式セル）について、`<f>` の内容が無視され `<v>`（計算済みキャッシュ値）のみが `Cell` の値として採用されることの確認
 
+## 実装メモ
+
+- **状態機械の形**: `<c>` の子要素（`<v>`/`<f>`/`<is>`）は互いに入れ子にならないため、専用の状態enumではなくフラットな `cur_*` ローカル変数（`cur_ref: Option<CellRef>` が「`<c>` の中にいるか」を兼ねる。加えて `cur_type`/`cur_style`/`cur_value_text`/`cur_inline`）で実装した。各変数は `<c>` の開始タグを見た瞬間に必ず新規初期化され、終了タグ（自己終了 `<c/>` の場合は即座に）までに共通ヘルパー `flush_cell` で消費し切る。行やセルを跨いで状態が漏れないことを実際に保証しているのは、明示的な行境界でのリセットではなく、この「セルごとの毎回フル初期化」である。
+- **`build_cell` のシグネチャ**: ドラフトが未使用のまま `let _ = (cell_ref, style_id);` としていた `cell_ref`/`style_id` 引数は削除した。値/スタイルの振り分けは呼び出し元（`flush_cell`）が担い、`build_cell` 自体は不要。
+- **`<v>`/`<f>` のテキスト読み取り**: ドラフトには無かった `read_leaf_text` ヘルパーを追加した。quick-xml 0.41 では実体参照が `Event::Text` とは別の `Event::GeneralRef` としてトークン化されるため（[parse/mod.md オープンクエスチョン1](mod.md)参照）、`concat_rich_text` と同じ共通ヘルパー `push_general_ref`（[parse/mod.rs](mod.md)）経由で解決する。
+- **`flush_cell` の挿入判定**: `<c>` は、スタイル（`s`属性）・値（`<v>`/`<is>` のテキスト）・`t="s"`参照（解決後に値を持つ）のいずれかを持つ場合にのみ挿入する。疎行列の要件通り、完全に空の `<c r="A1"/>` はインスタンス化しない。
+
 ## 未決事項 / オープンクエスチョン
 
 1. ~~`PendingSharedString` / `PendingStyle` の配置場所の再検討~~ → **解決**: 両型の定義を本ファイル（`parse/worksheet.rs`）へ移設し、[`resolve/shared_strings.rs`](../resolve/shared_strings.md) / [`resolve/style.rs`](../resolve/style.md) 側がそれぞれを `use` する構造とした（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を反映）。詳細は依存関係セクション参照。
