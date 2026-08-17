@@ -49,6 +49,12 @@ src/
 
 ## Module Responsibility Details
 
+### `lib.rs`
+
+The crate root. Defines the public API entry points (`parse_workbook(path) -> Result<Workbook>`, etc.) and declares `container/` `parse/` `resolve/` `pipeline.rs` `json.rs` as private `mod`s, hiding them as crate-internal implementation, while re-exporting outward only a subset of `model/`'s types plus `error::Error`.
+
+- Detailed design: [lib.md](lib.en.md)
+
 ### `error.rs`
 
 Defines the single `Error` enum shared across the entire crate. It is the most foundational leaf module, depending on no other module in the crate (including `model/`), and is depended on by nearly every module: `container/`, `parse/`, `model/`, `resolve/`, `pipeline.rs`, `lib.rs`.
