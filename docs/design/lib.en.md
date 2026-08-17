@@ -7,6 +7,7 @@ Design doc for `src/lib.rs`. This is the crate root, and implements the "public 
 ## Responsibility / Scope
 
 - Defines the crate's public API functions: `parse_workbook`, which parses `.xlsx` from a file path, and `parse_workbook_reader`, which parses directly from any `Read + Seek` (both thin wrappers that internally call [`pipeline::run`](pipeline.en.md))
+- `parse_workbook` backfills its own known file path into any `Error::Io { path: None, .. }` arising inside `pipeline::run` (after `File::open` succeeds, during ZIP extraction or XML streaming) before returning it to the caller (reflects the [PR #11 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/11#pullrequestreview-4949346233))
 - Decides which submodules are exposed outside the crate. `container` / `parse` / `resolve` / `pipeline` / `json` are declared as private `mod`s, hiding them as crate-internal implementation. Even where an individual item is defined as `pub fn` within its own file (e.g. [`container::ZipContainer::open`](container/mod.en.md)), if the enclosing `mod` itself is private, Rust's visibility rules make it unreachable from outside the crate regardless (see Dependencies for details)
 - Re-exports to the crate root, from the types `model/` defines, the ones reachable from outside via `Workbook` (`Workbook`, `Sheet`, `Cell`, `CellValue`, `CellRef`, `SheetVisibility`, `MergedRegion`, `ResolvedStyle`, `StyleId`, `DateTimeValue`), along with `error::{Error, Result}`
 - Re-exports `json::{to_json_writer, to_json_string}` directly to the crate root, exposing the `Workbook`-to-JSON conversion as an independent second step (implements the resolution of [pipeline.md Open Question 1](pipeline.en.md))
@@ -36,14 +37,36 @@ use std::path::Path;
 
 /// Parses `.xlsx` from a file path — the most common public entry point.
 /// A thin wrapper that opens a `std::fs::File` internally and delegates to
-/// [`pipeline::run`](pipeline.en.md).
+/// [`pipeline::run`](pipeline.en.md). Beyond a failure of `File::open`
+/// itself, any I/O error arising inside `pipeline::run` (during ZIP
+/// extraction or XML streaming) with `path` left unset (`None`) is
+/// backfilled with the file path this function already knows before being
+/// returned (reflects the [PR #11
+/// review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/11#pullrequestreview-4949346233)).
 pub fn parse_workbook(path: impl AsRef<Path>) -> Result<Workbook> {
     let path = path.as_ref();
     let file = File::open(path).map_err(|source| Error::Io {
         path: Some(path.to_path_buf()),
         source,
     })?;
-    pipeline::run(file)
+    pipeline::run(file).map_err(|err| fill_io_path(err, path))
+}
+
+/// Backfills the file path `parse_workbook` already knows into an
+/// `Error::Io { path: None, .. }` propagated from `pipeline::run`. Any
+/// other variant is returned unchanged. `Error::XmlParse` /
+/// `Error::MissingRequiredElement` also carry a `path` field, but theirs
+/// names a part within the OPC package (e.g. `"xl/worksheets/sheet1.xml"`)
+/// — a different meaning from a filesystem path — so they are excluded
+/// from backfilling.
+fn fill_io_path(err: Error, path: &Path) -> Error {
+    match err {
+        Error::Io { path: None, source } => Error::Io {
+            path: Some(path.to_path_buf()),
+            source,
+        },
+        other => other,
+    }
 }
 
 /// Parses `.xlsx` from any `Read + Seek` input (an in-memory buffer, a
@@ -70,13 +93,15 @@ Declaring `container` / `parse` / `resolve` / `pipeline` / `json` as private `mo
 ## Error Handling Policy
 
 - `parse_workbook` converts a `std::fs::File::open` failure into `Error::Io { path: Some(path), source }`. It can set `path` to `Some` because this function itself holds the concrete context — a file path. This is exactly the usage [error.md](error.en.md) had in mind for the `Some` side of `Io::path: Option<PathBuf>`
-- `parse_workbook_reader` generates no I/O error itself (`reader` is already an in-memory or caller-provided input; this function performs no opening step on it). Any error arising within `pipeline::run` (e.g. `container::ZipContainer::open_reader` detecting a corrupt byte sequence when trying to read it as a ZIP) simply propagates via `?`. Any `Error::Io` generated there has `path: None` — this is exactly the "input that doesn't go through a file path, or a future `Read`-trait input `lib.rs` accepts" case [error.md](error.en.md) had already anticipated when designing `Io::path: Option<PathBuf>`
-- This file itself never generates a new `Error` variant. It simply returns existing variants (everything besides the `Io` case above propagates up from `pipeline::run` and below) straight to the caller
+- **`parse_workbook` backfills any `Error::Io { path: None, .. }` returned by `pipeline::run` via `fill_io_path`** (reflects the [PR #11 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/11#pullrequestreview-4949346233)). When `File::open` itself succeeds but an I/O error occurs later, during ZIP extraction or XML streaming (e.g. the file is deleted or corrupted mid-read), `pipeline::run` has no way of knowing which filesystem path `container::ZipContainer` etc. is reading from, so it returns `Error::Io` with `path` left as `None`. `parse_workbook` rewrites that `None` using the file path it already holds before returning to the caller, so the caller reliably gets the file name regardless of which stage of parsing the I/O error occurred in. `Error::XmlParse` / `Error::MissingRequiredElement`'s `path` field names a part within the OPC package (e.g. `"xl/worksheets/sheet1.xml"`) — a different meaning from a filesystem path — so `fill_io_path` excludes them from backfilling
+- `parse_workbook_reader` generates no I/O error itself (`reader` is already an in-memory or caller-provided input; this function performs no opening step on it). Any error arising within `pipeline::run` simply propagates via `?`. Any `Error::Io` generated there is never backfilled and stays `path: None` (unlike `parse_workbook`, this function never had a file path in the first place, so there is nothing to backfill with) — this is exactly the "input that doesn't go through a file path" case [error.md](error.en.md) had already anticipated when designing `Io::path: Option<PathBuf>`
+- This file itself never generates a new `Error` variant. It simply returns existing variants (everything besides the `Io` case above propagates up from `pipeline::run` and below) straight to the caller. `fill_io_path` only rewrites the `path` field of an existing `Error::Io` instance; it never constructs a new variant
 
 ## Testing Strategy
 
 - Verify that passing a valid `.xlsx` file path to `parse_workbook` returns `Ok(Workbook)` (a filesystem-backed integration test)
 - Verify that passing a non-existent path to `parse_workbook` returns `Error::Io { path: Some(path), .. }` (including that `path` is set correctly)
+- **Unit-test `fill_io_path` directly: verify that passing `Error::Io { path: None, .. }` rewrites `path` to `Some`, and that `Error::Io { path: Some(..), .. }` or any other variant (e.g. `Error::XmlParse`) passes through unchanged** (a unit test for the backfill behavior added by the PR #11 review; an integration test that actually reproduces an I/O error mid-read inside `pipeline::run` would depend on filesystem-operation timing and tend to be flaky, so a direct unit test of `fill_io_path` is used instead)
 - Verify that passing a `std::io::Cursor<Vec<u8>>` holding valid `.xlsx`-shaped bytes to `parse_workbook_reader` returns `Ok(Workbook)`
 - Verify that `parse_workbook` (via a file) and `parse_workbook_reader` (in-memory) return the same `Workbook` for identical `.xlsx` data (a wiring test confirming both functions are simple delegations to `pipeline::run`)
 - Verify that passing `parse_workbook`'s return value directly into `to_json_string` yields a valid JSON string (an end-to-end test verifying the two-step public API actually chains together)

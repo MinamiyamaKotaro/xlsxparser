@@ -7,6 +7,7 @@
 ## 責務・スコープ
 
 - クレートの公開API関数を定義する: ファイルパスから `.xlsx` をパースする `parse_workbook`、任意の `Read + Seek` から直接パースする `parse_workbook_reader`（いずれも内部で [`pipeline::run`](pipeline.md) を呼び出す薄いラッパー）
+- `parse_workbook` は、`pipeline::run` の内部（`File::open` 成功後、ZIP展開やXMLストリーミングの過程）で発生したI/Oエラーの `Error::Io { path: None, .. }` に対し、自身が知っているファイルパスを補完してから呼び出し元へ返す（[PR #11 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/11#pullrequestreview-4949346233)を反映）
 - どのサブモジュールをクレート外部へ公開するかを決定する。`container` / `parse` / `resolve` / `pipeline` / `json` は非公開の `mod` として宣言し、クレート内部実装として隠蔽する。個々のファイル内では `pub fn` として定義されている項目（例: [`container::ZipContainer::open`](container/mod.md)）があっても、包含する `mod` 自体が非公開であればRustの可視性規則上クレート外部からは到達不能になる（詳細は依存関係セクション参照）
 - `model/` が定義する型のうち、`Workbook` を介して外部から到達しうる型（`Workbook`, `Sheet`, `Cell`, `CellValue`, `CellRef`, `SheetVisibility`, `MergedRegion`, `ResolvedStyle`, `StyleId`, `DateTimeValue`）と `error::{Error, Result}` をクレートルートへ再エクスポートする
 - `json::{to_json_writer, to_json_string}` をそのままクレートルートへ再エクスポートし、`Workbook` からJSONへの変換を独立した2段目のステップとして公開する（[pipeline.md オープンクエスチョン1](pipeline.md) の解決を実装する）
@@ -36,14 +37,34 @@ use std::path::Path;
 
 /// ファイルパスから `.xlsx` をパースする、最も一般的な公開エントリポイント。
 /// 内部で `std::fs::File` を開き [`pipeline::run`](pipeline.md) へ委譲する
-/// 薄いラッパー。
+/// 薄いラッパー。`File::open` 自体の失敗だけでなく、`pipeline::run` の
+/// 内部（ZIP展開中やXMLストリーミング中）で発生したI/Oエラーについても、
+/// `path` が未設定（`None`）であれば本関数が知っているファイルパスで
+/// 補完してから返す（[PR #11 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/11#pullrequestreview-4949346233)
+/// を反映）。
 pub fn parse_workbook(path: impl AsRef<Path>) -> Result<Workbook> {
     let path = path.as_ref();
     let file = File::open(path).map_err(|source| Error::Io {
         path: Some(path.to_path_buf()),
         source,
     })?;
-    pipeline::run(file)
+    pipeline::run(file).map_err(|err| fill_io_path(err, path))
+}
+
+/// `pipeline::run` から伝播した `Error::Io { path: None, .. }` に、
+/// `parse_workbook` が知っているファイルパスを補完する。それ以外の
+/// バリアントはそのまま返す。`Error::XmlParse` / `Error::MissingRequiredElement`
+/// も `path` フィールドを持つが、これらはOPCパッケージ内のパーツ名
+/// （例: `"xl/worksheets/sheet1.xml"`）を表しファイルシステムパスとは
+/// 意味が異なるため補完対象に含めない。
+fn fill_io_path(err: Error, path: &Path) -> Error {
+    match err {
+        Error::Io { path: None, source } => Error::Io {
+            path: Some(path.to_path_buf()),
+            source,
+        },
+        other => other,
+    }
 }
 
 /// 任意の `Read + Seek` 入力（インメモリバッファ、HTTPレスポンスボディを
@@ -69,13 +90,15 @@ pub fn parse_workbook_reader<R: Read + Seek>(reader: R) -> Result<Workbook> {
 ## エラー処理方針
 
 - `parse_workbook` は `std::fs::File::open` の失敗を `Error::Io { path: Some(path), source }` へ変換する。`path` を `Some` にできるのは、ファイルパスという具体的な文脈を本関数自身が持っているためであり、[error.md](error.md) が定義する `Io::path: Option<PathBuf>` の `Some` 側の使用例そのものである
-- `parse_workbook_reader` はそれ自身がI/Oエラーを生成する処理を持たない（`reader` は既にメモリ上または呼び出し側が用意した入力であり、本関数はそれを開く処理を行わない）。`pipeline::run` の内部（例えば `container::ZipContainer::open_reader` がZIPとして破損したバイト列を検知した場合）で発生するエラーはそのまま `?` で伝播する。ここで生成されうる `Error::Io` の `path` は `None` となる — [error.md](error.md) が `Io::path: Option<PathBuf>` の設計時に既に想定していた「ファイルパスを経由しない入力、または将来 `lib.rs` が `Read` トレイト入力を受け付ける場合」がまさに本関数に該当する
-- 本ファイル自身は新たな `Error` バリアントを生成しない。既存のバリアント（`Io` 以外はすべて `pipeline::run` 以下から伝播する）をそのまま呼び出し元へ返す
+- **`parse_workbook` は `pipeline::run` から返る `Error::Io { path: None, .. }` を `fill_io_path` で補完する**（[PR #11 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/11#pullrequestreview-4949346233)を反映）。`File::open` 自体は成功したがその後のZIP展開・XMLストリーミング中にI/Oエラーが起きた場合（例えば読み取り中にファイルが削除・破損した場合）、`pipeline::run` は `container::ZipContainer` 等がどのファイルパスから読んでいるかを知らないため `path: None` のまま `Error::Io` を返す。`parse_workbook` はこの `None` を自身が保持しているファイルパスで書き換えてから呼び出し元へ返すことで、パース処理のどの段階で発生したI/Oエラーであっても呼び出し元がファイル名を確実に得られるようにする。`Error::XmlParse` / `Error::MissingRequiredElement` の `path` フィールドはOPCパッケージ内のパーツ名（例: `"xl/worksheets/sheet1.xml"`）を表しファイルシステムパスとは意味が異なるため、`fill_io_path` の補完対象には含めない
+- `parse_workbook_reader` はそれ自身がI/Oエラーを生成する処理を持たない（`reader` は既にメモリ上または呼び出し側が用意した入力であり、本関数はそれを開く処理を行わない）。`pipeline::run` の内部で発生するエラーはそのまま `?` で伝播する。ここで生成されうる `Error::Io` の `path` は補完されず `None` のままとなる（`parse_workbook` と異なり、本関数はファイルパスという文脈を最初から持たないため補完しようがない） — [error.md](error.md) が `Io::path: Option<PathBuf>` の設計時に既に想定していた「ファイルパスを経由しない入力」がまさに本関数に該当する
+- 本ファイル自身は新たな `Error` バリアントを生成しない。既存のバリアント（`Io` 以外はすべて `pipeline::run` 以下から伝播する）をそのまま呼び出し元へ返す。`fill_io_path` は既存の `Error::Io` インスタンスの `path` フィールドを書き換えるのみで、新しいバリアントを生成しない
 
 ## テスト方針
 
 - 正当な `.xlsx` ファイルへのパスを `parse_workbook` に渡した場合に `Ok(Workbook)` が得られることの確認（ファイルシステム経由の統合テスト）
 - 存在しないパスを `parse_workbook` に渡した場合に `Error::Io { path: Some(path), .. }` を返すことの確認（`path` が正しく設定されていることを含む）
+- **`fill_io_path` 単体に対し、`Error::Io { path: None, .. }` を渡した場合に `path` が `Some` へ書き換わること、`Error::Io { path: Some(..), .. }` や他バリアント（`Error::XmlParse` 等）を渡した場合は変更されずそのまま返ることの確認**（PR #11 レビューで追加した補完仕様の単体テスト。`pipeline::run` の内部で実際にファイル読み取り中のI/Oエラーを再現させる統合テストはファイルシステム操作のタイミングに依存し不安定になりやすいため、`fill_io_path` 単体のテストで代替する）
 - 正当な `.xlsx` 相当のバイト列を持つ `std::io::Cursor<Vec<u8>>` を `parse_workbook_reader` に渡した場合に `Ok(Workbook)` が得られることの確認
 - 同一の `.xlsx` データに対し `parse_workbook`（ファイル経由）と `parse_workbook_reader`（インメモリ経由）が同じ `Workbook` を返すことの確認（両関数が `pipeline::run` への単純な委譲であることの結線テスト）
 - `parse_workbook` の返り値を `to_json_string` にそのまま渡し、有効なJSON文字列が得られることの確認（公開APIの2段構成が実際に連結して動作することを検証するE2Eテスト）
