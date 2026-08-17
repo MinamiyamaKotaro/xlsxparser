@@ -7,8 +7,8 @@ Design doc for `src/model/sheet.rs`. Using `Cell` / `CellRef` from [model/cell.m
 ## Responsibility / Scope
 
 - Defines `Sheet`, a sparse matrix that holds only cells with data or formatting, backed by `HashMap<CellRef, Cell>`
-- Holds the "virtual cell coordinate → origin cell" alias reference mapping for merged cells, enabling transparent access via `get()`
-- Keeps `cells` / `merge_aliases` / `merged_regions` fully private, and only allows mutation through a narrow `pub(crate)` API (`insert_cell` / `insert_merge` / `get_mut`), so that `Sheet` itself enforces internal invariants such as keeping `max_row`/`max_col` in sync and backfilling a placeholder for a merge's origin cell
+- Resolves a virtual cell coordinate inside a merged region to its origin cell, enabling transparent access via `get()` (see Key Types for how — a bug found at implementation time ruled out the originally-drafted per-cell alias map; see the note right after the code block)
+- Keeps `cells` / `merged_regions` fully private, and only allows mutation through a narrow `pub(crate)` API (`insert_cell` / `insert_merge` / `get_mut`), so that `Sheet` itself enforces internal invariants such as keeping `max_row`/`max_col` in sync and backfilling a placeholder for a merge's origin cell
 - **Not responsible for**: parsing `<mergeCells>` XML (`parse/worksheet.rs`), or the decision logic that matches merge ranges against cell data and calls `insert_merge` (`resolve/merge.rs` — this file only provides the API that safely builds the mapping once called)
 
 ## Key Types (draft)
@@ -47,10 +47,10 @@ pub struct Sheet {
     pub name: String,
     pub visibility: SheetVisibility,
     cells: HashMap<CellRef, Cell>,
-    /// virtual cell coordinate -> origin cell coordinate. Built by resolve/merge.rs.
-    merge_aliases: HashMap<CellRef, CellRef>,
-    /// origin cell coordinate -> merged region. Keying by the origin cell allows
-    /// O(1) lookup of row_span/col_span.
+    /// origin cell coordinate -> merged region. Also the sole source of
+    /// truth for resolving a virtual coordinate to its origin (via
+    /// `resolve_origin`'s geometric containment check) — see the note
+    /// below the code block for why this replaced a per-cell alias map.
     merged_regions: HashMap<CellRef, MergedRegion>,
     /// The largest row/column number among inserted cells. Updated incrementally
     /// on each cell insertion; does not depend on the `<dimension>` element's value.
@@ -59,10 +59,10 @@ pub struct Sheet {
 }
 
 impl Sheet {
-    /// Constructs a new, empty sheet. `cells` / `merge_aliases` /
-    /// `merged_regions` start empty; `max_row` / `max_col` start at 0.
-    /// `pipeline.rs` builds one from [`parse/workbook.rs`](../parse/workbook.en.md)'s
-    /// result (`name`/`visibility`) and passes it to
+    /// Constructs a new, empty sheet. `cells` / `merged_regions` start
+    /// empty; `max_row` / `max_col` start at 0. `pipeline.rs` builds one
+    /// from [`parse/workbook.rs`](../parse/workbook.en.md)'s result
+    /// (`name`/`visibility`) and passes it to
     /// [`parse/worksheet.rs`](../parse/worksheet.en.md) to stream cells into
     /// (see pipeline.md; added after discovering the gap while designing it).
     pub(crate) fn new(name: String, visibility: SheetVisibility) -> Self {
@@ -70,17 +70,36 @@ impl Sheet {
             name,
             visibility,
             cells: HashMap::new(),
-            merge_aliases: HashMap::new(),
             merged_regions: HashMap::new(),
             max_row: 0,
             max_col: 0,
         }
     }
 
+    /// Resolves `r` to a merged region's origin coordinate if `r` falls
+    /// inside one; otherwise returns `r` unchanged. A linear scan over
+    /// `merged_regions`, skipped entirely when there are none (the common
+    /// case for a sheet with no merges). Real-world sheets have at most a
+    /// few thousand merged regions regardless of sheet dimensions, so this
+    /// stays cheap — the same "simple O(N) is fine for expected-small N"
+    /// tradeoff `resolve::merge`'s overlap validation already makes.
+    fn resolve_origin(&self, r: CellRef) -> CellRef {
+        if self.merged_regions.is_empty() {
+            return r;
+        }
+        self.merged_regions
+            .values()
+            .find(|region| {
+                r.row >= region.start.row && r.row <= region.end.row
+                    && r.col >= region.start.col && r.col <= region.end.col
+            })
+            .map_or(r, |region| region.start)
+    }
+
     /// Retrieves a cell, resolving the merged-cell alias if needed.
     /// Returns the same `Cell` whether passed the origin or a virtual coordinate.
     pub fn get(&self, r: CellRef) -> Option<&Cell> {
-        let origin = self.merge_aliases.get(&r).copied().unwrap_or(r);
+        let origin = self.resolve_origin(r);
         self.cells.get(&origin)
     }
 
@@ -88,7 +107,7 @@ impl Sheet {
     /// needed. Used by resolve/shared_strings.rs and resolve/style.rs to rewrite a
     /// cell's value/style with resolved data.
     pub(crate) fn get_mut(&mut self, r: CellRef) -> Option<&mut Cell> {
-        let origin = self.merge_aliases.get(&r).copied().unwrap_or(r);
+        let origin = self.resolve_origin(r);
         self.cells.get_mut(&origin)
     }
 
@@ -101,31 +120,26 @@ impl Sheet {
         self.cells.insert(r, cell);
     }
 
-    /// Registers a merged region: records every coordinate in the range (other than
-    /// the origin) as an alias to the origin cell, and records the region itself
-    /// keyed by the origin cell in `merged_regions`. If the origin cell does not yet
-    /// exist in `cells` (a merged range with neither value nor formatting), a blank
-    /// placeholder cell (`value: None`, `style: None`) is inserted first. This
-    /// guarantees `iter_cells` always picks up the origin cell, so `json.rs` never
-    /// silently drops merge information (including row_span/col_span) for a fully
-    /// blank merged range. The region's end coordinate is a virtual cell that is
-    /// never inserted into `cells`, so it would never be reflected in `max_row`/
-    /// `max_col` via `insert_cell`; it is applied explicitly here so that a case
-    /// like "the only real data is at A1, but it is merged as A1:C3" still expands
-    /// the sheet's effective used range.
+    /// Registers a merged region, keyed by its origin cell, in
+    /// `merged_regions` (membership for any other coordinate in the range
+    /// is resolved geometrically on demand by `resolve_origin`, not
+    /// precomputed here — see the note below the code block). If the
+    /// origin cell does not yet exist in `cells` (a merged range with
+    /// neither value nor formatting), a blank placeholder cell (`value:
+    /// None`, `style: None`) is inserted first. This guarantees
+    /// `iter_cells` always picks up the origin cell, so `json.rs` never
+    /// silently drops merge information (including row_span/col_span) for a
+    /// fully blank merged range. The region's end coordinate is a virtual
+    /// cell that is never inserted into `cells`, so it would never be
+    /// reflected in `max_row`/`max_col` via `insert_cell`; it is applied
+    /// explicitly here so that a case like "the only real data is at A1,
+    /// but it is merged as A1:C3" still expands the sheet's effective used
+    /// range.
     pub(crate) fn insert_merge(&mut self, region: MergedRegion) {
         debug_assert!(region.start.row <= region.end.row);
         debug_assert!(region.start.col <= region.end.col);
         if !self.cells.contains_key(&region.start) {
             self.insert_cell(region.start, Cell { value: None, style: None });
-        }
-        for row in region.start.row..=region.end.row {
-            for col in region.start.col..=region.end.col {
-                let r = CellRef { row, col };
-                if r != region.start {
-                    self.merge_aliases.insert(r, region.start);
-                }
-            }
         }
         self.merged_regions.insert(region.start, region);
         self.max_row = self.max_row.max(region.end.row);
@@ -138,26 +152,29 @@ impl Sheet {
         self.merged_regions.get(&origin)
     }
 
-    /// An iterator over origin cells only (for JSON generation). Filters out
-    /// any coordinate present in `merge_aliases`: `parse/worksheet.rs`
-    /// inserts a `Cell` for every `<c>` element it streams, including ones
-    /// inside a merged range that later turn out not to be the origin (e.g.
-    /// a virtual cell carrying only border styling), so `cells` cannot be
-    /// assumed to hold origin cells exclusively (fixed at implementation
-    /// time — PR #20 review; `cells.iter()` without this filter would leak
-    /// such virtual cells into `json.rs`'s output as duplicates).
+    /// An iterator over origin cells only (for JSON generation). Excludes
+    /// any coordinate that `resolve_origin` maps to a *different* cell:
+    /// `parse/worksheet.rs` inserts a `Cell` for every `<c>` element it
+    /// streams, including ones inside a merged range that later turn out
+    /// not to be the origin (e.g. a virtual cell carrying only border
+    /// styling), so `cells` cannot be assumed to hold origin cells
+    /// exclusively (fixed at implementation time — PR #20 review;
+    /// `cells.iter()` without this filter would leak such virtual cells
+    /// into `json.rs`'s output as duplicates).
     pub fn iter_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
-        self.cells.iter().filter(|(r, _)| !self.merge_aliases.contains_key(r)).map(|(&r, c)| (r, c))
+        self.cells.iter().filter(|(&r, _)| self.resolve_origin(r) == r).map(|(&r, c)| (r, c))
     }
 }
 ```
+
+**Implementation-time fix: `merge_aliases` removed (a hang bug found while implementing `resolve/`).** The draft above originally had `insert_merge` populate a `merge_aliases: HashMap<CellRef, CellRef>` by iterating every `(row, col)` pair in the region and inserting an alias entry — an O(`row_span * col_span`) loop. That's unbounded for a legitimate full-sheet merge (`A1:XFD1048576`, Excel's actual maximum dimensions, ~17 billion cells), and was found to hang in practice while writing `resolve/merge.rs`'s tests (a merged region built from real worksheet bounds took the test suite well past a two-minute timeout). The fix removes `merge_aliases` entirely; `get`/`get_mut`/`iter_cells` instead resolve membership on demand via `resolve_origin`'s O(N) geometric scan over `merged_regions` (N = number of merged regions on the sheet, not the area of any one of them), which is skipped outright when there are no merges. This trades `get`'s complexity from O(1) to O(N), but N stays small in practice (real spreadsheets have at most a few thousand merged regions regardless of how large any single one is), and it eliminates the hang entirely. `insert_merge` itself is now O(1).
 
 ## Dependencies
 
 - Depends on: [`model/cell.rs`](cell.en.md) (`Cell`, `CellRef`)
 - Depended on by: `model::Workbook` (holds multiple sheets), [`pipeline.rs`](../pipeline.en.md) (constructs sheets via `Sheet::new`), `resolve/merge.rs` (calls `insert_merge` to register merged cells), `resolve/shared_strings.rs` / `resolve/style.rs` (rewrite a cell's value/style with resolved data via `get_mut`), [`json.rs`](../json.en.md) (assembles JSON from `iter_cells` and `merged_region_at`), `parse/worksheet.rs` (inserts parsed data via `insert_cell`)
 
-The `cells` / `merge_aliases` / `merged_regions` fields themselves stay fully private — not even `pub(crate)` — and writes to these internal data structures are restricted to the three methods `insert_cell` / `insert_merge` / `get_mut`. The alternative of making the fields directly `pub(crate)` (as originally suggested in review) was also considered, but that would require every caller across multiple `resolve/` modules to individually remember to keep `max_row`/`max_col` up to date and to backfill a merge's origin cell — scattering the invariant across the crate. Restricting writes to these methods keeps the invariant contained inside `Sheet` itself, so callers don't need to worry about correctness.
+The `cells` / `merged_regions` fields themselves stay fully private — not even `pub(crate)` — and writes to these internal data structures are restricted to the three methods `insert_cell` / `insert_merge` / `get_mut`. The alternative of making the fields directly `pub(crate)` (as originally suggested in review) was also considered, but that would require every caller across multiple `resolve/` modules to individually remember to keep `max_row`/`max_col` up to date and to backfill a merge's origin cell — scattering the invariant across the crate. Restricting writes to these methods keeps the invariant contained inside `Sheet` itself, so callers don't need to worry about correctness.
 
 ## Error Handling Policy
 
@@ -171,7 +188,9 @@ The `cells` / `merge_aliases` / `merged_regions` fields themselves stay fully pr
 - Boundary-value tests for `MergedRegion::row_span` / `col_span` (a 1x1 range, a large range)
 - Verifying that `merged_region_at` retrieves the corresponding `MergedRegion` from an origin cell coordinate in O(1) (including behavior on a sheet with many merged regions)
 - Verifying that `iter_cells` returns only origin cells and never includes virtual coordinates
-- **Verifying that `iter_cells` still excludes a coordinate that already had a `cells` entry (via `insert_cell`) before `insert_merge` made it a virtual/alias coordinate** — the case where `parse/worksheet.rs` streamed a `<c>` element (e.g. border-only styling) for a cell inside a merged range that later turns out not to be the origin (a regression-test point added following the [PR #20 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/20#pullrequestreview-4949786605); without the `merge_aliases` filter in `iter_cells`, such a cell would leak into `json.rs`'s output as a duplicate of the origin)
+- **Verifying that `iter_cells` still excludes a coordinate that already had a `cells` entry (via `insert_cell`) before `insert_merge` made it a virtual coordinate** — the case where `parse/worksheet.rs` streamed a `<c>` element (e.g. border-only styling) for a cell inside a merged range that later turns out not to be the origin (a regression-test point added following the [PR #20 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/20#pullrequestreview-4949786605); without this filter in `iter_cells`, such a cell would leak into `json.rs`'s output as a duplicate of the origin)
+- **Verifying that `insert_merge` on a full-sheet-sized region (e.g. `A1:XFD1048576`, Excel's actual maximum dimensions) registers in roughly constant time rather than hanging** (a regression test for the `merge_aliases`-removal fix described after the code block above)
+- **Verifying that a coordinate outside every merged region resolves to itself and is unaffected by unrelated regions existing elsewhere on the sheet** (a correctness check for `resolve_origin`'s geometric containment scan)
 - Verifying that `max_row` / `max_col` are updated correctly on every `insert_cell` call (confirming they can be computed without trusting `<dimension>`)
 - **Verifying that calling `insert_merge` on a range with neither value nor formatting inserts a blank placeholder at the origin cell, and that it is then correctly retrievable via `iter_cells` / `merged_region_at`** (a regression-test point added following the [PR #5 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948259819))
 - **Verifying that when the only real data is at `A1`, but it is merged as `A1:C3`, calling `insert_merge` results in `max_row == 3` and `max_col == 3`** (regression test for the case where a merge region's end coordinate expands the sheet's effective used range)

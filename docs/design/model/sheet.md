@@ -7,8 +7,8 @@
 ## 責務・スコープ
 
 - データまたは書式を持つセルのみを `HashMap<CellRef, Cell>` で保持する疎行列 `Sheet` を定義する
-- 結合セルの「仮想セル座標 → 起点セルへのエイリアス参照」マッピングを保持し、`get()` 経由で透過的にアクセスできるようにする
-- `cells` / `merge_aliases` / `merged_regions` はクレート内非公開のまま保持し、`insert_cell` / `insert_merge` / `get_mut` という限定されたAPI（`pub(crate)`）経由でのみ変更を許可することで、`max_row`/`max_col` の同期や結合起点セルの補完といった内部不変条件を`Sheet`自身に強制させる
+- 結合範囲内の仮想セル座標を起点セルへ解決し、`get()` 経由で透過的にアクセスできるようにする（具体的な解決方法は主要な型セクション参照。実装時に発覚したバグにより、当初ドラフトのセル単位エイリアスマップは不採用となった。コードブロック直後の注記参照）
+- `cells` / `merged_regions` はクレート内非公開のまま保持し、`insert_cell` / `insert_merge` / `get_mut` という限定されたAPI（`pub(crate)`）経由でのみ変更を許可することで、`max_row`/`max_col` の同期や結合起点セルの補完といった内部不変条件を`Sheet`自身に強制させる
 - **含まない責務**: `<mergeCells>` XMLのパース（`parse/worksheet.rs`）、結合範囲とセルデータを突き合わせて `insert_merge` を呼び出す判断ロジックそのもの（`resolve/merge.rs`。本ファイルは呼び出しを受けて安全にマッピングを構築するAPIのみを提供する）
 
 ## 主要な型（案）
@@ -47,10 +47,10 @@ pub struct Sheet {
     pub name: String,
     pub visibility: SheetVisibility,
     cells: HashMap<CellRef, Cell>,
-    /// 仮想セル座標 -> 起点セル座標。resolve/merge.rs が構築する。
-    merge_aliases: HashMap<CellRef, CellRef>,
-    /// 起点セル座標 -> 結合範囲。キーを起点セルにすることで、
-    /// row_span/col_spanの参照をO(1)で行えるようにする。
+    /// 起点セル座標 -> 結合範囲。仮想座標を起点へ解決する唯一の
+    /// 情報源でもある（`resolve_origin` による幾何学的な包含判定。
+    /// コードブロック直後の注記でセル単位エイリアスマップから
+    /// 置き換えた経緯を説明）。
     merged_regions: HashMap<CellRef, MergedRegion>,
     /// 挿入されたセルのうち最大の行・列番号。セル挿入のたびに
     /// インクリメンタルに更新し、`<dimension>` 要素の値には依存しない。
@@ -59,8 +59,8 @@ pub struct Sheet {
 }
 
 impl Sheet {
-    /// 新規シートを構築する。`cells` / `merge_aliases` / `merged_regions` は
-    /// 空、`max_row` / `max_col` は0から開始する。`pipeline.rs` が
+    /// 新規シートを構築する。`cells` / `merged_regions` は空、
+    /// `max_row` / `max_col` は0から開始する。`pipeline.rs` が
     /// [`parse/workbook.rs`](../parse/workbook.md) の結果（`name`/`visibility`）
     /// から構築し、[`parse/worksheet.rs`](../parse/worksheet.md) へ渡して
     /// ストリームでセルを挿入させる（pipeline.md 参照。設計時に発見した
@@ -70,17 +70,36 @@ impl Sheet {
             name,
             visibility,
             cells: HashMap::new(),
-            merge_aliases: HashMap::new(),
             merged_regions: HashMap::new(),
             max_row: 0,
             max_col: 0,
         }
     }
 
+    /// `r` が結合範囲内に収まる場合はその起点座標へ解決し、収まらない
+    /// 場合は `r` をそのまま返す。`merged_regions` への線形走査（結合が
+    /// 一件も無い場合は走査自体をスキップする、最も一般的なケース）。
+    /// 実運用のシートはシートの寸法によらず結合範囲の件数はせいぜい
+    /// 数千件程度に収まるため、この方式でも十分軽量である —
+    /// `resolve::merge` の重複検証が既に採用している「想定件数が
+    /// 小さい前提でのシンプルなO(N)」と同じ判断。
+    fn resolve_origin(&self, r: CellRef) -> CellRef {
+        if self.merged_regions.is_empty() {
+            return r;
+        }
+        self.merged_regions
+            .values()
+            .find(|region| {
+                r.row >= region.start.row && r.row <= region.end.row
+                    && r.col >= region.start.col && r.col <= region.end.col
+            })
+            .map_or(r, |region| region.start)
+    }
+
     /// 結合セルのエイリアスを解決したうえでセルを取得する。
     /// 起点・仮想いずれの座標を渡しても同じ `Cell` を返す。
     pub fn get(&self, r: CellRef) -> Option<&Cell> {
-        let origin = self.merge_aliases.get(&r).copied().unwrap_or(r);
+        let origin = self.resolve_origin(r);
         self.cells.get(&origin)
     }
 
@@ -88,7 +107,7 @@ impl Sheet {
     /// resolve/shared_strings.rs, resolve/style.rs がセルの値・スタイルを
     /// 解決済みデータへ書き換える際に用いる。
     pub(crate) fn get_mut(&mut self, r: CellRef) -> Option<&mut Cell> {
-        let origin = self.merge_aliases.get(&r).copied().unwrap_or(r);
+        let origin = self.resolve_origin(r);
         self.cells.get_mut(&origin)
     }
 
@@ -100,11 +119,13 @@ impl Sheet {
         self.cells.insert(r, cell);
     }
 
-    /// 結合範囲を登録する。範囲内の各座標（起点を除く）を起点セルへの
-    /// エイリアスとして登録し、`merged_regions` にも起点セルキーで記録する。
-    /// 起点セルがまだ `cells` に存在しない場合（値も書式も持たない結合範囲）は、
-    /// 空セル（`value: None`, `style: None`）をプレースホルダーとして挿入する。
-    /// これにより `iter_cells` が必ず起点セルを拾い、`json.rs` が row_span/col_span
+    /// 結合範囲を起点セルキーで `merged_regions` に登録する（範囲内の
+    /// 他座標が結合範囲に属するかどうかは、ここで事前計算せず
+    /// `resolve_origin` がオンデマンドに幾何学的判定する。コードブロック
+    /// 直後の注記参照）。起点セルがまだ `cells` に存在しない場合
+    /// （値も書式も持たない結合範囲）は、空セル（`value: None`,
+    /// `style: None`）をプレースホルダーとして挿入する。これにより
+    /// `iter_cells` が必ず起点セルを拾い、`json.rs` が row_span/col_span
     /// を含む結合情報を取りこぼさないことを保証する。
     /// 終点座標（`region.end`）は `cells` に挿入されない仮想セルのため、
     /// `insert_cell` 経由では `max_row`/`max_col` に反映されない。結合範囲の
@@ -117,14 +138,6 @@ impl Sheet {
         if !self.cells.contains_key(&region.start) {
             self.insert_cell(region.start, Cell { value: None, style: None });
         }
-        for row in region.start.row..=region.end.row {
-            for col in region.start.col..=region.end.col {
-                let r = CellRef { row, col };
-                if r != region.start {
-                    self.merge_aliases.insert(r, region.start);
-                }
-            }
-        }
         self.merged_regions.insert(region.start, region);
         self.max_row = self.max_row.max(region.end.row);
         self.max_col = self.max_col.max(region.end.col);
@@ -135,25 +148,27 @@ impl Sheet {
         self.merged_regions.get(&origin)
     }
 
-    /// 起点セルのみを走査するイテレータ（JSON生成用）。`merge_aliases` に
-    /// 含まれる座標は除外する: `parse/worksheet.rs` はストリームする
-    /// `<c>` 要素ごとに `Cell` を挿入するため、結合範囲内で後から
-    /// 仮想セルだと判明する座標（罫線のみのスタイルなど）も `cells` に
+    /// 起点セルのみを走査するイテレータ（JSON生成用）。`resolve_origin` が
+    /// 自分自身とは異なる座標へ解決する座標は除外する: `parse/worksheet.rs`
+    /// はストリームする `<c>` 要素ごとに `Cell` を挿入するため、結合範囲内で
+    /// 後から仮想セルだと判明する座標（罫線のみのスタイルなど）も `cells` に
     /// 含まれうる。よって `cells` が起点セルのみを保持するとは限らない
     /// （実装時に修正。PR #20 レビュー。このフィルタが無いと、そうした
     /// 仮想セルが `json.rs` の出力に起点セルの重複として漏れ出る）。
     pub fn iter_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
-        self.cells.iter().filter(|(r, _)| !self.merge_aliases.contains_key(r)).map(|(&r, c)| (r, c))
+        self.cells.iter().filter(|(&r, _)| self.resolve_origin(r) == r).map(|(&r, c)| (r, c))
     }
 }
 ```
+
+**実装時の修正: `merge_aliases` を廃止（ハングするバグ、`resolve/` 実装時に発覚）。** 上記コードブロックは当初、`insert_merge` が範囲内の全 `(row, col)` の組を走査して `merge_aliases: HashMap<CellRef, CellRef>` へエイリアスを1件ずつ登録するドラフトだった——これは O(row_span × col_span) のループである。Excelの実際の最大寸法いっぱいの正当なシート全体結合（`A1:XFD1048576`、約170億セル）に対してはこのコストが無制限に膨れ上がり、実際に `resolve/merge.rs` のテストを書いている最中にハングすることが判明した（実シートの最大寸法から構築した結合範囲で、テストスイートが2分のタイムアウトを大幅に超過した）。修正では `merge_aliases` を完全に廃止し、`get`/`get_mut`/`iter_cells` は代わりに `resolve_origin` の O(N) 幾何学的走査（N はシート上の結合範囲の件数であり、個々の結合範囲の面積ではない）でオンデマンドに所属を判定する。結合が無ければこの走査自体が完全にスキップされる。これにより `get` の計算量はO(1)からO(N)へ後退するが、Nは実運用では小さく保たれる（結合範囲がどれだけ巨大であっても、実際のスプレッドシートが持つ結合範囲の件数自体はせいぜい数千件程度）。一方でハングは完全に解消され、`insert_merge` 自体もO(1)になる。
 
 ## 依存関係
 
 - 依存先: [`model/cell.rs`](cell.md)（`Cell`, `CellRef`）
 - 依存元: `model::Workbook`（複数シートを保持）、[`pipeline.rs`](../pipeline.md)（`Sheet::new` でシートを構築する）、`resolve/merge.rs`（`insert_merge` を呼び出して結合セルを登録する）、`resolve/shared_strings.rs` / `resolve/style.rs`（`get_mut` を通じてセルの値・スタイルを解決済みデータへ書き換える）、[`json.rs`](../json.md)（`iter_cells` と `merged_region_at` からJSONを組み立てる）、`parse/worksheet.rs`（`insert_cell` でパース結果を挿入する）
 
-`cells` / `merge_aliases` / `merged_regions` フィールド自体は `pub(crate)` にも公開せず完全に非公開のままとし、これらの内部データ構造への書き込みは `insert_cell` / `insert_merge` / `get_mut` の3メソッドのみに限定する。フィールドを直接 `pub(crate)` にする案（初回レビューでの提案）も検討したが、その場合 `max_row`/`max_col` の更新漏れや結合起点セルの補完漏れを各呼び出し元（`resolve/` 配下の複数モジュール）が個別に守る必要があり、不変条件がクレート全体に分散してしまう。メソッド経由に限定することで不変条件を `Sheet` 自身に閉じ込め、呼び出し側は正しさを気にせず利用できる。
+`cells` / `merged_regions` フィールド自体は `pub(crate)` にも公開せず完全に非公開のままとし、これらの内部データ構造への書き込みは `insert_cell` / `insert_merge` / `get_mut` の3メソッドのみに限定する。フィールドを直接 `pub(crate)` にする案（初回レビューでの提案）も検討したが、その場合 `max_row`/`max_col` の更新漏れや結合起点セルの補完漏れを各呼び出し元（`resolve/` 配下の複数モジュール）が個別に守る必要があり、不変条件がクレート全体に分散してしまう。メソッド経由に限定することで不変条件を `Sheet` 自身に閉じ込め、呼び出し側は正しさを気にせず利用できる。
 
 ## エラー処理方針
 
@@ -167,7 +182,9 @@ impl Sheet {
 - `MergedRegion::row_span` / `col_span` の境界値テスト（1x1範囲、大きい範囲）
 - `merged_region_at` が起点セル座標から対応する `MergedRegion` をO(1)で取得できることの確認（結合範囲を多数持つシートでの動作確認を含む）
 - `iter_cells` が起点セルのみを返し、仮想セル座標を含まないことの確認
-- **`insert_merge` で仮想／エイリアス座標になる前に `insert_cell` で `cells` に既存エントリがあった座標も、`iter_cells` から正しく除外されることの確認** — `parse/worksheet.rs` が結合範囲内（後に起点でないと判明する座標、例: 罫線のみのスタイル）に `<c>` 要素をストリームするケース（[PR #20 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/20#pullrequestreview-4949786605)で追加した回帰テスト観点。`iter_cells` に `merge_aliases` によるフィルタが無いと、このセルが起点セルの重複として `json.rs` の出力に漏れ出る）
+- **`insert_merge` で仮想座標になる前に `insert_cell` で `cells` に既存エントリがあった座標も、`iter_cells` から正しく除外されることの確認** — `parse/worksheet.rs` が結合範囲内（後に起点でないと判明する座標、例: 罫線のみのスタイル）に `<c>` 要素をストリームするケース（[PR #20 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/20#pullrequestreview-4949786605)で追加した回帰テスト観点。`iter_cells` にこのフィルタが無いと、このセルが起点セルの重複として `json.rs` の出力に漏れ出る）
+- **`insert_merge` にシート全体規模の結合範囲（例: Excelの実際の最大寸法 `A1:XFD1048576`）を渡した場合、ハングせずほぼ一定時間で登録が完了することの確認**（上記コードブロック直後で説明した `merge_aliases` 廃止の回帰テスト）
+- **どの結合範囲にも属さない座標が自分自身へ解決され、シート上の他の無関係な結合範囲の存在に影響されないことの確認**（`resolve_origin` の幾何学的包含判定に対する正しさの検証）
 - `insert_cell` 呼び出しのたびに `max_row` / `max_col` が正しく更新されることの確認（`<dimension>` を信頼せずに算出できることの確認）
 - **値も書式も持たない結合範囲に対して `insert_merge` を呼んだ場合、起点セルが空セルとして `cells` に挿入され、`iter_cells` / `merged_region_at` から正しく参照できることの確認**（PR #5 レビューで追加した回帰テスト観点）
 - **実データが `A1` のみだが `A1:C3` として結合されているケースで、`insert_merge` 呼び出し後に `max_row == 3` かつ `max_col == 3` となることの確認**（結合範囲の終点がシートの実質的な使用範囲を広げるケースの回帰テスト）
