@@ -67,6 +67,8 @@ Owns the `ZipContainer` and controls the execution order of each phase (borrowin
 
 The entry point for ZIP (OPC) extraction. Responsible for detecting and blocking Zip Bomb / Zip Slip. Does not interpret (parse) the contents of the XML.
 
+- Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [sanitize.md](container/sanitize.en.md) (`mod.md` not yet written)
+
 ### `parse/`
 
 The layer that aggregates dependencies on XML parsing libraries such as `quick-xml`. It only repackages XML elements into pure structs and holds no business logic (merged cell resolution, shared string resolution, etc.). Since disabling external entity expansion during XML parsing (XXE countermeasure) is a `Reader` initialization setting in quick-xml, it is the responsibility of this layer (`parse/mod.rs`), which aggregates the quick-xml dependency.

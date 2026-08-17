@@ -67,6 +67,8 @@ src/
 
 ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブロックを担う。XMLの中身の解釈（パース）は行わない。
 
+- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [sanitize.md](container/sanitize.md)（`mod.md` は未作成）
+
 ### `parse/`
 
 `quick-xml` などXMLパースライブラリへの依存を集約する層。XML要素から純粋な構造体への詰め替えのみを行い、ビジネスロジック（結合セル解決・共有文字列解決など）は持たない。XMLパース時の外部エンティティ展開無効化（XXE対策）は quick-xml の `Reader` 初期化設定であるため、quick-xml依存を集約する本層（`parse/mod.rs`）の責務とする。
