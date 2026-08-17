@@ -252,8 +252,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let default_from_path = parse_workbook(&path).unwrap();
-        let explicit_from_path =
-            parse_workbook_with_limits(&path, SizeLimits::default()).unwrap();
+        let explicit_from_path = parse_workbook_with_limits(&path, SizeLimits::default()).unwrap();
         std::fs::remove_file(&path).ok();
 
         let default_from_reader = parse_workbook_reader(Cursor::new(bytes.clone())).unwrap();
