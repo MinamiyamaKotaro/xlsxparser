@@ -1,5 +1,7 @@
 # `model/cell.rs` 設計書
 
+*[English](cell.en.md)*
+
 `src/model/cell.rs` に対応する設計書。[architecture.md](../architecture.md) が定義する `model/` の方針（XMLパースや解決ロジックに依存しない純粋なRustデータ構造）に基づき、セル1つ分の値・参照を表す最も基礎的な型を定義する。`model/sheet.rs` や `model/workbook.rs` はこのファイルの型に依存する。
 
 ## 責務・スコープ

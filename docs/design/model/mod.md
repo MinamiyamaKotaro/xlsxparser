@@ -1,5 +1,7 @@
 # `model/mod.rs` 設計書
 
+*[English](mod.en.md)*
+
 `src/model/mod.rs` に対応する設計書。`model/` 配下のサブモジュール宣言と、外部（`resolve/` `json.rs` `lib.rs` など）に公開する型の再エクスポートのみを行う集約ファイル。
 
 ## 責務・スコープ

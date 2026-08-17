@@ -1,5 +1,7 @@
 # `model/workbook.rs` 設計書
 
+*[English](workbook.en.md)*
+
 `src/model/workbook.rs` に対応する設計書。全フェーズの解決処理が完了した最終的なデータモデルであり、`lib.rs` の公開API（`parse_workbook(path) -> Result<Workbook>`）の返り値そのものになる。[model/sheet.md](sheet.md) の `Sheet` を集約する。
 
 ## 責務・スコープ

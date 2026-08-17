@@ -1,5 +1,7 @@
 # src/ アーキテクチャ設計
 
+*[English](architecture.en.md)*
+
 Issue [#1](https://github.com/MinamiyamaKotaro/xlsxparser/issues/1) での議論を経て確定した `src/` ディレクトリ構成と、各モジュールの責務をまとめたドキュメント。要求仕様書（[requirements.md](../requirement/requirements.md)）が定義する5フェーズ・パイプラインに対応させている。
 
 ## 設計方針

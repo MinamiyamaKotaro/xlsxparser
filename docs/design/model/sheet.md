@@ -1,5 +1,7 @@
 # `model/sheet.rs` 設計書
 
+*[English](sheet.en.md)*
+
 `src/model/sheet.rs` に対応する設計書。[model/cell.md](cell.md) の `Cell` / `CellRef` を用いて、1シート分のデータを表す疎行列 `Sheet` を定義する。要求仕様書の 3.1（疎行列によるメモリ最適化）・3.2（結合セルの透過的アクセス）を型として実現する中核モジュール。
 
 ## 責務・スコープ
