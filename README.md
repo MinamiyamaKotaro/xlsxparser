@@ -27,8 +27,9 @@ let workbook = xlsxparser::parse_workbook("book.xlsx")?;
 let json = xlsxparser::to_json_string(&workbook)?;
 ```
 
-- [docs/requirement/requirements.md](docs/requirement/requirements.md)
-  (Japanese) — the functional requirements and the 5-phase pipeline summarized below.
+- [docs/requirement/requirements.en.md](docs/requirement/requirements.en.md) —
+  the functional requirements and the 5-phase pipeline summarized below
+  (also available in [Japanese](docs/requirement/requirements.md)).
 - [docs/design/architecture.en.md](docs/design/architecture.en.md) — the
   overall `src/` directory layout, module responsibilities, and design
   principles (also available in [Japanese](docs/design/architecture.md)).
