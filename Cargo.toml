@@ -9,3 +9,4 @@ publish = false
 
 [dependencies]
 thiserror = "2"
+zip = { version = "8", default-features = false, features = ["deflate"] }

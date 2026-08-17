@@ -1,7 +1,7 @@
 # cargo-deny configuration. See https://embarkstudios.github.io/cargo-deny/
 #
-# Provisional scaffold for CI (Issue #16); revisit the [licenses] allow-list
-# once real dependencies (quick-xml, zip, ...) are added under Issue #15.
+# The [licenses] allow-list is extended as needed whenever a new dependency
+# is added under Issue #15 (e.g. "Zlib" for zip's zlib-rs).
 
 [advisories]
 ignore = []
@@ -20,6 +20,7 @@ allow = [
   "BSD-2-Clause",
   "BSD-3-Clause",
   "Unicode-3.0",
+  "Zlib",
 ]
 
 [bans]

@@ -5,6 +5,7 @@
 //! described in `docs/design/lib.en.md` (`parse_workbook`, ...) land once
 //! every module they depend on exists.
 
+mod container;
 mod error;
 mod model;
 
