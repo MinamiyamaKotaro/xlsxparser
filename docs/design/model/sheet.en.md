@@ -8,7 +8,8 @@ Design doc for `src/model/sheet.rs`. Using `Cell` / `CellRef` from [model/cell.m
 
 - Defines `Sheet`, a sparse matrix that holds only cells with data or formatting, backed by `HashMap<CellRef, Cell>`
 - Holds the "virtual cell coordinate → origin cell" alias reference mapping for merged cells, enabling transparent access via `get()`
-- **Not responsible for**: parsing `<mergeCells>` XML (`parse/worksheet.rs`), or the logic that matches merge ranges against cell data to build the alias mapping itself (`resolve/merge.rs` — this file only provides a data structure that holds and looks up an already-built mapping)
+- Keeps `cells` / `merge_aliases` / `merged_regions` fully private, and only allows mutation through a narrow `pub(crate)` API (`insert_cell` / `insert_merge` / `get_mut`), so that `Sheet` itself enforces internal invariants such as keeping `max_row`/`max_col` in sync and backfilling a placeholder for a merge's origin cell
+- **Not responsible for**: parsing `<mergeCells>` XML (`parse/worksheet.rs`), or the decision logic that matches merge ranges against cell data and calls `insert_merge` (`resolve/merge.rs` — this file only provides the API that safely builds the mapping once called)
 
 ## Key Types (draft)
 
@@ -61,6 +62,46 @@ impl Sheet {
         self.cells.get(&origin)
     }
 
+    /// Retrieves a mutable reference to a cell, resolving the merged-cell alias if
+    /// needed. Used by resolve/shared_strings.rs and resolve/style.rs to rewrite a
+    /// cell's value/style with resolved data.
+    pub(crate) fn get_mut(&mut self, r: CellRef) -> Option<&mut Cell> {
+        let origin = self.merge_aliases.get(&r).copied().unwrap_or(r);
+        self.cells.get_mut(&origin)
+    }
+
+    /// Inserts a cell while updating max_row/max_col at the same time. Writes to
+    /// `cells` only ever go through this method, structurally preventing the
+    /// dimension fields from going out of sync.
+    pub(crate) fn insert_cell(&mut self, r: CellRef, cell: Cell) {
+        self.max_row = self.max_row.max(r.row);
+        self.max_col = self.max_col.max(r.col);
+        self.cells.insert(r, cell);
+    }
+
+    /// Registers a merged region: records every coordinate in the range (other than
+    /// the origin) as an alias to the origin cell, and records the region itself
+    /// keyed by the origin cell in `merged_regions`. If the origin cell does not yet
+    /// exist in `cells` (a merged range with neither value nor formatting), a blank
+    /// placeholder cell (`value: None`, `style: None`) is inserted first. This
+    /// guarantees `iter_cells` always picks up the origin cell, so `json.rs` never
+    /// silently drops merge information (including row_span/col_span) for a fully
+    /// blank merged range.
+    pub(crate) fn insert_merge(&mut self, region: MergedRegion) {
+        if !self.cells.contains_key(&region.start) {
+            self.insert_cell(region.start, Cell { value: None, style: None });
+        }
+        for row in region.start.row..=region.end.row {
+            for col in region.start.col..=region.end.col {
+                let r = CellRef { row, col };
+                if r != region.start {
+                    self.merge_aliases.insert(r, region.start);
+                }
+            }
+        }
+        self.merged_regions.insert(region.start, region);
+    }
+
     /// Retrieves, in O(1), the merged region an origin cell belongs to
     /// (used by json.rs to compute row_span/col_span).
     pub fn merged_region_at(&self, origin: CellRef) -> Option<&MergedRegion> {
@@ -75,12 +116,14 @@ impl Sheet {
 ## Dependencies
 
 - Depends on: [`model/cell.rs`](cell.en.md) (`Cell`, `CellRef`)
-- Depended on by: `model::Workbook` (holds multiple sheets), `resolve/merge.rs` (builds and writes `merge_aliases` / `merged_regions`), `resolve/shared_strings.rs` / `resolve/style.rs` (rewrite the values in `cells`), `json.rs` (assembles JSON from `iter_cells` and `merged_region_at`), `parse/worksheet.rs` or `resolve/` (updates `max_row` / `max_col` as cells are inserted)
+- Depended on by: `model::Workbook` (holds multiple sheets), `resolve/merge.rs` (calls `insert_merge` to register merged cells), `resolve/shared_strings.rs` / `resolve/style.rs` (rewrite a cell's value/style with resolved data via `get_mut`), `json.rs` (assembles JSON from `iter_cells` and `merged_region_at`), `parse/worksheet.rs` (inserts parsed data via `insert_cell`)
+
+The `cells` / `merge_aliases` / `merged_regions` fields themselves stay fully private — not even `pub(crate)` — and writes to these internal data structures are restricted to the three methods `insert_cell` / `insert_merge` / `get_mut`. The alternative of making the fields directly `pub(crate)` (as originally suggested in review) was also considered, but that would require every caller across multiple `resolve/` modules to individually remember to keep `max_row`/`max_col` up to date and to backfill a merge's origin cell — scattering the invariant across the crate. Restricting writes to these methods keeps the invariant contained inside `Sheet` itself, so callers don't need to worry about correctness.
 
 ## Error Handling Policy
 
-- `get()` returns `Option` rather than `Result`, since the sparse-matrix nature means a missing cell (i.e. a blank cell) is a normal, expected state.
-- Validating invalid merge ranges (overlapping ranges, out-of-range coordinates, etc.) is out of scope for this file; it is handled as an error (the common type in `error.rs`) on the `resolve/merge.rs` side. `Sheet` is a data structure that operates only under the assumption that the mapping has already been built and holds a "trusted state."
+- `get()` / `get_mut()` return `Option` rather than `Result`, since the sparse-matrix nature means a missing cell (i.e. a blank cell) is a normal, expected state.
+- Validating invalid merge ranges (overlapping ranges, out-of-range coordinates, etc.) is out of scope for this file; it is handled as an error (the common type in `error.rs`) on the `resolve/merge.rs` side, before `insert_merge` is called. `insert_merge` itself operates under the assumption that the range it is given is already valid.
 
 ## Testing Strategy
 
@@ -89,11 +132,13 @@ impl Sheet {
 - Boundary-value tests for `MergedRegion::row_span` / `col_span` (a 1x1 range, a large range)
 - Verifying that `merged_region_at` retrieves the corresponding `MergedRegion` from an origin cell coordinate in O(1) (including behavior on a sheet with many merged regions)
 - Verifying that `iter_cells` returns only origin cells and never includes virtual coordinates
-- Verifying that `max_row` / `max_col` are updated correctly on cell insertion (confirming they can be computed without trusting `<dimension>`)
+- Verifying that `max_row` / `max_col` are updated correctly on every `insert_cell` call (confirming they can be computed without trusting `<dimension>`)
+- **Verifying that calling `insert_merge` on a range with neither value nor formatting inserts a blank placeholder at the origin cell, and that it is then correctly retrievable via `iter_cells` / `merged_region_at`** (a regression-test point added in this round)
 
 ## Open Questions
 
 1. ~~Managing sheet dimensions (used range)~~ → **Resolved**: `<dimension>` elements generated by third-party tools can be inaccurate or missing, so they are not trusted. `max_row` / `max_col` are updated incrementally on each cell insertion and exposed as public fields on `Sheet` for O(1) retrieval (finalized following the [PR #5 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948235239)).
 2. **Key type for `cells`**: Whether to adopt `HashMap<CellRef, Cell>` or the `HashMap<(u32, u32), Cell>` shown as an example in the requirements spec. `CellRef` already implements `Hash` so the two are type-equivalent, but which to use is still to be decided from a readability / API-consistency standpoint.
-3. **Handling of duplicate/invalid merge ranges**: How `resolve/merge.rs` should behave if a malicious or corrupted XLSX contains overlapping merge ranges (reject with an error, or overwrite on a last-write-wins basis) is undecided. Note that this file's API design (holding `merge_aliases` / `merged_regions` each as a single `HashMap`) assumes "last write wins."
+3. **Handling of duplicate/invalid merge ranges**: How `resolve/merge.rs` should behave if a malicious or corrupted XLSX contains overlapping merge ranges (reject with an error, or overwrite on a last-write-wins basis) is undecided. Note that this file's API design (`insert_merge` called multiple times is assumed to simply overwrite) assumes "last write wins."
 4. **Other `worksheet.xml` metadata such as frozen rows/columns**: Not explicitly covered by the requirements spec, but if things like `freezePane` are handled in the future, whether to hold them on `Sheet` or split them into a separate type is undecided (currently out of scope and not included in the type). Visibility is resolved (see Open Question 1 of workbook.md).
+5. ~~Crate-internal access to private fields~~ → **Resolved**: rather than making fields like `cells` directly `pub(crate)`, `Sheet` implements the narrow API `insert_cell` / `insert_merge` / `get_mut` and disallows direct access from anywhere else (finalized following the [PR #5 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948259819); see the Dependencies section for the comparison against directly exposing the fields).

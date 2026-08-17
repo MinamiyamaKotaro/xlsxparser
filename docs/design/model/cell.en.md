@@ -15,6 +15,12 @@ Design doc for `src/model/cell.rs`. Per the [architecture.md](../architecture.en
 ```rust
 use std::sync::Arc;
 
+/// Placeholder type for a resolved date/time value. The concrete type (e.g.
+/// `chrono::NaiveDateTime` vs. a lightweight custom type) is undecided (see Open
+/// Question 4). Until it is finalized, a stand-in definition such as the one below
+/// is assumed: `pub struct DateTimeValue;`
+pub struct DateTimeValue; // TODO: replace with the concrete type at implementation time
+
 /// Cell coordinates. 1-based, matching Excel (A1 = row:1, col:1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CellRef {

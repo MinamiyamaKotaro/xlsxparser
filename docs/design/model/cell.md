@@ -15,6 +15,11 @@
 ```rust
 use std::sync::Arc;
 
+/// 日付・時刻の解決済み値のプレースホルダー型。具体的な型（chrono::NaiveDateTime か
+/// 軽量な自前型か）は未決定（オープンクエスチョン4参照）。実装が確定するまでの
+/// 暫定ダミー定義は次の通り: `pub struct DateTimeValue;`
+pub struct DateTimeValue; // TODO: 実装フェーズで具体的な型に置き換える
+
 /// セル座標。Excelに合わせて1-basedとする（A1 = row:1, col:1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CellRef {
