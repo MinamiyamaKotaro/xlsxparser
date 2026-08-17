@@ -48,6 +48,12 @@ src/
 
 ## Module Responsibility Details
 
+### `error.rs`
+
+Defines the single `Error` enum shared across the entire crate. It is the most foundational leaf module, depending on no other module in the crate (including `model/`), and is depended on by nearly every module: `container/`, `parse/`, `model/`, `resolve/`, `pipeline.rs`, `lib.rs`.
+
+- Detailed design: [error.md](error.en.md)
+
 ### `pipeline.rs`
 
 Owns the `ZipContainer` and controls the execution order of each phase (borrowing a stream from `container`, passing it to `parse`, resolving the result in `resolve`, and serializing it in `json.rs`) and the timing of resource disposal.

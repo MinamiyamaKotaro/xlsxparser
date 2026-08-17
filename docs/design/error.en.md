@@ -1,0 +1,149 @@
+# `src/error.rs` Design Doc
+
+*[日本語](error.md)*
+
+Design doc for `src/error.rs`. Defines the library-wide common error type shared across all 5 phases of the pipeline defined by [architecture.md](architecture.en.md). [model/cell.md](model/cell.en.md) (`CellRef::from_a1`), [model/sheet.md](model/sheet.en.md) (validation of invalid merged ranges), and [model/workbook.md](model/workbook.en.md) (`parse_workbook`'s `Result::Err`) are all written assuming a dependency on the type defined here.
+
+## Responsibility / Scope
+
+- Defines a single crate-wide error enum `Error` (plus `pub type Result<T> = std::result::Result<T, Error>;`)
+- Represents the failure modes that can occur in each phase (relationship resolution, sanitization, stream parsing, analysis/deferred resolution) together with the information callers need to handle them (affected path, offending value, etc.)
+- Implements `std::error::Error` and holds external crate errors (e.g. `quick-xml`) as a type-erased `#[source]` so the root cause can be traced via the error chain without making that crate a public dependency
+- **Not responsible for**: recovery/retry logic (the caller's responsibility), localizing error messages (this library provides only a single set of Rust error strings; i18n, if needed, is left to the caller based on the error variant)
+
+## Key Types (draft)
+
+```rust
+use std::path::PathBuf;
+
+/// Crate-wide Result alias.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// The common error type used throughout the library. Every module's failure
+/// modes, including `parse_workbook`'s `Result::Err`, are consolidated into
+/// this type. Marked `#[non_exhaustive]` so future variants can be added
+/// without a breaking change (see Open Question 2).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    // --- Phase 1: relationship resolution ---
+    /// A required relationship part, e.g. `xl/_rels/workbook.xml.rels`, is
+    /// missing from the ZIP.
+    #[error("required relationship part not found: {0}")]
+    MissingRelationshipPart(String),
+
+    /// The `r:id` referenced by a `<sheet r:id="...">` element in
+    /// `workbook.xml` does not exist in the rels part, or the target file the
+    /// rels part points to does not exist in the ZIP.
+    #[error("dangling relationship reference: r:id={r_id}")]
+    DanglingRelationship { r_id: String },
+
+    // --- Phase 2: sanitization ---
+    /// The total uncompressed size exceeded the configured limit (Zip Bomb
+    /// protection, requirements spec section 2).
+    #[error("zip bomb detected: uncompressed size {actual} bytes exceeds limit {limit} bytes")]
+    ZipBombDetected { limit: u64, actual: u64 },
+
+    /// A ZIP entry name contains a path traversal sequence that would escape
+    /// the extraction directory (Zip Slip protection).
+    #[error("path traversal detected in zip entry: {entry_name}")]
+    ZipSlipDetected { entry_name: String },
+
+    /// The ZIP archive itself is corrupt, or a required part of the .xlsx
+    /// (OPC) package — e.g. `[Content_Types].xml` or `xl/workbook.xml` — is
+    /// missing.
+    #[error("not a valid .xlsx package: {0}")]
+    InvalidPackage(String),
+
+    // --- Phase 3: stream parsing ---
+    /// The XML is syntactically invalid (wraps the underlying XML parser
+    /// error). `source` does not hold the concrete parser error type (e.g.
+    /// `quick_xml::Error`) directly; it is type-erased as `Box<dyn Error>`
+    /// (see the explanation right after this code block).
+    #[error("XML parse error in {path}: {source}")]
+    XmlParse {
+        path: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    /// A required element or attribute is missing from the XML (e.g. a `<c>`
+    /// element without an `r` attribute).
+    #[error("missing required element/attribute `{name}` in {path}")]
+    MissingRequiredElement { path: String, name: &'static str },
+
+    // --- Phase 4: analysis and deferred resolution ---
+    /// An A1-style cell reference string is invalid (syntax error, numeric
+    /// overflow, empty string, etc. — returned by `CellRef::from_a1` in
+    /// model/cell.md).
+    #[error("invalid cell reference: {0:?}")]
+    InvalidCellRef(String),
+
+    /// A shared string index (referenced via `t="s"`) falls outside the
+    /// bounds of the shared string table.
+    #[error("shared string index {index} out of bounds (table len={len})")]
+    SharedStringIndexOutOfBounds { index: usize, len: usize },
+
+    /// A style ID (index into `cellXfs`) that does not exist was referenced.
+    #[error("invalid style id: {0}")]
+    InvalidStyleId(u32),
+
+    /// A merged cell range is invalid (overlaps another merged range, or its
+    /// start/end coordinates are inverted; used by the validation that
+    /// precedes `insert_merge` calls in model/sheet.md).
+    #[error("invalid merged cell range {start}:{end}: {reason}")]
+    InvalidMergedRange {
+        start: String,
+        end: String,
+        reason: String,
+    },
+
+    // --- Common across all phases ---
+    /// An I/O error (e.g. the target file cannot be opened or read).
+    /// `path` is `Option` because inputs that don't go through a file path
+    /// (e.g. an in-memory buffer such as `Cursor<Vec<u8>>`, or a future
+    /// `Read`-trait input accepted by `lib.rs`) have no path to report.
+    /// The Display message intentionally omits `path` for simplicity
+    /// (revisit at implementation time if `Some`/`None` should render
+    /// differently).
+    #[error("I/O error: {source}")]
+    Io {
+        path: Option<PathBuf>,
+        #[source]
+        source: std::io::Error,
+    },
+}
+```
+
+`InvalidPackage` currently serves as a provisional catch-all for ZIP extraction failures (e.g. a corrupt archive). Once `container/`'s design (i.e. which ZIP-handling crate to use) is finalized, revisit whether to split this into a dedicated variant that holds that crate's error type as `#[source]` (see Open Question 1).
+
+`XmlParse::source` holds `Box<dyn std::error::Error + Send + Sync + 'static>` rather than a concrete parser type (e.g. `quick_xml::Error`) because, even with `Error` marked `#[non_exhaustive]`, the types of each variant's named fields remain visible to external code — so placing a concrete external-crate type in a field effectively makes that crate a public dependency. A public dependency means a major version bump in that crate forces a breaking change in this library, and downstream users would have to add the crate as a direct dependency themselves just to work with `Error::XmlParse { source, .. }`. Type-erasing it means `parse/`'s choice of XML parser can change or be upgraded without affecting the public API (reflects feedback from the PR #6 review). For the same reason, `Io::source` (`std::io::Error`) is kept as-is without type erasure, since it is a standard-library type and does not raise the public-dependency concern.
+
+## Dependencies
+
+- Depends on: nothing within the crate (the most foundational leaf module — not even `model/` — since `error.rs` depending on any other module would create a cycle). Depends only on the external crate `thiserror` (to reduce boilerplate in defining the error type). It does not depend on `quick-xml`: `XmlParse::source` type-erases the parser's error into `Box<dyn std::error::Error + Send + Sync + 'static>` instead of holding its concrete type directly, so `quick-xml` (or any other XML parser `parse/` might adopt in the future) never becomes a public dependency (see the explanation in Key Types; reflects feedback from the PR #6 review).
+- Depended on by: nearly every module in the crate (`container/`, `parse/`, `model/`, `resolve/`, `pipeline.rs`, `lib.rs`). `json.rs` only serializes already-resolved data, so it is not expected to generate new instances of this type under normal operation.
+
+`thiserror` is a compile-time-only proc-macro dependency with no impact on runtime binary size or speed, so it does not conflict with the "lightweight and fast" policy in requirements spec section 1.
+
+## Error Handling Policy
+
+- `error.rs` itself performs no error-generating logic (it only defines the type). The following policy applies to everything that uses this type.
+- The library never uses `panic!` / `unwrap()` / `expect()` internally. Since the input being parsed is always an untrusted external file, every unexpected input must be propagated to the caller as one of the `Error` variants (the same principle as the error handling policy in [model/cell.md](model/cell.en.md)).
+- Errors originating from external crates (e.g. `quick-xml`) are never swallowed; they are held as `#[source]` so the root cause remains traceable via `std::error::Error::source()`. To avoid becoming a public dependency, though, the concrete external-crate type is not placed directly in the field — it is type-erased as `Box<dyn std::error::Error + Send + Sync + 'static>` (see `XmlParse`; this does not apply to `Io::source`, which is a standard-library type, `std::io::Error`).
+- Variants carry context (`path`, `r_id`, `index`, etc.) wherever practical, so callers can use it for logging or debugging to identify which file or coordinate the error occurred at.
+
+## Testing Strategy
+
+- Verify that each variant's `Display` (the `#[error(...)]` message) produces the intended string
+- Verify that `std::error::Error::source()` correctly returns the root cause for `XmlParse` / `Io`
+- Document (rather than test for compilation) that `#[non_exhaustive]` prevents crate consumers from `match`-ing without a `_ =>` arm — i.e. adding a future variant is not a breaking change; this is a compiler-guaranteed language feature, so no separate compile-pass test is needed
+- Since this file only defines types, its own unit-test surface is minimal; verification of actual variant construction and propagation is left to the tests of each originating module (e.g. `from_a1` in `model/cell.rs`)
+
+## Open Questions
+
+1. **Which external crate to use for ZIP handling**: to be settled when `container/` is designed. Once chosen, reconsider whether to replace `InvalidPackage(String)` with a dedicated variant holding that crate's error type as `#[source]`, or keep the current `String` catch-all.
+2. **Whether to keep `#[non_exhaustive]`**: currently adopted as a general best practice so future variant additions aren't breaking changes. However, while the crate is pre-1.0, adding variants is not considered a breaking change under Cargo's semantic versioning rules in the first place, so this may turn out to be unnecessary until the 1.0 release policy is settled.
+3. **Granularity of errors**: currently represented as a single flat enum covering "what happened in which phase," but whether to split it into per-phase nested sub-enums (e.g. `Error::Xml(XmlError)`) if the variant count keeps growing is undecided. Nesting would make caller-side matching deeper and more awkward to write (e.g. `Error::Xml(XmlError::MissingRequiredElement(...))`), so unless the library grows dramatically in scope, the benefit of keeping the current flat enum likely outweighs that of nesting it (reflects feedback from the PR #6 review).
+4. ~~How `InvalidCellRef` / `InvalidMergedRange` hold their input value~~ → **Resolved**: they do not hold the [model/cell.md](model/cell.en.md) `CellRef` type itself; they keep the current design of holding a `String` (the original input string, or its A1-notation form). This follows the Dependencies-section principle of keeping `error.rs` the most foundational leaf module, with no dependency on any other module (including `model/`). Embedding `CellRef` in a field would create an `error.rs → model::cell` dependency, while `CellRef::from_a1` already depends on `crate::error::Error` — producing a cycle between the two modules (reflects feedback from the PR #6 review).
+5. **MSRV for the `std::error::Error` implementation**: the choice of `thiserror` version (and how it handles `std::error::Error::source()`) depends on the crate's overall MSRV (Minimum Supported Rust Version) policy, which is undecided; to be finalized alongside `Cargo.toml` setup.
