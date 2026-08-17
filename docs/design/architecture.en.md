@@ -91,6 +91,8 @@ Responsible for Phase 4's analysis and deferred resolution. Since it has no depe
 - `merge.rs`: after the stream completes, matches the merged-range list from `<mergeCells>` against the collected cell data, mapping alias references from virtual cell coordinates to their origin cell.
 - `style.rs`: applies resolved formatting information from `styles.xml` to cells.
 
+- Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [mod.md](resolve/mod.en.md) / [shared_strings.md](resolve/shared_strings.en.md) / [merge.md](resolve/merge.en.md) / [style.md](resolve/style.en.md)
+
 ### `json.rs`
 
 Serializes the fully analyzed and resolved data model into JSON, including attributes such as `row_span` / `col_span` needed for frontend rendering.

@@ -91,6 +91,8 @@ ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブ�
 - `merge.rs`: ストリーム完了後に `<mergeCells>` の結合範囲リストとセルデータを突き合わせ、仮想セル座標から起点セルへのエイリアス参照をマッピングする。
 - `style.rs`: `styles.xml` から解決済みの書式情報をセルに適用する。
 
+- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [mod.md](resolve/mod.md) / [shared_strings.md](resolve/shared_strings.md) / [merge.md](resolve/merge.md) / [style.md](resolve/style.md)
+
 ### `json.rs`
 
 分析・解決が完了したデータモデルを、`row_span` / `col_span` などフロントエンド描画に必要な属性を含むJSONへシリアライズする。
