@@ -98,6 +98,21 @@ pub enum Error {
         reason: String,
     },
 
+    // --- Phase 5: JSON generation ---
+    /// JSON serialization failed (wraps the error `serde_json` returns).
+    /// `source` is type-erased as `Box<dyn Error>` for the same reason as
+    /// `XmlParse::source` (added alongside [json.md](json.md)'s design;
+    /// reflects the PR #10 review). In practice `json.rs` always falls
+    /// back non-finite floats before ever handing them to `serde_json`, so
+    /// no failure is expected to originate from a value's content; this
+    /// variant mainly serves as the propagation path for I/O errors from
+    /// the `Write` implementation.
+    #[error("JSON serialization error: {source}")]
+    JsonSerialize {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
     // --- Common across all phases ---
     /// An I/O error (e.g. the target file cannot be opened or read).
     /// `path` is `Option` because inputs that don't go through a file path
@@ -117,12 +132,12 @@ pub enum Error {
 
 `InvalidPackage` currently serves as a provisional catch-all for ZIP extraction failures (e.g. a corrupt archive). Once `container/`'s design (i.e. which ZIP-handling crate to use) is finalized, revisit whether to split this into a dedicated variant that holds that crate's error type as `#[source]` (see Open Question 1).
 
-`XmlParse::source` holds `Box<dyn std::error::Error + Send + Sync + 'static>` rather than a concrete parser type (e.g. `quick_xml::Error`) because, even with `Error` marked `#[non_exhaustive]`, the types of each variant's named fields remain visible to external code — so placing a concrete external-crate type in a field effectively makes that crate a public dependency. A public dependency means a major version bump in that crate forces a breaking change in this library, and downstream users would have to add the crate as a direct dependency themselves just to work with `Error::XmlParse { source, .. }`. Type-erasing it means `parse/`'s choice of XML parser can change or be upgraded without affecting the public API (reflects feedback from the PR #6 review). For the same reason, `Io::source` (`std::io::Error`) is kept as-is without type erasure, since it is a standard-library type and does not raise the public-dependency concern.
+`XmlParse::source` holds `Box<dyn std::error::Error + Send + Sync + 'static>` rather than a concrete parser type (e.g. `quick_xml::Error`) because, even with `Error` marked `#[non_exhaustive]`, the types of each variant's named fields remain visible to external code — so placing a concrete external-crate type in a field effectively makes that crate a public dependency. A public dependency means a major version bump in that crate forces a breaking change in this library, and downstream users would have to add the crate as a direct dependency themselves just to work with `Error::XmlParse { source, .. }`. Type-erasing it means `parse/`'s choice of XML parser can change or be upgraded without affecting the public API (reflects feedback from the PR #6 review). For the same reason, `Io::source` (`std::io::Error`) is kept as-is without type erasure, since it is a standard-library type and does not raise the public-dependency concern. `JsonSerialize::source` type-erases `serde_json::Error` for the same reason (added when [json.md](json.en.md) was designed, following the PR #10 review).
 
 ## Dependencies
 
 - Depends on: nothing within the crate (the most foundational leaf module — not even `model/` — since `error.rs` depending on any other module would create a cycle). Depends only on the external crate `thiserror` (to reduce boilerplate in defining the error type). It does not depend on `quick-xml`: `XmlParse::source` type-erases the parser's error into `Box<dyn std::error::Error + Send + Sync + 'static>` instead of holding its concrete type directly, so `quick-xml` (or any other XML parser `parse/` might adopt in the future) never becomes a public dependency (see the explanation in Key Types; reflects feedback from the PR #6 review).
-- Depended on by: nearly every module in the crate (`container/`, `parse/`, `model/`, `resolve/`, `pipeline.rs`, `lib.rs`). `json.rs` only serializes already-resolved data, so it is not expected to generate new instances of this type under normal operation.
+- Depended on by: nearly every module in the crate (`container/`, `parse/`, `model/`, `resolve/`, `pipeline.rs`, `lib.rs`). [`json.rs`](json.en.md) generates only `Error::JsonSerialize` (representing `serde_json`/I/O failures only; added following the PR #10 review) and no other variant.
 
 `thiserror` is a compile-time-only proc-macro dependency with no impact on runtime binary size or speed, so it does not conflict with the "lightweight and fast" policy in requirements spec section 1.
 
@@ -136,7 +151,7 @@ pub enum Error {
 ## Testing Strategy
 
 - Verify that each variant's `Display` (the `#[error(...)]` message) produces the intended string
-- Verify that `std::error::Error::source()` correctly returns the root cause for `XmlParse` / `Io`
+- Verify that `std::error::Error::source()` correctly returns the root cause for `XmlParse` / `Io` / `JsonSerialize`
 - Document (rather than test for compilation) that `#[non_exhaustive]` prevents crate consumers from `match`-ing without a `_ =>` arm — i.e. adding a future variant is not a breaking change; this is a compiler-guaranteed language feature, so no separate compile-pass test is needed
 - Since this file only defines types, its own unit-test surface is minimal; verification of actual variant construction and propagation is left to the tests of each originating module (e.g. `from_a1` in `model/cell.rs`)
 
