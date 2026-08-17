@@ -48,6 +48,12 @@ src/
 
 ## モジュール責務の詳細
 
+### `error.rs`
+
+クレート全体で共有する単一のエラー列挙型 `Error` を定義する。`model/` を含むクレート内の他モジュールに依存しない最も基底のリーフモジュールであり、`container/` `parse/` `model/` `resolve/` `pipeline.rs` `lib.rs` のほぼ全モジュールがこの型に依存する。
+
+- 詳細設計: [error.md](error.md)
+
 ### `pipeline.rs`
 
 `ZipContainer` を所有し、各フェーズの実行順序（`container` からストリームを借りて `parse` へ渡し、結果を `resolve` で解決して `json.rs` でシリアライズする）とリソース破棄タイミングを制御する。
