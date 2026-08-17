@@ -7,6 +7,7 @@
 
 mod container;
 mod error;
+mod json;
 mod model;
 mod parse;
 mod pipeline;
