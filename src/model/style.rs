@@ -24,9 +24,5 @@ pub struct ResolvedStyle {
 }
 
 /// A table looking up `ResolvedStyle` by `cellXfs` index. Built by
-/// `parse/styles.rs`.
-///
-/// `#[allow(dead_code)]`: unused until `parse/styles.rs` and
-/// `resolve/style.rs` (Issue #15) exist.
-#[allow(dead_code)]
+/// `parse/styles.rs`, applied by `resolve/style.rs`.
 pub type StyleSheet = HashMap<StyleId, Arc<ResolvedStyle>>;

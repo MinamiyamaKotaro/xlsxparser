@@ -73,12 +73,8 @@ pub struct Sheet {
 }
 
 impl Sheet {
-    /// Constructs a new, empty sheet.
-    ///
-    /// `#[allow(dead_code)]`: only exercised by tests until `pipeline.rs`
-    /// (Issue #15) calls it to build sheets from `parse/workbook.rs`'s
-    /// output.
-    #[allow(dead_code)]
+    /// Constructs a new, empty sheet. Called by `pipeline::run` to build
+    /// sheets from `parse/workbook.rs`'s output.
     pub(crate) fn new(name: String, visibility: SheetVisibility) -> Self {
         Self {
             name,
@@ -128,10 +124,6 @@ impl Sheet {
     /// alias if needed. Used by `resolve/shared_strings.rs` and
     /// `resolve/style.rs` to rewrite a cell's value/style with resolved
     /// data.
-    ///
-    /// `#[allow(dead_code)]`: unused until those `resolve/` modules
-    /// (Issue #15) call it.
-    #[allow(dead_code)]
     pub(crate) fn get_mut(&mut self, r: CellRef) -> Option<&mut Cell> {
         let origin = self.resolve_origin(r);
         self.cells.get_mut(&origin)
@@ -140,10 +132,6 @@ impl Sheet {
     /// Inserts a cell while updating max_row/max_col at the same time.
     /// Writes to `cells` only ever go through this method, structurally
     /// preventing the dimension fields from going out of sync.
-    ///
-    /// `#[allow(dead_code)]`: only exercised by tests until
-    /// `parse/worksheet.rs` (Issue #15) calls it while streaming cells.
-    #[allow(dead_code)]
     pub(crate) fn insert_cell(&mut self, r: CellRef, cell: Cell) {
         self.max_row = self.max_row.max(r.row);
         self.max_col = self.max_col.max(r.col);
@@ -159,10 +147,6 @@ impl Sheet {
     /// placeholder cell is inserted first, so `iter_cells` always picks up
     /// the origin cell. Calling this again for the same origin overwrites
     /// the previous region (last-write-wins).
-    ///
-    /// `#[allow(dead_code)]`: only exercised by tests until
-    /// `resolve/merge.rs` (Issue #15) calls it.
-    #[allow(dead_code)]
     pub(crate) fn insert_merge(&mut self, region: MergedRegion) {
         debug_assert!(region.start.row <= region.end.row);
         debug_assert!(region.start.col <= region.end.col);

@@ -8,7 +8,6 @@ use crate::parse::{PendingSharedString, SharedStringTable};
 /// For each entry in `pending`, looks up the actual string in `table` and
 /// writes it back into the corresponding cell in `sheet` as
 /// `CellValue::Text`.
-#[allow(dead_code)]
 pub(crate) fn resolve(
     sheet: &mut Sheet,
     pending: &[PendingSharedString],

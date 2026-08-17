@@ -12,18 +12,14 @@ use std::io::BufRead;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Relationship {
     /// r:id (e.g. "rId1").
-    #[allow(dead_code)]
     pub id: String,
     /// The full URI from the Type attribute (e.g. ".../relationships/worksheet").
     /// Kept as a plain string; interpreting it is left to the caller.
-    #[allow(dead_code)]
     pub rel_type: String,
     /// For Internal: the ZIP-entry-name-equivalent absolute path already
     /// resolved by `resolve_target_path`. For External: the Target
     /// attribute's URI string, unchanged.
-    #[allow(dead_code)]
     pub target: String,
-    #[allow(dead_code)]
     pub target_mode: TargetMode,
 }
 
@@ -48,7 +44,6 @@ pub(crate) type RelationshipMap = HashMap<String, Relationship>;
 /// anchor used to resolve `Target`'s relative paths. `path` is an
 /// identifier used only in error messages (the rels part's own ZIP entry
 /// name, e.g. `"xl/_rels/workbook.xml.rels"`).
-#[allow(dead_code)]
 pub(crate) fn parse_relationships(
     reader: impl BufRead,
     part_dir: &str,
