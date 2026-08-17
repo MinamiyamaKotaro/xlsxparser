@@ -35,14 +35,26 @@ pub const DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 
 /// happens once, up front, rather than lazily on individual entry access, so
 /// an "untrusted entry name" can never reach any later stage of processing.
 ///
-/// Checks performed (draft):
+/// Checks performed:
 /// - Rejects the empty string
 /// - Rejects absolute paths (starting with `/`)
-/// - Rejects Windows drive-letter prefixes (e.g. `C:\...`)
-/// - Rejects any path containing a `..` (parent directory) component
+/// - Rejects any path containing a backslash (not a valid OPC/ZIP
+///   separator; also covers Windows-style paths such as
+///   `C:\Windows\System32\evil`)
+/// - Rejects Windows drive-letter prefixes (e.g. `C:evil`) independently of
+///   the backslash check above
+/// - Rejects any `/`-separated path containing a `..` (parent directory)
+///   segment
 ///
-/// The implementation uses `std::path::Path::components()` purely for this
-/// validation; the result is never interpreted or used as an actual
+/// Implemented with plain string operations (`starts_with`/`contains`/
+/// `split('/')`) rather than `std::path::Path`, finalized at implementation
+/// time (PR #7's draft had proposed `Path::components()`): `Path`'s
+/// component parsing is conditionally compiled per target OS — e.g.
+/// backslash is only treated as a separator, and drive letters only
+/// recognized, when built for a `windows` target — so it would not reject
+/// `C:\Windows\System32\evil` the same way on a non-Windows build. This
+/// validation must behave identically regardless of which OS the library is
+/// built for. The result is never interpreted or used as an actual
 /// filesystem path (this library never extracts ZIP entries to disk, so the
 /// traditional Zip Slip harm — an unintended file write — cannot occur
 /// directly here; see Dependencies for why entry names are still validated).

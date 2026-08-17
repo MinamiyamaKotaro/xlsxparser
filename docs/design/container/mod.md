@@ -145,8 +145,9 @@ impl<R> ZipContainer<R> {
 
 ## 未決事項 / オープンクエスチョン
 
-1. **ZIP操作に使用する外部クレートの選定**: [error.md オープンクエスチョン1](../error.md) と同一の論点で未決定だが、PR #7 レビューでの一般的知見を踏まえ、Rustエコシステムにおける実績とシーク対応（`Read + Seek`）の観点から `zip` クレートを第一候補として設計を進める（本ファイルの型が要求する `Read + Seek` の前提とも合致する）。ただし具体的なバージョン固定・代替クレートとの最終比較は `Cargo.toml` 整備時に確定させる。
+1. ~~ZIP操作に使用する外部クレートの選定~~ → **解決**: `zip` クレート（v8）を採用（[error.md オープンクエスチョン1](../error.md) と同一の論点）。`open`/`open_reader` は `zip::result::ZipError` を専用の `#[source]` 保持バリアントにせず、現状は `Error::InvalidPackage(String)` へ文字列化する簡易な受け皿のままとした。呼び出し側がZIP失敗の種類ごとに分岐する必要が出てきたら見直す。
 2. ~~`get_entry` の戻り値の型設計~~ → **解決**: `impl Read + '_`（RPIT、`self` の借用に束縛）を採用する。本ライブラリの処理パイプラインは「rels読み込み→SST読み込み→worksheet逐次読み込み」という完全な逐次アクセスパターンであり、複数エントリのストリームを同時に開いておく必要性は設計上存在しない。アロケーションコストがなく、複数ストリームの同時オープン（借用競合）をコンパイル時に防げる `impl Read + '_` の方が `Box<dyn Read + '_>` より望ましい（PR #7 レビュー指摘を反映）。
-3. **`max_entry_size` / `max_total_size` の設定インターフェース**: `with_max_entry_size` / `with_max_total_size` のような後付けのビルダーメソッドにするか、`open` / `open_reader` の引数に含めるか、[sanitize.md オープンクエスチョン1](sanitize.md) で触れている `lib.rs` 公開APIからの可変性議論と合わせて確定させる。
+3. ~~`max_entry_size` / `max_total_size` の設定インターフェース~~ → **暫定解決**: クレート内からのみ呼び出せる `pub(crate)` ビルダーメソッド（`with_max_entry_size` / `with_max_total_size`）として実装した。`lib.rs` の公開APIにはまだ出しておらず、公開APIからの可変性（セキュリティレビュー Finding 2）が `lib.rs` 設計時（Issue #15）に固まり次第、`pipeline.rs` から呼び出す想定。
 4. ~~アーカイブ全体の累積サイズ追跡~~ → **解決**: `ZipContainer` が `total_read` / `max_total_size` フィールドとして保持する（`ZipContainer` が複数エントリにまたがる状態を持つ自然な置き場所であるため）。`get_entry` が `BoundedReader` へ `&mut u64` として貸し出す設計とし、`Cell` 等の内部可変性は用いない（PR #7 レビュー指摘を反映。詳細は[sanitize.md](sanitize.md)参照）。
 5. ~~必須パーツの存在チェックの責務分界~~ → **解決**: `ZipContainer` は「ZIPアーカイブから安全にファイルを切り出す汎用コンテナ層」としての責務に徹し、`.xlsx` (OPC) 特有のセマンティクス（どのパーツが必須か）は持たない（単一責任の原則）。存在チェックは `pipeline.rs` / `parse/relationships.rs` 側が `get_entry` の `Ok(None)` を見てハンドリングする（PR #7 レビュー指摘を反映）。
+6. **エントリ名検索の大文字小文字の扱い**: `get_entry` は `zip::ZipArchive::by_name` を使用しており大文字小文字を区別するが、OPCパート名（ECMA-376 Part 2）は仕様上大文字小文字を区別しない（ASCII case folding）。実装時点では、実運用のツール（Excel、Google Sheets、LibreOffice、Apache POI）がエントリ名と `.rels` の `Target` 参照を常にバイト単位で一致させているため、シンプルさを優先しcase-sensitiveのままとした。仕様に非準拠なツールが生成したファイルで問題が生じた場合は、既存の `validate_entry_path` の走査と合わせて `open_reader` 時に `HashMap<String, String>`（小文字化した名前 → 元の名前）を一度だけ構築する対応が考えられる（PR #21 レビュー指摘を反映）。
