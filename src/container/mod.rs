@@ -122,11 +122,9 @@ impl<R: Read + Seek> ZipContainer<R> {
 impl<R> ZipContainer<R> {
     /// Opens with an explicitly set per-entry uncompressed-size cap for Zip
     /// Bomb protection. `pub(crate)` rather than exposed on the public API
-    /// directly: `lib.rs` doesn't yet expose a way for callers to override
-    /// the default caps, so nothing calls this today. Tracked as follow-up
-    /// work (security review Finding 2: "whether callers should be able to
-    /// override the default size caps via `lib.rs`'s public API").
-    #[allow(dead_code)]
+    /// directly: `pipeline::run` calls this with the `SizeLimits` it
+    /// receives from `lib.rs`'s public API
+    /// (`parse_workbook_with_limits`/`parse_workbook_reader_with_limits`).
     pub(crate) fn with_max_entry_size(mut self, limit: u64) -> Self {
         self.max_entry_size = limit;
         self
@@ -134,7 +132,6 @@ impl<R> ZipContainer<R> {
 
     /// Opens with an explicitly set archive-wide cumulative uncompressed-size
     /// cap for Zip Bomb protection. Same rationale as `with_max_entry_size`.
-    #[allow(dead_code)]
     pub(crate) fn with_max_total_size(mut self, limit: u64) -> Self {
         self.max_total_size = limit;
         self

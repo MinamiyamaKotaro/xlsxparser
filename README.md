@@ -100,6 +100,20 @@ declarations (see
 [pipeline.en.md Open Question 3](docs/design/pipeline.en.md) for the
 rationale and the strict-OPC-conformance tradeoff this makes).
 
+## Security notes
+
+- **Zip Bomb / Zip Slip / XXE**: guarded against at parse time (see
+  [Architecture](#architecture) above and
+  [docs/security/design-review.md](docs/security/design-review.md) for the
+  full analysis).
+- **CSV / formula injection**: cell string values (including formula-computed
+  result strings) pass through unchanged, with no escaping at any stage —
+  this is safe as JSON output, but callers who re-export parsed values into
+  CSV or another spreadsheet format are responsible for their own
+  formula-injection mitigations (e.g. escaping a value that starts with `=`,
+  `+`, `-`, or `@`), since a `.xlsx` input is untrusted and this library
+  performs no rewriting of cell content.
+
 ## License
 
 TBD.

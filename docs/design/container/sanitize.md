@@ -8,6 +8,7 @@
 
 - **Zip Slip対策**: ZIPエントリ名がアーカイブのルート外へ脱出しないことを検証する（`validate_entry_path`）
 - **Zip Bomb対策**: 展開後バイト数の上限をストリーミングで強制する `Read` ラッパー（`BoundedReader`）を提供する
+- Zip Bombサイズ上限を呼び出し側が指定するための公開設定型 `SizeLimits` を定義する（`lib.rs`（[lib.md](../lib.md)）が再エクスポートし、`parse_workbook_with_limits`/`parse_workbook_reader_with_limits` の引数として使う。セキュリティレビュー Finding 2）
 - **含まない責務**: ZIPアーカイブそのものの展開・エントリ列挙（`container/mod.rs`）、XMLの構文解釈やXXE対策（`parse/`。要求仕様書2章のXXE要件は architecture.md の議論の経緯により `parse/mod.rs` の責務と確定済み）
 
 ## 主要な型（案）
@@ -17,15 +18,43 @@ use crate::error::Error;
 use std::io::{self, Read};
 
 /// フェーズ2のデフォルトの、エントリ単体ごとの展開後サイズ上限（バイト単位）。
-/// 具体的な値および呼び出し側（`lib.rs` の公開API）からの上書き可否は未決定
-/// （オープンクエスチョン1参照）。
-pub const DEFAULT_MAX_UNCOMPRESSED_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB（暫定値）
+/// 呼び出し側（`lib.rs` の公開API）からの上書きは `SizeLimits`
+/// （[lib.md](../lib.md)）経由で可能（オープンクエスチョン1で解決）。
+pub const DEFAULT_MAX_UNCOMPRESSED_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB
 
 /// フェーズ2のデフォルトの、アーカイブ全体を通じた累積展開後サイズ上限
 /// （バイト単位）。中程度のエントリを大量に持つことで累積的にメモリを
 /// 圧迫するタイプのZip Bombに対する防御（[container/mod.md](mod.md) 参照。
 /// PR #7 レビュー指摘を反映）。
-pub const DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB（暫定値）
+pub const DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// Zip Bomb対策のサイズ上限を呼び出し側が指定するための公開設定型。
+/// `lib.rs`（[lib.md](../lib.md)）がクレートルートへ再エクスポートし、
+/// `parse_workbook_with_limits`/`parse_workbook_reader_with_limits` の引数
+/// として使う。`Default` は `DEFAULT_MAX_UNCOMPRESSED_SIZE` /
+/// `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE` をそのまま用いる（値を二重管理
+/// せず、`parse_workbook`/`parse_workbook_reader` は内部で
+/// `SizeLimits::default()` を渡すだけで済む）。
+#[derive(Debug, Clone, Copy)]
+pub struct SizeLimits {
+    /// 個々のZIPエントリ（シートXML等）の展開後サイズ上限（バイト）。
+    /// `ZipContainer::with_max_entry_size`（[container/mod.md](mod.md)）へ
+    /// そのまま渡る。
+    pub max_entry_size: u64,
+    /// アーカイブ全体での累積展開後サイズ上限（バイト）。
+    /// `ZipContainer::with_max_total_size`（[container/mod.md](mod.md)）へ
+    /// そのまま渡る。
+    pub max_total_size: u64,
+}
+
+impl Default for SizeLimits {
+    fn default() -> Self {
+        Self {
+            max_entry_size: DEFAULT_MAX_UNCOMPRESSED_SIZE,
+            max_total_size: DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE,
+        }
+    }
+}
 
 /// ZIPエントリ名がアーカイブのルートより外側へ脱出しないことを検証する
 /// （Zip Slip対策）。`container/mod.rs` がアーカイブを開いた直後、
@@ -156,10 +185,11 @@ Zip Slipの検証を「実ディスクへの展開を行わない設計であっ
 - `BoundedReader`: エントリ単体の上限を1バイトでも超える読み込みが `Err` になり、`LimitExceeded` の `actual`/`limit` が `per_entry_limit` 側の値で正しいことの確認
 - `BoundedReader`: エントリ単体は上限内でも、複数エントリにまたがる累積読み込みが `cumulative_limit` を超えた場合に `Err` になり、`LimitExceeded` の `actual`/`limit` が `cumulative_limit` 側の値で正しいことの確認（累積カウンタが呼び出しをまたいで正しく引き継がれることの確認を含む）
 - `BoundedReader`: 上限に達する前の通常の読み込みが正しくバイト数をカウント・透過し、`cumulative_read` の値も正しく加算されることの確認
+- `SizeLimits::default()` の `max_entry_size`/`max_total_size` が、それぞれ `DEFAULT_MAX_UNCOMPRESSED_SIZE`/`DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE` と一致することの確認（値の二重管理が実装時にずれていないことの回帰テスト）
 
 ## 未決事項 / オープンクエスチョン
 
-1. **サイズ上限のデフォルト値と可変性**: `DEFAULT_MAX_UNCOMPRESSED_SIZE`（暫定512 MiB）・`DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE`（暫定2 GiB）の具体的な値の妥当性、および `lib.rs` の公開API（`parse_workbook` 等）から呼び出し側が上限を上書きできるようにすべきかは、`lib.rs` の設計時にあわせて確定させる。
+1. ~~サイズ上限のデフォルト値と可変性~~ → **解決**: `DEFAULT_MAX_UNCOMPRESSED_SIZE`（512 MiB）・`DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE`（2 GiB）は値として維持する。要求仕様書自体には具体的なファイルサイズ上限の記載がないが、実務上の巨大シート（「方眼紙Excel」、数十万〜100万セル規模）でも展開後XMLサイズは概ね10〜50 MiB程度に収まるため、512 MiBは正当な入力を誤って拒否しない十分な余裕を持ちつつDoSを抑制できる値と判断した。呼び出し側からの上書きは、`lib.rs`（[lib.md](../lib.md)）が新設する `SizeLimits` 構造体と `parse_workbook_with_limits` / `parse_workbook_reader_with_limits` を通じて可能にする（`pipeline::run` が `SizeLimits` を受け取り、[container/mod.md](mod.md) の `with_max_entry_size` / `with_max_total_size` へ橋渡しする。セキュリティレビュー Finding 2、Issue [#14](https://github.com/MinamiyamaKotaro/xlsxparser/issues/14)）。
 2. ~~上限のスコープ: エントリ単位か累積か~~ → **解決**: エントリ単位（`per_entry_limit`）に加え、アーカイブ全体の累積展開済みサイズ（`cumulative_limit`）も `BoundedReader` が同時に監視する設計とする。累積カウンタの実体は [container/mod.md](mod.md) の `ZipContainer` がフィールドとして保持し、`get_entry` 呼び出し時に `&mut u64` として `BoundedReader` へ渡す（PR #7 レビュー指摘を反映）。
 3. ~~`LimitExceeded` から `Error::ZipBombDetected` への変換層~~ → **解決**: `pipeline.rs` ではなく `parse/` が `quick_xml::Error` を `crate::error::Error` へ変換する境界（型消去する直前）でダウンキャストする。理由・詳細はエラー処理方針セクション参照（PR #7 レビュー指摘を反映。当初検討した「`ZipContainer` に共有フラグ（`Cell`）を持たせ `pipeline.rs` 側で確認する」代替案は、`container/sanitize.rs` の関知しない範囲に恒常的なチェック漏れリスクを生む上、`parse/` 層での変換に比べて余分な内部可変性を要するため採用しない）。
 4. **圧縮率ベースの検知の要否**: 現状は展開後の絶対サイズのみで判定するが、ZIP中央ディレクトリから安価に取得できる「宣言された圧縮後サイズ」と「宣言された展開後サイズ」の比率（例: 100倍以上）を用いた早期検知（実際に展開する前段階でのスクリーニング）を `container/mod.rs` 側に追加すべきかは未決定。追加する場合、その判定ロジックを本ファイルに置くか `container/mod.rs` に置くかも未確定。

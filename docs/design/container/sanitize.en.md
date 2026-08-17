@@ -8,6 +8,7 @@ Design doc for `src/container/sanitize.rs`. Covers Phase 2 (sanitization) as def
 
 - **Zip Slip protection**: validates that a ZIP entry name cannot escape the archive's logical root (`validate_entry_path`)
 - **Zip Bomb protection**: provides a `Read` wrapper (`BoundedReader`) that enforces an uncompressed-size cap while streaming
+- Defines `SizeLimits`, the public configuration type callers use to set the Zip Bomb size caps (re-exported by `lib.rs` ([lib.md](../lib.en.md)) and used as the argument to `parse_workbook_with_limits`/`parse_workbook_reader_with_limits` — security review Finding 2)
 - **Not responsible for**: extracting the ZIP archive itself or enumerating its entries (`container/mod.rs`), interpreting XML syntax or XXE protection (`parse/` — per the discussion recorded in architecture.md, the XXE requirement from requirements spec section 2 has already been settled as `parse/mod.rs`'s responsibility)
 
 ## Key Types (draft)
@@ -17,16 +18,44 @@ use crate::error::Error;
 use std::io::{self, Read};
 
 /// The default uncompressed-size cap for Phase 2, per individual entry (in
-/// bytes). The concrete value and whether the caller (via `lib.rs`'s public
-/// API) can override it are undecided (see Open Question 1).
-pub const DEFAULT_MAX_UNCOMPRESSED_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB (provisional)
+/// bytes). Callers can override it via `lib.rs`'s public API through
+/// `SizeLimits` ([lib.md](../lib.en.md)) (resolved in Open Question 1).
+pub const DEFAULT_MAX_UNCOMPRESSED_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB
 
 /// The default cumulative uncompressed-size cap for Phase 2, across the
 /// whole archive (in bytes). Defends against the variant of Zip Bomb built
 /// from many moderately-sized entries whose cumulative total becomes
 /// enormous (see [container/mod.md](mod.en.md). Reflects feedback from the
 /// PR #7 review).
-pub const DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB (provisional)
+pub const DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// Public configuration type callers use to set the Zip Bomb size caps.
+/// `lib.rs` ([lib.md](../lib.en.md)) re-exports it at the crate root and
+/// uses it as the argument to `parse_workbook_with_limits`/
+/// `parse_workbook_reader_with_limits`. `Default` reuses
+/// `DEFAULT_MAX_UNCOMPRESSED_SIZE` / `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE`
+/// as-is (a single source of truth for the values — `parse_workbook`/
+/// `parse_workbook_reader` simply pass `SizeLimits::default()` internally).
+#[derive(Debug, Clone, Copy)]
+pub struct SizeLimits {
+    /// The per-entry (sheet XML, etc.) uncompressed-size cap, in bytes.
+    /// Passed straight through to `ZipContainer::with_max_entry_size`
+    /// ([container/mod.md](mod.en.md)).
+    pub max_entry_size: u64,
+    /// The archive-wide cumulative uncompressed-size cap, in bytes. Passed
+    /// straight through to `ZipContainer::with_max_total_size`
+    /// ([container/mod.md](mod.en.md)).
+    pub max_total_size: u64,
+}
+
+impl Default for SizeLimits {
+    fn default() -> Self {
+        Self {
+            max_entry_size: DEFAULT_MAX_UNCOMPRESSED_SIZE,
+            max_total_size: DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE,
+        }
+    }
+}
 
 /// Validates that a ZIP entry name cannot escape the archive's logical root
 /// (Zip Slip protection). `container/mod.rs` calls this for every entry name
@@ -164,10 +193,11 @@ The reason Zip Slip is validated even though this library never extracts entries
 - `BoundedReader`: verify a read that exceeds the per-entry limit by even one byte returns `Err`, with `LimitExceeded`'s `actual`/`limit` correctly reflecting `per_entry_limit`
 - `BoundedReader`: verify that even when a single entry stays within its own limit, cumulative reads spanning multiple entries that exceed `cumulative_limit` return `Err`, with `LimitExceeded`'s `actual`/`limit` correctly reflecting `cumulative_limit` (including verifying the cumulative counter correctly carries over across calls)
 - `BoundedReader`: verify ordinary reads before either cap is reached correctly count and pass through bytes, and that `cumulative_read` is incremented correctly
+- Verify that `SizeLimits::default()`'s `max_entry_size`/`max_total_size` equal `DEFAULT_MAX_UNCOMPRESSED_SIZE`/`DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE` respectively (a regression test guarding against the two sources of truth drifting apart at implementation time)
 
 ## Open Questions
 
-1. **Default size caps and configurability**: whether the concrete values of `DEFAULT_MAX_UNCOMPRESSED_SIZE` (provisionally 512 MiB) and `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE` (provisionally 2 GiB) are appropriate, and whether callers should be able to override them via `lib.rs`'s public API (e.g. `parse_workbook`), is to be finalized alongside `lib.rs`'s design.
+1. ~~Default size caps and configurability~~ → **Resolved**: `DEFAULT_MAX_UNCOMPRESSED_SIZE` (512 MiB) and `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE` (2 GiB) keep their current values. The requirements spec itself states no concrete file-size ceiling, but even a real-world "grid-paper Excel" sheet (hundreds of thousands to a million cells) decompresses to roughly 10–50 MiB of XML, so 512 MiB leaves a comfortable margin against rejecting legitimate input while still bounding DoS exposure. Caller overrides are now possible through a new `SizeLimits` struct and `parse_workbook_with_limits` / `parse_workbook_reader_with_limits` on `lib.rs` ([lib.md](../lib.en.md)) — `pipeline::run` accepts a `SizeLimits` and forwards it to [container/mod.md](mod.en.md)'s `with_max_entry_size` / `with_max_total_size` (security review Finding 2, Issue [#14](https://github.com/MinamiyamaKotaro/xlsxparser/issues/14)).
 2. ~~Scope of the cap: per-entry vs. cumulative~~ → **Resolved**: `BoundedReader` now monitors both a per-entry cap (`per_entry_limit`) and a cumulative cap across the whole archive (`cumulative_limit`) simultaneously. The cumulative counter itself is a field owned by `ZipContainer` in [container/mod.md](mod.en.md), passed into `BoundedReader` as `&mut u64` on each `get_entry` call (reflects feedback from the PR #7 review).
 3. ~~The conversion layer from `LimitExceeded` to `Error::ZipBombDetected`~~ → **Resolved**: the downcast happens where `parse/` converts a `quick_xml::Error` into `crate::error::Error` — not in `pipeline.rs`. See Error Handling Policy for the rationale and details (reflects feedback from the PR #7 review; the alternative initially considered — giving `ZipContainer` a shared flag via `Cell` that `pipeline.rs` checks — was not adopted, since it would create an ongoing risk of a missed check outside `container/sanitize.rs`'s own visibility, and would require extra interior mutability compared to converting at the `parse/` layer).
 4. **Whether to add compression-ratio-based detection**: the current design judges only by absolute uncompressed size. Whether `container/mod.rs` should additionally perform early screening using the ratio between the ZIP central directory's declared compressed and uncompressed sizes (e.g. flagging a ratio above 100:1) before actually decompressing anything is undecided; if added, whether that logic belongs in this file or in `container/mod.rs` is also undecided.

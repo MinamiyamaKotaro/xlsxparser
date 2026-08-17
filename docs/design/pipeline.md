@@ -7,6 +7,7 @@
 ## 責務・スコープ
 
 - [`container::ZipContainer`](container/mod.md) を所有し、フェーズ1〜4を通じて `get_entry` を逐次呼び出す（1エントリを読み切ってから次のエントリを取得する。[container/mod.md](container/mod.md) が `get_entry` の型シグネチャで既に強制している逐次アクセスパターンに従う）
+- 呼び出し元（`lib.rs`）から受け取った `SizeLimits`（[lib.md](lib.md)）を `ZipContainer::open_reader` 直後に `with_max_entry_size` / `with_max_total_size`（[container/mod.md](container/mod.md)）へ橋渡しし、Zip Bombサイズ上限を呼び出し側が上書きできるようにする（セキュリティレビュー Finding 2、Issue [#14](https://github.com/MinamiyamaKotaro/xlsxparser/issues/14)）
 - **フェーズ1**: `xl/_rels/workbook.xml.rels` と `xl/workbook.xml` を取得・パースし、シート名・可視性・実体ファイルパスの「ルーティングプラン」を構築する。あわせて `xl/_rels/workbook.xml.rels` 内から `sharedStrings.xml` / `styles.xml` への関係を関係タイプ（`Relationship.rel_type`）で識別する（[relationships.md 含まない責務](parse/relationships.md) が「どの r:id がどのパーツ種別に対応するかの意味づけは呼び出し元の責務」としていた分担を実装する）
 - ルーティングプラン構築後、rels読み込みに使ったリーダーと [`parse::RelationshipMap`](parse/relationships.md) をスコープアウトさせ破棄する（architecture.md「フェーズ1完了時にルーティングマップ構築後、`_rels` の一時バッファを破棄する」の実装）
 - ルーティングプラン確定後、シートループに入る前に [`SharedStringTable`](parse/shared_strings.md) と [`StyleSheet`](model/style.md) を一度だけ構築する
@@ -17,6 +18,7 @@
 ## 主要な型・関数（案）
 
 ```rust
+use crate::container::sanitize::SizeLimits;
 use crate::container::ZipContainer;
 use crate::error::Error;
 use crate::model::sheet::{Sheet, SheetVisibility};
@@ -42,9 +44,15 @@ struct SheetRoute {
 /// 公開API（`parse_workbook` 等。オープンクエスチョン2参照）が本関数を呼ぶ。
 /// `Read + Seek` に対して汎用的なのは [container/mod.md](container/mod.md) の
 /// `ZipContainer::open_reader` の制約（ZIP central directory 読み取りに
-/// シーク可能性を要求する）をそのまま引き継ぐため。
-pub(crate) fn run<R: Read + Seek>(reader: R) -> Result<Workbook, Error> {
-    let mut container = ZipContainer::open_reader(reader)?;
+/// シーク可能性を要求する）をそのまま引き継ぐため。`limits` は Zip Bomb対策
+/// のサイズ上限（[lib.md](lib.md) `SizeLimits`）で、`lib.rs` の
+/// `parse_workbook`/`parse_workbook_reader` からは `SizeLimits::default()`
+/// が、`parse_workbook_with_limits`/`parse_workbook_reader_with_limits` から
+/// は呼び出し側が指定した値がそのまま渡る。
+pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workbook, Error> {
+    let mut container = ZipContainer::open_reader(reader)?
+        .with_max_entry_size(limits.max_entry_size)
+        .with_max_total_size(limits.max_total_size);
 
     // --- フェーズ1: リレーションシップの解決とルーティングプラン構築 ---
     let rels_reader = container
@@ -154,6 +162,7 @@ pub(crate) fn run<R: Read + Seek>(reader: R) -> Result<Workbook, Error> {
 - 複数シートを持つブックで、各シートが `xl/workbook.xml` の `<sheets>` 定義順で `Workbook.sheets()` に格納されることの確認（[model/workbook.md](model/workbook.md) のソース順維持方針との結線）
 - 途中のシート（例: 2枚目）のパースが失敗する場合に、1枚目が正常に処理済みであっても `Workbook` 全体が返らず `Err` になることの確認（fail closed の回帰テスト）
 - 可視性が `Hidden`/`VeryHidden` のシートを含むブックでも、全シートが除外されずに `Workbook` へ含まれることの確認（[model/workbook.md オープンクエスチョン1](model/workbook.md) との結線）
+- `run` に `DEFAULT_MAX_UNCOMPRESSED_SIZE` より小さい `max_entry_size` を持つ `SizeLimits` を渡した場合、通常なら成功するはずの入力が `Error::ZipBombDetected` になることの確認（`SizeLimits` が実際に `ZipContainer` まで橋渡しされていることの結線テスト。`with_max_entry_size`/`with_max_total_size` 自体のロジック検証は [container/mod.md](container/mod.md) 側の責務）
 
 ## 未決事項 / オープンクエスチョン
 
