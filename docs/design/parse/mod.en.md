@@ -9,6 +9,7 @@ Design doc for `src/parse/mod.rs`. Per [architecture.md](../architecture.en.md),
 - Declares submodules (`mod relationships; mod workbook; mod shared_strings; mod styles; mod worksheet;`) and re-exports crate-internal types
 - Provides `create_secure_reader`, the sole gateway for constructing a `quick_xml::Reader` with XXE mitigations already applied. Every module under `parse/` must obtain its `Reader` only through this function, never by calling `Reader::from_reader` directly (this implements architecture.md's rationale: "if each parser initializes its own `Reader`, there is a risk of a missed configuration")
 - Provides `convert_xml_error`, the sole gateway for converting `quick_xml::Error` into [`crate::error::Error`](../error.en.md). This is also where limit-exceeded errors from [container/sanitize.md](../container/sanitize.en.md)'s `BoundedReader` (Zip Bomb protection) are detected and converted into `Error::ZipBombDetected`
+- Provides `read_event`, the sole gateway for reading events. `quick-xml` is a non-validating parser that never resolves a DTD internal subset or an external entity even in its default configuration, so classic XXE cannot occur in the first place — but rather than resting on that assumption alone, this function actively rejects any `<!DOCTYPE ...>` declaration (`Event::DocType`) unconditionally the moment it is detected as XML syntax (fail closed), giving XXE mitigation an explicit, verifiable form that doesn't depend on the parser's internal implementation or future version changes. Every module under `parse/` reads events only through this function, never calling `Reader::read_event_into` directly (reflects [the security review](../../security/design-review.en.md) Finding 1)
 - Provides small shared helpers for patterns that would otherwise be duplicated across modules: required-attribute lookup (returning `Error::MissingRequiredElement` when absent) and concatenating rich-text runs (`<r><t>...</t></r>`) used by both shared strings and inline strings
 - **Not responsible for**: interpreting the structure specific to any individual XML part (`_rels` / `workbook.xml` / `sharedStrings.xml` / `styles.xml` / `sheetX.xml` — each submodule's job), semantic validation/resolution of parsed results (`resolve/`)
 
@@ -81,6 +82,40 @@ pub(crate) fn convert_xml_error(path: &str, err: quick_xml::Error) -> Error {
     }
 }
 
+/// The sole gateway for reading events. Calls `reader.read_event_into(buf)`,
+/// converts any error via `convert_xml_error`, and — if the returned `Event`
+/// is `Event::DocType` (a `<!DOCTYPE ...>` declaration) — returns
+/// `Error::DoctypeRejected` unconditionally without interpreting its content
+/// at all (fail closed).
+///
+/// None of OOXML's `_rels`/`workbook.xml`/`sharedStrings.xml`/`styles.xml`/
+/// `sheetX.xml` parts ever carry a DOCTYPE declaration per spec, so this
+/// check never rejects a legitimate `.xlsx`. The design assumption that
+/// `quick-xml` itself is a non-validating parser that resolves neither a
+/// DTD internal subset nor an external entity, so classic XXE cannot occur
+/// even in the default configuration (see Responsibility / Scope), still
+/// holds — but this function acts as an independent layer of defense that
+/// keeps working even if that assumption were ever broken by a future
+/// version change or a switch to a different parser, by cutting processing
+/// off the moment a DOCTYPE declaration's mere presence is detected at the
+/// XML syntax level. Every module under `parse/` reads events only through
+/// this function, never calling `reader.read_event_into` directly.
+pub(crate) fn read_event<'a>(
+    reader: &mut Reader<impl BufRead>,
+    buf: &'a mut Vec<u8>,
+    path: &str,
+) -> Result<Event<'a>, Error> {
+    let event = reader
+        .read_event_into(buf)
+        .map_err(|err| convert_xml_error(path, err))?;
+    if matches!(event, Event::DocType(_)) {
+        return Err(Error::DoctypeRejected {
+            path: path.to_string(),
+        });
+    }
+    Ok(event)
+}
+
 /// Reads attribute `name` from `start`. Returns `Error::MissingRequiredElement`
 /// if it is absent. Whether the returned string is fully decoded/unescaped
 /// or kept as raw bytes is to be settled together with the quick-xml version
@@ -120,10 +155,13 @@ pub(crate) fn concat_rich_text<R: BufRead>(
 
 `convert_xml_error`'s reference to `container::sanitize::LimitExceeded` is simply the implementation of what both [container/sanitize.md Error Handling Policy](../container/sanitize.en.md) and [container/mod.md Error Handling Policy](../container/mod.en.md) had already settled — that the conversion boundary lives where `parse/` converts `quick_xml::Error` into `crate::error::Error`. This resolves the open point both of those files had left pending.
 
+`read_event` returning `Error::DoctypeRejected` ([newly added](../error.en.md)) makes it a third "sole gateway," alongside `create_secure_reader` and `convert_xml_error`. It doubles up XXE mitigation as an active check performed on every event actually read, rather than leaving it solely to the passive mechanism of how the `Reader` is configured at construction time (reflects [the security review](../../security/design-review.en.md) Finding 1).
+
 ## Error Handling Policy
 
 - `create_secure_reader` cannot fail (constructing a `Reader` never fails by itself; I/O errors on the underlying stream only surface when `read_event` is actually called)
 - `convert_xml_error` always converts any `quick_xml::Error` into some variant of `crate::error::Error` (never panics). Anything that doesn't match `Error::ZipBombDetected` always falls back to `Error::XmlParse`, so no unknown variant is silently swallowed
+- When `read_event` detects `Event::DocType`, it returns `Error::DoctypeRejected` immediately without interpreting the declaration's content at all (e.g. whether its internal subset defines an entity). Rather than an allowlist-style judgment that "only rejects it if it contains a suspicious entity definition," treating the mere presence of a DOCTYPE declaration as grounds for rejection structurally eliminates any chance of a detection gap caused by a mistake in parsing the entity-definition syntax (fail closed — the same principle [container/sanitize.md](../container/sanitize.en.md)'s `validate_entry_path` follows: "ambiguous or uninterpretable input errs on the side of rejection")
 - `required_attr` returns `Result` rather than panicking, since a missing attribute can originate from untrusted external input (a malformed `.xlsx`)
 
 ## Testing Strategy
@@ -133,12 +171,15 @@ pub(crate) fn concat_rich_text<R: BufRead>(
 - `convert_xml_error`: verify that an ordinary XML syntax error (e.g. an unclosed tag) converts to `Error::XmlParse` with `path` set correctly
 - `required_attr`: verify it retrieves the value when the attribute is present, and returns `Error::MissingRequiredElement` when absent
 - `concat_rich_text`: verify a single `<t>`, multiple `<r><t>` runs, and input containing `<rPh>` each produce the expected string (exhaustive cases live in [shared_strings.md Testing Strategy](shared_strings.en.md); this file only verifies the wiring)
-- An integration-style test that feeds a malicious XML payload (a DOCTYPE declaration with an external entity reference — an XXE payload) through `create_secure_reader` and verifies that no content from the external file ever appears in the parse result (verifies requirements chapter 2's XXE requirement itself; per the [PR #9 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204), this is centralized here and not repeated in individual `parse/*.rs` files — the core of XXE mitigation is that `create_secure_reader` returns a safely configured `Reader`, so testing it where that factory function is defined is the most direct and maintainable structure)
+- **`read_event`: verify that feeding a malicious XML payload containing a DOCTYPE declaration and an external entity reference (e.g. `<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>`) returns `Error::DoctypeRejected` the moment `Event::DocType` is detected, and reads no further events** (verifies requirements chapter 2's XXE requirement itself; a regression test for the explicit, verifiable mitigation [the security review](../../security/design-review.en.md) Finding 1 called for, instead of resting on an implicit assumption alone)
+- `read_event`: verify that legitimate XML with no external entity reference and no DOCTYPE declaration (representative of `_rels`/`workbook.xml`/`sharedStrings.xml`/`styles.xml`/`sheetX.xml`) returns events as normal, and `Error::DoctypeRejected` is never raised spuriously (a regression test guarding against false positives on a legitimate `.xlsx`)
+- `read_event`: verify that XML with no DOCTYPE but a syntax error, and input that exceeds `BoundedReader`'s limit, each convert correctly to `Error::XmlParse`/`Error::ZipBombDetected` via `convert_xml_error` (a wiring test confirming error conversion happens before the `Event::DocType` check)
+- None of the above XXE-related tests are repeated in individual `parse/*.rs` files (per the [PR #9 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204), they are centralized here, where `read_event` is defined)
 
 ## Open Questions
 
-1. **Finalizing the quick-xml version and `Reader` configuration API**: tied to [error.md Open Question 1](../error.en.md) and [container/mod.md Open Question 1](../container/mod.en.md). `Reader::config_mut()`'s availability and the names of its settings vary by version, so this file's code sample will need updating to match the actual API once `Cargo.toml` is set up.
-2. ~~Where the XXE-non-applicability test lives~~ → **Resolved**: centralized in this file's unit tests (reflects the [PR #9 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)). Placing it alongside where `create_secure_reader` is defined lets it directly verify the core of the mitigation — that a safely configured `Reader` is returned — without repeating it in individual `parse/*.rs` files.
+1. **Finalizing the quick-xml version and `Reader` configuration API**: tied to [error.md Open Question 1](../error.en.md) and [container/mod.md Open Question 1](../container/mod.en.md). `Reader::config_mut()`'s availability and the names of its settings vary by version, so this file's code sample will need updating to match the actual API once `Cargo.toml` is set up. **`read_event`'s XXE mitigation (unconditionally rejecting `Event::DocType`), however, does not depend on how this open question resolves** (reflects [the security review](../../security/design-review.en.md) Finding 1). The `Event` enum's shape (the existence of the `DocType` variant) has stayed stable across quick-xml's major versions, so changes to configuration-API details like `Reader::config_mut()` have no bearing on this mitigation's effectiveness. That independence is exactly what fundamentally resolves the issue Finding 1 raised with the original design, which rested on "the `Reader`'s default behavior" as an implicit assumption.
+2. ~~Where the XXE-non-applicability test lives~~ → **Resolved**: centralized in this file's unit tests (reflects the [PR #9 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)). Placing it alongside where `read_event` is defined lets it directly verify the core of the mitigation — that `Event::DocType` is reliably detected and rejected — without repeating it in individual `parse/*.rs` files.
 3. **`required_attr`'s return type**: returning `Cow<str>` or `&str` instead of an allocated `String` could avoid unnecessary allocation, but this is to be settled together with quick-xml's attribute-decoding API (version-dependent).
 4. ~~How to resolve namespaces (e.g. `r:id`)~~ → **Resolved**: does not adopt `quick_xml::NsReader`'s namespace-URI-based resolution; simplifies to plain string-prefix matching (matching against an attribute name that includes the prefix, e.g. `"r:id"`, when calling `required_attr`) — reflects the [PR #9 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204). This prioritizes requirements chapter 1's "lightweight and fast" policy, given that every major producer (Excel, Google Sheets, LibreOffice, Apache POI, etc.) uses `r` as the relationships-namespace prefix without exception in practice. Even in the very rare case of a legally-formed document that declares the namespace under a different alias, the attribute simply comes back "not found," failing closed as `Error::MissingRequiredElement` rather than silently reading a wrong value.
 5. **`Reader` internal buffer sizing for large streams such as `worksheet.xml`**: quick-xml grows its buffer dynamically by default, but there is room to explicitly tune the initial buffer size for the "grid-paper Excel" sheet sizes the requirements target. To be settled during [worksheet.md](worksheet.en.md)'s design/implementation based on profiling.
