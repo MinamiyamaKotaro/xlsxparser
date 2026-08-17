@@ -97,7 +97,7 @@ pub enum Error {
     // --- Phase 5: JSON generation ---
     /// JSON serialization failed (wraps the error `serde_json` returns).
     /// `source` is type-erased for the same reason as `XmlParse::source`. In
-    /// practice `json.rs` always falls back non-finite floats before ever
+    /// practice `json.rs` always falls back on non-finite floats before ever
     /// handing them to `serde_json`, so no failure is expected to originate
     /// from a value's content; this variant mainly serves as the propagation
     /// path for I/O errors from the `Write` implementation.
@@ -111,12 +111,32 @@ pub enum Error {
     /// An I/O error (e.g. the target file cannot be opened or read). `path`
     /// is `Option` because inputs that don't go through a file path (e.g. an
     /// in-memory buffer such as `Cursor<Vec<u8>>`) have no path to report.
-    #[error("I/O error: {source}")]
+    /// When present, it is appended to the `Display` message so the
+    /// offending file can be identified from the error text alone.
+    #[error("I/O error{}: {source}", io_path_suffix(path))]
     Io {
         path: Option<PathBuf>,
         #[source]
         source: std::io::Error,
     },
+}
+
+/// Formats `Error::Io`'s optional `path` as a `Display`-message suffix
+/// (empty when `None`).
+fn io_path_suffix(path: &Option<PathBuf>) -> String {
+    match path {
+        Some(p) => format!(" (path: {})", p.display()),
+        None => String::new(),
+    }
+}
+
+/// Converts a path-less I/O error (e.g. from an in-memory buffer) via `?`.
+/// Errors with a known path should still be constructed explicitly as
+/// `Error::Io { path: Some(..), source }` so the path is reported.
+impl From<std::io::Error> for Error {
+    fn from(source: std::io::Error) -> Self {
+        Error::Io { path: None, source }
+    }
 }
 
 #[cfg(test)]
@@ -236,15 +256,48 @@ mod tests {
             "JSON serialization error: trailing comma"
         );
 
-        let io_source = io::Error::new(io::ErrorKind::NotFound, "no such file");
         assert_eq!(
             Error::Io {
                 path: Some(PathBuf::from("book.xlsx")),
-                source: io_source,
+                source: io::Error::new(io::ErrorKind::NotFound, "no such file"),
+            }
+            .to_string(),
+            "I/O error (path: book.xlsx): no such file"
+        );
+
+        assert_eq!(
+            Error::Io {
+                path: None,
+                source: io::Error::new(io::ErrorKind::NotFound, "no such file"),
             }
             .to_string(),
             "I/O error: no such file"
         );
+    }
+
+    #[test]
+    fn io_error_converts_via_from_with_no_path() {
+        let io_err = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let err: Error = io_err.into();
+        match &err {
+            Error::Io { path, source } => {
+                assert_eq!(*path, None);
+                assert_eq!(source.to_string(), "denied");
+            }
+            other => panic!("expected Error::Io, got {other:?}"),
+        }
+        assert_eq!(err.to_string(), "I/O error: denied");
+    }
+
+    #[test]
+    fn from_io_error_propagates_via_question_mark() {
+        fn fallible() -> Result<()> {
+            Err(io::Error::other("boom"))?;
+            Ok(())
+        }
+
+        let err = fallible().unwrap_err();
+        assert!(matches!(err, Error::Io { path: None, .. }));
     }
 
     #[test]
