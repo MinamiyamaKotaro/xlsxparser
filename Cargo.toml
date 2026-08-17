@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2021"
 description = "A lightweight, high-performance .xlsx (OOXML) parser library"
 repository = "https://github.com/MinamiyamaKotaro/xlsxparser"
-# license is TBD (see README.md "License"); set once decided.
+license = "MIT"
 publish = false
 
 [dependencies]

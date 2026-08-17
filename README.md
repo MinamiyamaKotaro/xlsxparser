@@ -116,4 +116,4 @@ rationale and the strict-OPC-conformance tradeoff this makes).
 
 ## License
 
-TBD.
+MIT — see [LICENSE](LICENSE).
