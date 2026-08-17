@@ -55,6 +55,24 @@ pub struct Sheet {
 }
 
 impl Sheet {
+    /// 新規シートを構築する。`cells` / `merge_aliases` / `merged_regions` は
+    /// 空、`max_row` / `max_col` は0から開始する。`pipeline.rs` が
+    /// [`parse/workbook.rs`](../parse/workbook.md) の結果（`name`/`visibility`）
+    /// から構築し、[`parse/worksheet.rs`](../parse/worksheet.md) へ渡して
+    /// ストリームでセルを挿入させる（pipeline.md 参照。設計時に発見した
+    /// 欠落のため追加）。
+    pub(crate) fn new(name: String, visibility: SheetVisibility) -> Self {
+        Self {
+            name,
+            visibility,
+            cells: HashMap::new(),
+            merge_aliases: HashMap::new(),
+            merged_regions: HashMap::new(),
+            max_row: 0,
+            max_col: 0,
+        }
+    }
+
     /// 結合セルのエイリアスを解決したうえでセルを取得する。
     /// 起点・仮想いずれの座標を渡しても同じ `Cell` を返す。
     pub fn get(&self, r: CellRef) -> Option<&Cell> {
@@ -119,7 +137,7 @@ impl Sheet {
 ## 依存関係
 
 - 依存先: [`model/cell.rs`](cell.md)（`Cell`, `CellRef`）
-- 依存元: `model::Workbook`（複数シートを保持）、`resolve/merge.rs`（`insert_merge` を呼び出して結合セルを登録する）、`resolve/shared_strings.rs` / `resolve/style.rs`（`get_mut` を通じてセルの値・スタイルを解決済みデータへ書き換える）、`json.rs`（`iter_cells` と `merged_region_at` からJSONを組み立てる）、`parse/worksheet.rs`（`insert_cell` でパース結果を挿入する）
+- 依存元: `model::Workbook`（複数シートを保持）、[`pipeline.rs`](../pipeline.md)（`Sheet::new` でシートを構築する）、`resolve/merge.rs`（`insert_merge` を呼び出して結合セルを登録する）、`resolve/shared_strings.rs` / `resolve/style.rs`（`get_mut` を通じてセルの値・スタイルを解決済みデータへ書き換える）、[`json.rs`](../json.md)（`iter_cells` と `merged_region_at` からJSONを組み立てる）、`parse/worksheet.rs`（`insert_cell` でパース結果を挿入する）
 
 `cells` / `merge_aliases` / `merged_regions` フィールド自体は `pub(crate)` にも公開せず完全に非公開のままとし、これらの内部データ構造への書き込みは `insert_cell` / `insert_merge` / `get_mut` の3メソッドのみに限定する。フィールドを直接 `pub(crate)` にする案（初回レビューでの提案）も検討したが、その場合 `max_row`/`max_col` の更新漏れや結合起点セルの補完漏れを各呼び出し元（`resolve/` 配下の複数モジュール）が個別に守る必要があり、不変条件がクレート全体に分散してしまう。メソッド経由に限定することで不変条件を `Sheet` 自身に閉じ込め、呼び出し側は正しさを気にせず利用できる。
 

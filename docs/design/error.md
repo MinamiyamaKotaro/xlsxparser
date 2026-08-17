@@ -87,6 +87,19 @@ pub enum Error {
         reason: String,
     },
 
+    // --- フェーズ5: JSON生成 ---
+    /// JSONへのシリアライズに失敗した（`serde_json` が返すエラーを包む）。
+    /// `source` は `XmlParse::source` と同じ理由で `Box<dyn Error>` として
+    /// 型消去する（[json.md](json.md) の設計に伴い新設。PR #10 レビューを
+    /// 反映）。実際には `json.rs` が非有限浮動小数点数を事前にフォール
+    /// バックさせてから `serde_json` へ渡すため、値の内容に起因する失敗は
+    /// 想定していない。主に `Write` 実装側のI/Oエラーの伝播経路として使う。
+    #[error("JSON serialization error: {source}")]
+    JsonSerialize {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
     // --- 全フェーズ共通 ---
     /// ファイルI/O由来のエラー（対象ファイルが開けない、読み込めないなど）。
     /// `path` はファイルパスを経由しない入力（例: `Cursor<Vec<u8>>` などの
@@ -105,12 +118,12 @@ pub enum Error {
 
 `InvalidPackage` は、ZIP展開そのものの失敗（破損アーカイブ等）を含む暫定的な受け皿としている。`container/` の設計（使用するZIP操作クレートの選定）が確定した際に、当該クレートのエラー型を `#[source]` として保持する専用バリアントへ分離するかを見直す（オープンクエスチョン1参照）。
 
-`XmlParse::source` を具体的なパーサーの型（例: `quick_xml::Error`）ではなく `Box<dyn std::error::Error + Send + Sync + 'static>` として保持しているのは、`Error` が `#[non_exhaustive]` であっても各バリアントの名前付きフィールドの型自体は外部から参照可能であり、フィールドに具体的な外部クレート型を置くとそのクレートが事実上パブリック依存になるためである。パブリック依存になると、当該クレートのメジャーバージョンアップが本ライブラリ側の破壊的変更を誘発し、利用者側も `Error::XmlParse { source, .. }` を扱うために当該クレートを直接依存に追加せざるを得なくなる。型消去することで、将来 `parse/` が採用するXMLパーサーを変更・更新してもパブリックAPIに影響しない（PR #6 レビュー指摘を反映）。同様の理由から `Io::source`（`std::io::Error`）は標準ライブラリの型でありパブリック依存の問題が生じないため、型消去せずそのまま保持する。
+`XmlParse::source` を具体的なパーサーの型（例: `quick_xml::Error`）ではなく `Box<dyn std::error::Error + Send + Sync + 'static>` として保持しているのは、`Error` が `#[non_exhaustive]` であっても各バリアントの名前付きフィールドの型自体は外部から参照可能であり、フィールドに具体的な外部クレート型を置くとそのクレートが事実上パブリック依存になるためである。パブリック依存になると、当該クレートのメジャーバージョンアップが本ライブラリ側の破壊的変更を誘発し、利用者側も `Error::XmlParse { source, .. }` を扱うために当該クレートを直接依存に追加せざるを得なくなる。型消去することで、将来 `parse/` が採用するXMLパーサーを変更・更新してもパブリックAPIに影響しない（PR #6 レビュー指摘を反映）。同様の理由から `Io::source`（`std::io::Error`）は標準ライブラリの型でありパブリック依存の問題が生じないため、型消去せずそのまま保持する。`JsonSerialize::source` も同じ理由で `serde_json::Error` を直接保持せず型消去する（[json.md](json.md) の設計時に追加。PR #10 レビューを踏まえた設計変更に伴う）。
 
 ## 依存関係
 
 - 依存先: なし（`model/` を含むクレート内の他モジュールに依存しない、最も基底のリーフモジュール。`error.rs` が他モジュールを参照すると循環依存になるため）。外部クレートとしては `thiserror`（エラー型定義の定型コード削減）にのみ依存する。`quick-xml` には依存しない。`XmlParse::source` はXMLパーサーの具体的なエラー型を直接保持せず `Box<dyn std::error::Error + Send + Sync + 'static>` として型消去するため、`quick-xml`（や将来 `parse/` が採用しうる他のXMLパーサー）はパブリック依存にならない（詳細は主要な型セクションの解説を参照。PR #6 レビュー指摘を反映）。
-- 依存元: クレート内のほぼ全モジュール（`container/`, `parse/`, `model/`, `resolve/`, `pipeline.rs`, `lib.rs`）。`json.rs` は解決済みデータのシリアライズのみのため、通常は本型を新規に生成しない想定。
+- 依存元: クレート内のほぼ全モジュール（`container/`, `parse/`, `model/`, `resolve/`, `pipeline.rs`, `lib.rs`）。[`json.rs`](json.md) は `Error::JsonSerialize`（`serde_json`/I/O由来の失敗のみを表現。PR #10 レビューを踏まえて追加）を除き本型を新規に生成しない。
 
 `thiserror` はコンパイル時のみのproc-macro依存であり、ランタイムの実行バイナリサイズや速度への影響がないため、要求仕様書1章が掲げる「軽量かつ高速」という方針と矛盾しない。
 
@@ -124,7 +137,7 @@ pub enum Error {
 ## テスト方針
 
 - 各バリアントの `Display`（`#[error(...)]` メッセージ）が意図した文字列を生成することの確認
-- `std::error::Error::source()` が `XmlParse` / `Io` について正しく根本原因を返すことの確認
+- `std::error::Error::source()` が `XmlParse` / `Io` / `JsonSerialize` について正しく根本原因を返すことの確認
 - `#[non_exhaustive]` により、クレート利用者側の `match` で `_ =>` アームなしにコンパイルできない（＝将来のバリアント追加が破壊的変更にならない）ことをドキュメント上明記し、コンパイル可否のテストは行わない（`#[non_exhaustive]` 自体はコンパイラが保証する言語機能のため）
 - 本ファイル単体のロジックテストは型定義のみのため最小限とし、実際のバリアント生成・伝播の検証は各生成元モジュール（`model/cell.rs` の `from_a1` 等）のテストで行う
 

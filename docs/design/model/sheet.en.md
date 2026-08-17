@@ -55,6 +55,24 @@ pub struct Sheet {
 }
 
 impl Sheet {
+    /// Constructs a new, empty sheet. `cells` / `merge_aliases` /
+    /// `merged_regions` start empty; `max_row` / `max_col` start at 0.
+    /// `pipeline.rs` builds one from [`parse/workbook.rs`](../parse/workbook.en.md)'s
+    /// result (`name`/`visibility`) and passes it to
+    /// [`parse/worksheet.rs`](../parse/worksheet.en.md) to stream cells into
+    /// (see pipeline.md; added after discovering the gap while designing it).
+    pub(crate) fn new(name: String, visibility: SheetVisibility) -> Self {
+        Self {
+            name,
+            visibility,
+            cells: HashMap::new(),
+            merge_aliases: HashMap::new(),
+            merged_regions: HashMap::new(),
+            max_row: 0,
+            max_col: 0,
+        }
+    }
+
     /// Retrieves a cell, resolving the merged-cell alias if needed.
     /// Returns the same `Cell` whether passed the origin or a virtual coordinate.
     pub fn get(&self, r: CellRef) -> Option<&Cell> {
@@ -122,7 +140,7 @@ impl Sheet {
 ## Dependencies
 
 - Depends on: [`model/cell.rs`](cell.en.md) (`Cell`, `CellRef`)
-- Depended on by: `model::Workbook` (holds multiple sheets), `resolve/merge.rs` (calls `insert_merge` to register merged cells), `resolve/shared_strings.rs` / `resolve/style.rs` (rewrite a cell's value/style with resolved data via `get_mut`), `json.rs` (assembles JSON from `iter_cells` and `merged_region_at`), `parse/worksheet.rs` (inserts parsed data via `insert_cell`)
+- Depended on by: `model::Workbook` (holds multiple sheets), [`pipeline.rs`](../pipeline.en.md) (constructs sheets via `Sheet::new`), `resolve/merge.rs` (calls `insert_merge` to register merged cells), `resolve/shared_strings.rs` / `resolve/style.rs` (rewrite a cell's value/style with resolved data via `get_mut`), [`json.rs`](../json.en.md) (assembles JSON from `iter_cells` and `merged_region_at`), `parse/worksheet.rs` (inserts parsed data via `insert_cell`)
 
 The `cells` / `merge_aliases` / `merged_regions` fields themselves stay fully private — not even `pub(crate)` — and writes to these internal data structures are restricted to the three methods `insert_cell` / `insert_merge` / `get_mut`. The alternative of making the fields directly `pub(crate)` (as originally suggested in review) was also considered, but that would require every caller across multiple `resolve/` modules to individually remember to keep `max_row`/`max_col` up to date and to backfill a merge's origin cell — scattering the invariant across the crate. Restricting writes to these methods keeps the invariant contained inside `Sheet` itself, so callers don't need to worry about correctness.
 
