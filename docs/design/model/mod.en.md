@@ -18,11 +18,11 @@ mod sheet;
 mod workbook;
 
 pub use cell::{Cell, CellRef, CellValue};
-pub use sheet::{MergedRegion, Sheet};
+pub use sheet::{MergedRegion, Sheet, SheetVisibility};
 pub use workbook::Workbook;
 ```
 
-Where `ResolvedStyle` (see open question 1 in [model/cell.md](cell.en.md)) ends up being defined is not yet decided; if it is placed under `model/`, it would also be added to the re-exports here.
+Where `ResolvedStyle` and `DateTimeValue` (see open questions 3 and 4 in [model/cell.md](cell.en.md)) end up being defined is not yet decided; if placed under `model/`, they would also be added to the re-exports here.
 
 ## Dependencies
 
@@ -39,5 +39,5 @@ None. Since this file only contains type definitions and re-exports, it has no u
 
 ## Open Questions
 
-1. **Where `ResolvedStyle` is defined**: As noted in open question 1 of [model/cell.md](cell.en.md), it is undecided whether the type for `Cell.style` lives under `model/` or under `resolve/style.rs`, and the re-export list here changes accordingly.
+1. **Where `ResolvedStyle` / `DateTimeValue` are defined**: As noted in open questions 3 and 4 of [model/cell.md](cell.en.md), it is undecided whether these types live under `model/` or under `resolve/style.rs`, and the re-export list here changes accordingly.
 2. **Visibility scope**: Whether fields of `MergedRegion` or `CellRef` (`row` / `col`) should be made `pub` and exposed externally, or restricted to constructor-only access, is to be decided together with the public API design of `lib.rs` (a separate issue).

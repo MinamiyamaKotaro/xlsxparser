@@ -18,11 +18,11 @@ mod sheet;
 mod workbook;
 
 pub use cell::{Cell, CellRef, CellValue};
-pub use sheet::{MergedRegion, Sheet};
+pub use sheet::{MergedRegion, Sheet, SheetVisibility};
 pub use workbook::Workbook;
 ```
 
-`ResolvedStyle`（[model/cell.md](cell.md) の未決事項1を参照）をどのファイルに定義するかは未確定だが、`model/` 配下に置く場合は本ファイルでの再エクスポート対象に加わる。
+`ResolvedStyle` と `DateTimeValue`（[model/cell.md](cell.md) の未決事項3・4を参照）をどのファイルに定義するかは未確定だが、`model/` 配下に置く場合は本ファイルでの再エクスポート対象に加わる。
 
 ## 依存関係
 
@@ -39,5 +39,5 @@ pub use workbook::Workbook;
 
 ## 未決事項 / オープンクエスチョン
 
-1. **`ResolvedStyle` の定義場所**: [model/cell.md](cell.md) の未決事項1で触れた通り、`Cell.style` の型を `model/` 側に置くか `resolve/style.rs` 側に置くかが未決定であり、それに伴い本ファイルでの再エクスポート対象も変わる。
+1. **`ResolvedStyle` / `DateTimeValue` の定義場所**: [model/cell.md](cell.md) の未決事項3・4で触れた通り、これらの型を `model/` 側に置くか `resolve/style.rs` 側に置くかが未決定であり、それに伴い本ファイルでの再エクスポート対象も変わる。
 2. **公開範囲**: `MergedRegion` や `CellRef` のフィールド（`row` / `col`）まで `pub` として外部に公開するか、コンストラクタ経由のみのアクセスに制限するかは、`lib.rs` の公開API設計（別Issue）と合わせて確定させる。

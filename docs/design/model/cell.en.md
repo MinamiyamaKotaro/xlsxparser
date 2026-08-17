@@ -13,6 +13,8 @@ Design doc for `src/model/cell.rs`. Per the [architecture.md](../architecture.en
 ## Key Types (draft)
 
 ```rust
+use std::sync::Arc;
+
 /// Cell coordinates. 1-based, matching Excel (A1 = row:1, col:1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CellRef {
@@ -31,10 +33,15 @@ impl CellRef {
 /// A cell's value. Has a variant corresponding to each OOXML `t` attribute (cell type).
 #[derive(Debug, Clone, PartialEq)]
 pub enum CellValue {
-    /// The default when the t attribute is omitted. Numbers and dates are included here as serial values.
+    /// The default when the t attribute is omitted. Non-date serial values live here.
     Number(f64),
-    /// A resolved string (shared string t="s" / inline str / str are all unified into this form once resolved)
-    Text(String),
+    /// Converted from `Number` when `resolve/style.rs` determines, from the numFmt, that
+    /// the value is a date/time. The concrete type is undecided (see Open Question 4).
+    DateTime(DateTimeValue),
+    /// A resolved string (shared string t="s" / inline str / str are all unified into this
+    /// form once resolved). Uses `Arc<str>` to avoid duplicate allocations across cells that
+    /// share the same string.
+    Text(Arc<str>),
     Boolean(bool),
     /// t="e". Holds the error code string (e.g. "#DIV/0!") as-is.
     Error(String),
@@ -44,32 +51,40 @@ pub enum CellValue {
 /// `Sheet` (blank cells are not instantiated, per requirements spec 3.1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cell {
-    pub value: CellValue,
-    pub style: ResolvedStyle,
+    /// `Option` so that a cell with formatting only (no value) can be represented.
+    pub value: Option<CellValue>,
+    /// `None` represents the default (unset) style. `Arc` avoids duplicating identical
+    /// styles across cells and decouples cell lifetime from the `StyleSheet` container's
+    /// lifetime (see Dependencies).
+    pub style: Option<Arc<ResolvedStyle>>,
 }
 ```
 
-`ResolvedStyle` is a placeholder assuming another type within `model/` (planned to be defined either in `model/mod.rs` or on the `resolve/style.rs` side); this file only assumes the type exists, without defining it.
+`ResolvedStyle` is a placeholder assuming another type within `model/` (planned to be defined either in `model/mod.rs` or on the `resolve/style.rs` side); this file only assumes the type exists, without defining it. `DateTimeValue` is likewise a placeholder whose concrete type is undecided.
 
 ## Dependencies
 
 - Depends on: none (a leaf module with no dependency on any sibling module within `model/`)
 - Depended on by: `model::Sheet` (uses `CellRef`, or an equivalent tuple, as the key of `HashMap<(u32, u32), Cell>`), `resolve/`, `json.rs`
 
+`resolve/style.rs` clones the `Arc` for the relevant style out of `StyleSheet` (assumed to be `HashMap<StyleId, Arc<ResolvedStyle>>`) and assigns it to each cell. Because each cell holds (a share of) the actual data's ownership via `Arc`, the `StyleSheet` container itself can be dropped once Phase 4 completes — satisfying both `pipeline.rs`'s policy of immediate disposal and the memory-efficiency requirement of avoiding value copies. The same relationship holds between `resolve/shared_strings.rs` and `Arc<str>`.
+
 ## Error Handling Policy
 
-- `CellRef::from_a1` does not `panic` on invalid input (e.g. `"1A"`, empty string, column overflow) but returns a `Result`. Since all parser-originated input comes from an untrusted external file (XML), the common error type planned in `error.rs` is used.
+- `CellRef::from_a1` does not `panic` on invalid input (e.g. `"1A"`, empty string, column overflow) but returns a `Result`. Since all parser-originated input comes from an untrusted external file (XML), the common error type planned in `error.rs` is used. At implementation time, overflowing input such as `"A10000000000000"` must be reliably detected as an overflow during the `u32` parse and returned as `Err` (never `panic`).
 - `CellValue::Error` merely passes through the OOXML error code as-is; the parser does not interpret or branch on it internally (that is the caller's responsibility).
 
 ## Testing Strategy
 
 - Round-trip tests for `CellRef::from_a1` / `to_a1` (including boundary values such as `"A1"`, `"Z1"`, `"AA1"`, `"XFD1048576"` — Excel's maximum column/row)
-- Verifying that invalid A1 strings (lowercase, mixed symbols, column-only, row-only) return `Err`
+- Verifying that invalid A1 strings (lowercase, mixed symbols, column-only, row-only, overflowing row number) return `Err`
 - `PartialEq` comparison tests for each `CellValue` variant
+- Verifying that `value: None` (a cell with formatting only) is correctly held and compared
+- Verifying that `Arc::ptr_eq` holds true across multiple cells sharing the same style or string (i.e. the actual data is not duplicated)
 
 ## Open Questions
 
-1. **Representation of the `style` field**: As noted in the design memo for `pipeline.rs` ([architecture.md](../architecture.en.md#pipelinesrs)), it is undecided whether `Cell` holds resolved actual data (the `ResolvedStyle` value itself) or an index into the `StyleSheet` (e.g. `StyleId(u32)`). The former allows `StyleSheet` to be dropped after style resolution (more memory-efficient), but increases value copies when many cells share the same style. The latter avoids copies but requires extending `StyleSheet`'s lifetime until JSON generation completes.
-2. **The same point applies to shared strings**: Whether `CellValue::Text` holds a resolved `String` or an index into the `SharedStringTable` carries the same trade-off as point 1 above. This file assumes the former (resolved) for now, to be finalized together with the `resolve/shared_strings.rs` design doc.
+1. ~~Representation of the `style` field~~ → **Resolved**: adopt `Option<Arc<ResolvedStyle>>` (finalized following the [PR #5 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948235239)). `Arc` avoids duplicating the actual data while still allowing the `StyleSheet` container itself to be dropped once Phase 4 completes.
+2. ~~Representation of shared strings~~ → **Resolved**: adopt `CellValue::Text(Arc<str>)`, for the same reason as above.
 3. **Upper bound of rows/columns**: `u32` is sufficient for Excel's maximum column count (16,384 columns = XFD) and maximum row count (1,048,576 rows), but whether to treat `col` as a plain number or split it into a separate `ColumnRef` type in the future is undecided.
-4. **Handling of dates**: Since OOXML represents dates as a serial value (`Number`) plus a numFmt in `styles.xml`, this file's type includes dates under `Number`, with the responsibility of determining/converting date-ness assumed to belong to `resolve/style.rs`. Needs confirmation whether this division of responsibility is acceptable.
+4. **Concrete type of `DateTimeValue`**: It has now been decided that dates/times get their own variant (converted from `Number` by `resolve/style.rs` based on the numFmt), but whether to depend on an external crate such as `chrono::NaiveDateTime`, or use a lightweight custom type to avoid adding a dependency, is undecided. Handling of Excel's date epoch (including the 1900 leap-year bug) is also to be finalized at implementation time.

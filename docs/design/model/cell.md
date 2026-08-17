@@ -13,6 +13,8 @@
 ## 主要な型（案）
 
 ```rust
+use std::sync::Arc;
+
 /// セル座標。Excelに合わせて1-basedとする（A1 = row:1, col:1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CellRef {
@@ -31,10 +33,14 @@ impl CellRef {
 /// セルの値。OOXMLの `t` 属性（cell type）に対応するバリアントを持つ。
 #[derive(Debug, Clone, PartialEq)]
 pub enum CellValue {
-    /// t属性省略時のデフォルト。数値・日付はシリアル値としてここに含む。
+    /// t属性省略時のデフォルト。日付以外のシリアル値はここに含む。
     Number(f64),
-    /// 解決済みの文字列（共有文字列 t="s" / インラインstr / str のいずれも解決後はこの形に統一する）
-    Text(String),
+    /// numFmt が日付/時刻書式であると resolve/style.rs が判定した場合に
+    /// Number から変換される。具体的な型は未決定（オープンクエスチョン4参照）。
+    DateTime(DateTimeValue),
+    /// 解決済みの文字列（共有文字列 t="s" / インラインstr / str のいずれも解決後はこの形に統一する）。
+    /// `Arc<str>` により、同一文字列を指す複数セル間でのアロケーション重複を避ける。
+    Text(Arc<str>),
     Boolean(bool),
     /// t="e"。エラーコード文字列（例: "#DIV/0!"）をそのまま保持する。
     Error(String),
@@ -44,32 +50,39 @@ pub enum CellValue {
 /// （空白セルはインスタンス化しない、要求仕様書 3.1）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cell {
-    pub value: CellValue,
-    pub style: ResolvedStyle,
+    /// 値を持たない（=書式のみ設定された）セルを表現するため Option とする。
+    pub value: Option<CellValue>,
+    /// `None` はデフォルトスタイル（未指定）を表す。`Arc` により同一スタイルの
+    /// 重複コピーを避け、`StyleSheet` 本体の生存期間から切り離す（詳細は依存関係参照）。
+    pub style: Option<Arc<ResolvedStyle>>,
 }
 ```
 
-`ResolvedStyle` は `model/` 内の別型（`model/mod.rs` もしくは `resolve/style.rs` 側で定義予定）を想定するプレースホルダーで、本ファイルのスコープでは型の存在のみを仮定する。
+`ResolvedStyle` は `model/` 内の別型（`model/mod.rs` もしくは `resolve/style.rs` 側で定義予定）を想定するプレースホルダーで、本ファイルのスコープでは型の存在のみを仮定する。`DateTimeValue` も同様に、具体的な型が未確定なプレースホルダーである。
 
 ## 依存関係
 
 - 依存先: なし（`model/` 内の兄弟モジュールにも依存しない、リーフモジュール）
 - 依存元: `model::Sheet`（`HashMap<(u32, u32), Cell>` のキーに `CellRef`相当のタプル、または `CellRef` 自体を使う）、`resolve/`、`json.rs`
 
+`resolve/style.rs` は `StyleSheet`（`HashMap<StyleId, Arc<ResolvedStyle>>` を想定）から該当スタイルの `Arc` を各セルへ `clone()` して割り当てる。各セルが `Arc` を通じて実データの所有権（の一部）を持つため、`StyleSheet` コンテナ自体はフェーズ4完了時に破棄でき、`pipeline.rs` が定める即時破棄の方針と、値のコピーを避けたいというメモリ効率要件を両立できる。`resolve/shared_strings.rs` と `Arc<str>` の関係も同様。
+
 ## エラー処理方針
 
-- `CellRef::from_a1` は不正な入力（例: `"1A"`, 空文字列, 列オーバーフロー）に対し `panic` せず `Result` を返す。パース起点の入力はすべて外部ファイル（信頼できないXML）由来のため、`error.rs` に定義予定の共通エラー型を用いる。
+- `CellRef::from_a1` は不正な入力（例: `"1A"`, 空文字列, 列オーバーフロー）に対し `panic` せず `Result` を返す。パース起点の入力はすべて外部ファイル（信頼できないXML）由来のため、`error.rs` に定義予定の共通エラー型を用いる。実装時は `"A10000000000000"` のような桁溢れ入力についても `u32` へのパースで確実にオーバーフローを検知し `Err` を返すこと（`panic` させない）。
 - `CellValue::Error` はOOXML上のエラーコードをそのまま透過するのみで、パーサー内部では解釈・分岐しない（呼び出し側の責務）。
 
 ## テスト方針
 
 - `CellRef::from_a1` / `to_a1` のラウンドトリップテスト（`"A1"`, `"Z1"`, `"AA1"`, `"XFD1048576"`（Excel最大列/行）など境界値を含む）
-- 不正なA1文字列（小文字, 記号混入, 列名のみ, 行番号のみ）に対する `Err` 返却の確認
+- 不正なA1文字列（小文字, 記号混入, 列名のみ, 行番号のみ, 桁溢れする行番号）に対する `Err` 返却の確認
 - `CellValue` の各バリアントの `PartialEq` 比較テスト
+- `value: None`（書式のみ設定されたセル）が正しく保持・比較できることの確認
+- 同一スタイル／同一文字列を持つ複数セル間で `Arc::ptr_eq` が真になる（実データが重複コピーされていない）ことの確認
 
 ## 未決事項 / オープンクエスチョン
 
-1. **`style` フィールドの表現**: `pipeline.rs` の設計メモ（[architecture.md](../architecture.md#pipelinesrs)）にある通り、`Cell` が解決済みの実データ（`ResolvedStyle` の値そのもの）を持つか、`StyleSheet` 側のインデックス（`StyleId(u32)` 等）を持つかは未決定。前者はスタイル解決後に `StyleSheet` を破棄できる（メモリ効率が良い）が、同一スタイルを持つセルが多い場合に値のコピーが増える。後者は逆にコピーは避けられるが、JSON生成完了まで `StyleSheet` の生存期間を延ばす必要がある。
-2. **共有文字列も同様の論点**: `CellValue::Text` を解決済み `String` として持つか、`SharedStringTable` へのインデックスを持つかも上記1と同じトレードオフを持つ。本ファイルでは前者（解決済み）を仮定して記述したが、`resolve/shared_strings.rs` の設計書と合わせて確定させる。
+1. ~~`style` フィールドの表現~~ → **解決**: `Option<Arc<ResolvedStyle>>` を採用する（[PR #5 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948235239)を踏まえて確定）。`Arc` により実データの重複コピーを避けつつ、`StyleSheet` コンテナ自体はフェーズ4完了後に破棄できる。
+2. ~~共有文字列の表現~~ → **解決**: `CellValue::Text(Arc<str>)` を採用する。理由は上記1と同様。
 3. **行・列の桁上限**: Excelの最大列数（16,384列 = XFD）・最大行数（1,048,576行）に対し `u32` で十分だが、`col` を数値として扱うか将来的に列名を別型（`ColumnRef`）として分離するかは未決定。
-4. **日付の扱い**: OOXMLは日付をシリアル値（`Number`）+ `styles.xml` の numFmt で表現するため、本ファイルの型としては `Number` に含め、日付か否かの判定・変換は `resolve/style.rs` 側の責務とする想定。この分担で問題ないか要確認。
+4. **`DateTimeValue` の具体的な型**: 日付・時刻を独立したバリアントとして持つこと自体は決定した（`resolve/style.rs` が numFmt を見て `Number` から変換する）が、`chrono::NaiveDateTime` 等の外部クレートに依存するか、依存を増やさない軽量な自前型にするかは未決定。Excelの日付エポック（1900年うるう年バグを含む）の扱いも実装時に確定させる。
