@@ -40,6 +40,96 @@ let json = xlsxparser::to_json_string(&workbook)?;
   detail settled differently than planned, a bug found while writing
   tests, etc.), the doc was updated in place to record what changed and why.
 
+## Input / Output
+
+**Input**: a `.xlsx` file, via one of two entry points —
+
+- `parse_workbook(path)` — the common case, reads from a filesystem path.
+- `parse_workbook_reader(reader)` — from anything `Read + Seek` (an
+  in-memory buffer, a fully-read HTTP response body, ...), for callers that
+  don't go through the filesystem.
+
+Both return `Result<Workbook, Error>`, a fully resolved in-memory
+representation of every sheet (visible, hidden, and veryHidden alike). Each
+has a `_with_limits` variant taking an explicit `SizeLimits` to override the
+default Zip Bomb caps (512 MiB per ZIP entry, 2 GiB cumulative).
+
+**Output**: `to_json_string(&workbook)` / `to_json_writer(&workbook,
+writer)` serialize the resolved `Workbook` into JSON shaped like this
+(real output, from `tests/fixtures/complex/houganshi_merged.xlsx` — a
+sheet with a single merged region, `A1:C3`, holding one text cell):
+
+```json
+{
+  "sheets": [
+    {
+      "name": "Sheet1",
+      "visibility": "visible",
+      "maxRow": 3,
+      "maxCol": 3,
+      "cells": [
+        {
+          "row": 1,
+          "col": 1,
+          "value": { "type": "text", "value": "houganshi" },
+          "rowSpan": 3,
+          "colSpan": 3
+        }
+      ]
+    }
+  ]
+}
+```
+
+- `visibility` is `"visible"`, `"hidden"`, or `"veryHidden"` (from `<sheet
+  state="...">`).
+- `maxRow`/`maxCol` are the sheet's bounding box (the highest populated or
+  merged coordinate) — not the OOXML `<dimension>` value, which isn't read
+  at all.
+- `cells` only contains populated coordinates: a blank cell in between is
+  simply absent, never emitted as a `null`/`"empty"` entry (see
+  [Motivation](#motivation)). Cell order is unspecified — the sheet is
+  backed by a `HashMap`, not sorted by row/col.
+- Each cell's `value` is tagged by `type`:
+  `"number"` | `"text"` | `"boolean"` | `"error"` | `"dateTime"` |
+  `"empty"` (a cell with formatting only, or a value JSON can't
+  represent — `NaN`/`±Infinity`, or — for now — any date/time value, since
+  `DateTimeValue` doesn't carry real calendar data yet; see
+  [docs/design/model/cell.en.md](docs/design/model/cell.en.md) Open
+  Question 4).
+- `rowSpan`/`colSpan` are present (and `> 1`) only on a merged region's
+  anchor cell; every other coordinate inside the region resolves to that
+  same anchor and is not emitted as a separate JSON cell.
+
+A second real example — every `CellValue` variant in one row
+(`tests/fixtures/normal/basic_types.xlsx`; cells re-ordered by column here
+for readability, since actual order is unspecified):
+
+```json
+{
+  "sheets": [
+    {
+      "name": "Sheet1",
+      "visibility": "visible",
+      "maxRow": 1,
+      "maxCol": 7,
+      "cells": [
+        { "row": 1, "col": 1, "value": { "type": "text", "value": "日本語Text" } },
+        { "row": 1, "col": 2, "value": { "type": "number", "value": 42.0 } },
+        { "row": 1, "col": 3, "value": { "type": "number", "value": 19.99 } },
+        { "row": 1, "col": 4, "value": { "type": "empty" } },
+        { "row": 1, "col": 5, "value": { "type": "boolean", "value": true } },
+        { "row": 1, "col": 6, "value": { "type": "boolean", "value": false } },
+        { "row": 1, "col": 7, "value": { "type": "error", "value": "#N/A" } }
+      ]
+    }
+  ]
+}
+```
+
+(Column 4 is a date cell — it currently serializes as `"empty"` rather than
+`"dateTime"`, per the placeholder-`DateTimeValue` note above.)
+
 ## Architecture
 
 1. **Relationship resolution** — parse `_rels` parts to build a routing map
@@ -99,6 +189,43 @@ are accessed directly instead of being resolved through its Content-Type
 declarations (see
 [pipeline.en.md Open Question 3](docs/design/pipeline.en.md) for the
 rationale and the strict-OPC-conformance tradeoff this makes).
+
+## Benchmarks
+
+The benchmarking was done using [`hyperfine`](https://github.com/sharkdp/hyperfine)
+with `--warmup 3` on an `Apple M2 Pro` running `macOS 26.6.1`, comparing
+`xlsxparser` (via `parse_workbook`) against
+[`calamine`](https://github.com/tafia/calamine) `0.26.1` (via
+`worksheet_range`) — a widely-used pure-Rust `.xlsx` reader — both built in
+release mode, on `tests/fixtures/complex/extreme_sparse.xlsx`: a real,
+openpyxl-authored file where only two cells are populated, `A1` and
+`XFD1048576` (Excel's actual maximum: row 1,048,576, column 16,384) — the
+sparse "grid-paper Excel" shape this library is purpose-built for (see
+[Motivation](#motivation)).
+
+```bash
+xlsxparser
+  Time (mean ± σ):       3.0 ms ±   1.0 ms    [User: 1.3 ms, System: 1.1 ms]
+  Range (min … max):     2.1 ms …  18.3 ms    410 runs
+```
+
+`calamine` isn't shown as a completed hyperfine run because it never
+completed one: across repeated runs it was killed by the OS for excessive
+memory use after roughly 23-24 seconds, having grown to multiple GB of
+resident memory. The cause is structural, not a fluke: `calamine`'s
+`Range<T>` (the type `worksheet_range` returns) always backs onto a single
+dense `Vec<T>` sized to the *bounding box* of the populated cells —
+`Range::from_sparse` (`calamine` `0.26.1`, `src/lib.rs`) computes
+`cols * rows` from that bounding box and allocates `vec![T::default();
+cols * rows]` regardless of how few cells are actually non-empty. Here the
+two populated corners span the full sheet, so that bounding box *is*
+1,048,576 x 16,384 = 17,179,869,184 elements, and the allocation attempt
+is what gets the process killed.
+
+`xlsxparser` doesn't hit this because cells are kept in a coordinate-keyed
+`HashMap<CellRef, Cell>` (see [Architecture](#architecture) above) sized to
+the number of populated cells, never to the sheet's addressable bounding
+box — so `extreme_sparse.xlsx` costs `xlsxparser` exactly 2 map entries.
 
 ## Security notes
 
