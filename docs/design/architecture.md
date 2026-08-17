@@ -71,7 +71,7 @@ ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブ�
 
 `Cell` / `Sheet` / `Workbook` などの純粋なRustデータ構造を定義する。XMLパースや解決ロジックへの依存を持たない。疎行列（`HashMap<(row, col), Cell>`）によりメモリを最適化する。
 
-- `cell.rs` の詳細設計: [model/cell.md](model/cell.md)（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書。他ファイルは未作成）
+- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [mod.md](model/mod.md) / [cell.md](model/cell.md) / [sheet.md](model/sheet.md) / [workbook.md](model/workbook.md)
 
 ### `resolve/`
 
