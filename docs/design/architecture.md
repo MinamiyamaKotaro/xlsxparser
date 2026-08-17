@@ -1,5 +1,7 @@
 # src/ アーキテクチャ設計
 
+*[English](architecture.en.md)*
+
 Issue [#1](https://github.com/MinamiyamaKotaro/xlsxparser/issues/1) での議論を経て確定した `src/` ディレクトリ構成と、各モジュールの責務をまとめたドキュメント。要求仕様書（[requirements.md](../requirement/requirements.md)）が定義する5フェーズ・パイプラインに対応させている。
 
 ## 設計方針
@@ -70,6 +72,8 @@ ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブ�
 ### `model/`
 
 `Cell` / `Sheet` / `Workbook` などの純粋なRustデータ構造を定義する。XMLパースや解決ロジックへの依存を持たない。疎行列（`HashMap<(row, col), Cell>`）によりメモリを最適化する。
+
+- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [mod.md](model/mod.md) / [cell.md](model/cell.md) / [sheet.md](model/sheet.md) / [workbook.md](model/workbook.md)
 
 ### `resolve/`
 
