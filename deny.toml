@@ -7,6 +7,12 @@
 ignore = []
 
 [licenses]
+# The crate's own license is undecided yet (README.md "License: TBD") and it
+# is unpublished (Cargo.toml `publish = false`), so don't fail the license
+# check on the workspace crate itself — this section only governs
+# third-party dependency licenses.
+private = { ignore = true }
+
 allow = [
   "MIT",
   "Apache-2.0",

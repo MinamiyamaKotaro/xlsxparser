@@ -75,10 +75,9 @@ jobs:
         with:
           command: check
 
-  dependency-review:
-    name: Dependency review
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/dependency-review-action@v4
+  # dependency-review (actions/dependency-review-action) was tried in PR #17
+  # but failed with "Dependency review is not supported on this repository.
+  # Please ensure that Dependency graph is enabled" — a repo Settings >
+  # Security setting outside this workflow's control, and with zero
+  # dependencies today it adds no value yet. Re-add once dependencies exist
+  # and the setting is confirmed enabled.
