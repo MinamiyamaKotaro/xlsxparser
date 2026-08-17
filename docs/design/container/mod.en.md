@@ -14,7 +14,9 @@ Design doc for `src/container/mod.rs`. Implements the responsibility `architectu
 ## Key Types (draft)
 
 ```rust
-use crate::container::sanitize::{self, BoundedReader, DEFAULT_MAX_UNCOMPRESSED_SIZE};
+use crate::container::sanitize::{
+    self, BoundedReader, DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE, DEFAULT_MAX_UNCOMPRESSED_SIZE,
+};
 use crate::error::Error;
 use std::io::{Read, Seek};
 use std::path::Path;
@@ -29,6 +31,14 @@ use std::path::Path;
 pub struct ZipContainer<R> {
     archive: R, // placeholder standing in for whatever archive type the chosen ZIP crate provides
     max_entry_size: u64,
+    /// Cap on the cumulative uncompressed size across the whole archive
+    /// (Zip Bomb protection; see [sanitize.md](sanitize.en.md). Reflects
+    /// feedback from the PR #7 review).
+    max_total_size: u64,
+    /// Running total of bytes decompressed so far via `get_entry`.
+    /// `get_entry` lends this out to `BoundedReader` as `&mut` (see
+    /// Dependencies).
+    total_read: u64,
 }
 
 impl ZipContainer<std::fs::File> {
@@ -69,11 +79,18 @@ impl<R: Read + Seek> ZipContainer<R> {
     ///   (`Error::InvalidPackage`) or a relationship target is dangling
     ///   (`Error::DanglingRelationship`), so this method does not construct
     ///   an error itself.
-    /// - The returned stream is wrapped in `BoundedReader`, so the Zip Bomb
-    ///   cap (`max_entry_size`) is already applied.
-    pub fn get_entry(&mut self, name: &str) -> Result<Option<BoundedReader<impl Read + '_>>, Error> {
+    /// - The returned stream is wrapped in `BoundedReader`, so both the
+    ///   per-entry cap (`max_entry_size`) and the archive-wide cumulative
+    ///   cap (`max_total_size`) are already applied.
+    pub fn get_entry(&mut self, name: &str) -> Result<Option<BoundedReader<'_, impl Read + '_>>, Error> {
         sanitize::validate_entry_path(name)?;
-        let _ = name;
+        // The entry's read stream (from the `archive` field) and a mutable
+        // reference to `total_read` (passed as `BoundedReader::new`'s
+        // `cumulative_read` argument) can coexist by taking disjoint field
+        // borrows of the same `self`. No interior mutability such as `Cell`
+        // is needed (see sanitize.md).
+        let Self { archive, total_read, max_entry_size, max_total_size, .. } = self;
+        let _ = (archive, name, *max_entry_size, total_read, *max_total_size);
         unimplemented!()
     }
 
@@ -84,12 +101,23 @@ impl<R: Read + Seek> ZipContainer<R> {
 }
 
 impl<R> ZipContainer<R> {
-    /// Opens with an explicitly set uncompressed-size cap for Zip Bomb
-    /// protection. When unset, `DEFAULT_MAX_UNCOMPRESSED_SIZE`
+    /// Opens with an explicitly set per-entry uncompressed-size cap for Zip
+    /// Bomb protection. When unset, `DEFAULT_MAX_UNCOMPRESSED_SIZE`
     /// ([sanitize.md](sanitize.en.md)) is assumed to apply (the concrete
     /// builder-API shape is undecided; see Open Question 3).
     fn with_max_entry_size(mut self, limit: u64) -> Self {
         self.max_entry_size = limit;
+        self
+    }
+
+    /// Opens with an explicitly set archive-wide cumulative uncompressed-size
+    /// cap for Zip Bomb protection. When unset,
+    /// `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE` ([sanitize.md](sanitize.en.md))
+    /// is assumed to apply (resolves Open Question 4 following the PR #7
+    /// review; the concrete builder-API shape is undecided the same way as
+    /// `with_max_entry_size`, see Open Question 3).
+    fn with_max_total_size(mut self, limit: u64) -> Self {
+        self.max_total_size = limit;
         self
     }
 }
@@ -97,7 +125,7 @@ impl<R> ZipContainer<R> {
 
 ## Dependencies
 
-- Depends on: [`container/sanitize.rs`](sanitize.en.md) (`validate_entry_path`, `BoundedReader`, `DEFAULT_MAX_UNCOMPRESSED_SIZE`) and [`error.rs`](../error.en.md). No dependency on `model/` or `parse/`.
+- Depends on: [`container/sanitize.rs`](sanitize.en.md) (`validate_entry_path`, `BoundedReader`, `DEFAULT_MAX_UNCOMPRESSED_SIZE`, `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE`) and [`error.rs`](../error.en.md). No dependency on `model/` or `parse/`.
 - Depended on by: `pipeline.rs` only. Per architecture.md design policy 3 ("`container` and `parse` go back and forth tightly, but this call ordering and resource lifecycle management is centralized in `pipeline.rs` so other modules don't need to know about each other directly"), no module under `parse/` knows about `container::ZipContainer` directly — `pipeline.rs` passes along the byte stream it obtained via `get_entry`.
 
 Why `get_entry` re-validates `name` on every call: the open-time application of `validate_entry_path` only covers entry names the archive itself actually holds (static strings from the central directory). But the `name` passed to `get_entry` may instead be a string that `parse/relationships.rs` (Phase 1), via `pipeline.rs`, computed dynamically by combining a relative-path notation from a `.rels` file (e.g. `../media/image1.png`) with an entry name. If that computation has any normalization gap (e.g. an unresolved `..`), a path that slipped past the open-time check could reach `get_entry`. It is therefore treated as an independent, untrusted input and validated again every time (defense in depth).
@@ -109,7 +137,8 @@ The design where `get_entry` requires `&mut self` and ties the returned value's 
 - `open` / `open_reader` return `Error::InvalidPackage` when the ZIP archive itself is corrupt. Whether the underlying ZIP crate's error is simply stringified, or held in a dedicated type-erased `Box<dyn Error>` field the way `error.md`'s `XmlParse` does, is to be revisited once the crate is chosen (Open Question 1, tied to [error.md Open Question 1](../error.en.md)).
 - `open_reader` rejects the entire archive with `Error::ZipSlipDetected` if any entry name in the central directory fails `validate_entry_path` — there is no partial-acceptance fallback that uses only the "safe" entries.
 - `get_entry` represents a missing entry as `Ok(None)` rather than via `Result`'s error path (the same design principle `model::Sheet::get` uses to represent a blank cell as `None`; see [model/sheet.md](../model/sheet.en.md)).
-- How an `io::Error` raised mid-read from the `BoundedReader` returned by `get_entry` gets converted into `Error::ZipBombDetected` is undecided, as noted in [sanitize.md Open Question 3](sanitize.en.md).
+- Constructing an error for a missing required part (`[Content_Types].xml`, `xl/workbook.xml`, etc.) is not this file's responsibility. `ZipContainer` stays a generic container layer that only handles "safe file retrieval," with no OPC-specific semantics about which parts are mandatory (resolves Open Question 5 following the PR #7 review). Whether an `Ok(None)` from `get_entry` should become `Error::InvalidPackage` or `Error::DanglingRelationship` is for `pipeline.rs` / `parse/relationships.rs` to decide.
+- The conversion from an `io::Error` raised mid-read from the `BoundedReader` returned by `get_entry` into `Error::ZipBombDetected` happens at the boundary where `parse/` converts `quick_xml::Error` into `crate::error::Error` (see [sanitize.md Error Handling Policy](sanitize.en.md); Open Question 3 is resolved).
 
 ## Testing Strategy
 
@@ -120,11 +149,12 @@ The design where `get_entry` requires `&mut self` and ties the returned value's 
 - Verify that calling `get_entry` with a name that does not exist returns `Ok(None)` (not an error)
 - Verify that calling `get_entry` with a malformed `name` such as `"../etc/passwd"` returns `Error::ZipSlipDetected` regardless of whether such an entry actually exists in the archive (a defense-in-depth test simulating a path that slipped past open-time validation)
 - Verify that reading beyond `max_entry_size` from the stream `get_entry` returns produces an error (a wiring test against `sanitize::BoundedReader`; `BoundedReader`'s own logic is verified in [sanitize.md](sanitize.en.md))
+- Verify that `total_read` correctly accumulates across multiple `get_entry` calls, and that exceeding `max_total_size` produces an error (a wiring test for the cumulative counter `ZipContainer` passes into `BoundedReader`)
 
 ## Open Questions
 
-1. **Which external crate to use for ZIP handling**: the same question as [error.md Open Question 1](../error.en.md). Since this file's types are designed around requiring `Read + Seek`, whichever crate is chosen must support that assumption (random access over a seekable input).
-2. **Return type design for `get_entry`**: currently `impl Read + '_` (RPIT, tied to `self`'s borrow), meaning a second `get_entry` call cannot be made while a previous entry's stream is still held (the borrows would conflict). This should be fine given the sequential access pattern (see Dependencies), but whether to relax the constraint with a trait object such as `Box<dyn Read + '_>` is undecided.
-3. **`max_entry_size` configuration interface**: whether to use a post-hoc builder method like `with_max_entry_size`, or an argument to `open` / `open_reader`, is to be finalized together with the configurability discussion from `lib.rs`'s public API noted in [sanitize.md Open Question 1](sanitize.en.md).
-4. **Tracking the archive's cumulative size**: if the "cumulative, not just per-entry" protection mentioned in [sanitize.md Open Question 2](sanitize.en.md) is implemented, whether it belongs here (`ZipContainer` is the natural place, since it already spans multiple entries' state) or as a cumulative-counter type added to `sanitize.rs` is undecided.
-5. **Where the responsibility for checking required parts lives**: whether detecting that a mandatory `.xlsx` part (e.g. `[Content_Types].xml`, `xl/workbook.xml`) is missing should happen here at `open` time (making "is this a valid .xlsx package" part of this file's responsibility), or whether `pipeline.rs` / `parse/relationships.rs` should infer it from `get_entry` returning `Ok(None)`, is undecided. The former fails fast, but would give this file structural knowledge of OPC internals (which parts are mandatory), which may drift from its current scope of "only handles safe ZIP retrieval."
+1. **Which external crate to use for ZIP handling**: still the same open question as [error.md Open Question 1](../error.en.md), but per the general guidance surfaced in the PR #7 review, the design proceeds with the `zip` crate as the leading candidate, given its track record in the Rust ecosystem and its `Read + Seek` support (which matches this file's own requirement). The concrete version pin, and any final comparison against alternatives, is to be settled when `Cargo.toml` is set up.
+2. ~~Return type design for `get_entry`~~ → **Resolved**: adopt `impl Read + '_` (RPIT, tied to `self`'s borrow). This library's processing pipeline is a fully sequential access pattern — "read rels → read SST → read worksheets one after another" — with no design need to hold multiple entries' streams open at once. `impl Read + '_` has no allocation cost and lets the compiler statically rule out opening multiple streams at the same time (a borrow conflict), which is preferable to `Box<dyn Read + '_>` (reflects feedback from the PR #7 review).
+3. **`max_entry_size` / `max_total_size` configuration interface**: whether to use post-hoc builder methods like `with_max_entry_size` / `with_max_total_size`, or arguments to `open` / `open_reader`, is to be finalized together with the configurability discussion from `lib.rs`'s public API noted in [sanitize.md Open Question 1](sanitize.en.md).
+4. ~~Tracking the archive's cumulative size~~ → **Resolved**: `ZipContainer` holds it as the `total_read` / `max_total_size` fields (the natural place, since `ZipContainer` already spans state across multiple entries). `get_entry` lends it to `BoundedReader` as `&mut u64`; no interior mutability such as `Cell` is used (reflects feedback from the PR #7 review; see [sanitize.md](sanitize.en.md) for details).
+5. ~~Where the responsibility for checking required parts lives~~ → **Resolved**: `ZipContainer` stays a generic container layer whose job is "safely carve files out of a ZIP archive," with no `.xlsx` (OPC)-specific semantics (which parts are mandatory) — single responsibility principle. The existence check is handled by `pipeline.rs` / `parse/relationships.rs` reacting to `get_entry` returning `Ok(None)` (reflects feedback from the PR #7 review).

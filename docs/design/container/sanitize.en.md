@@ -16,10 +16,17 @@ Design doc for `src/container/sanitize.rs`. Covers Phase 2 (sanitization) as def
 use crate::error::Error;
 use std::io::{self, Read};
 
-/// The default uncompressed-size cap for Phase 2 (in bytes). The concrete
-/// value and whether the caller (via `lib.rs`'s public API) can override it
-/// are undecided (see Open Question 1).
+/// The default uncompressed-size cap for Phase 2, per individual entry (in
+/// bytes). The concrete value and whether the caller (via `lib.rs`'s public
+/// API) can override it are undecided (see Open Question 1).
 pub const DEFAULT_MAX_UNCOMPRESSED_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB (provisional)
+
+/// The default cumulative uncompressed-size cap for Phase 2, across the
+/// whole archive (in bytes). Defends against the variant of Zip Bomb built
+/// from many moderately-sized entries whose cumulative total becomes
+/// enormous (see [container/mod.md](mod.en.md). Reflects feedback from the
+/// PR #7 review).
+pub const DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB (provisional)
 
 /// Validates that a ZIP entry name cannot escape the archive's logical root
 /// (Zip Slip protection). `container/mod.rs` calls this for every entry name
@@ -42,11 +49,12 @@ pub const DEFAULT_MAX_UNCOMPRESSED_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB (pr
 pub fn validate_entry_path(name: &str) -> Result<(), Error>;
 
 /// An internal marker type that `BoundedReader::read` embeds in an
-/// `io::Error` once the cap is exceeded. The layer that ultimately converts
-/// this into `Error::ZipBombDetected` (`container/mod.rs`, or wherever
-/// `parse/` observes the I/O error) is expected to downcast via
-/// `io::Error::into_inner()` to recover `limit` / `actual` (see Open
-/// Question 3).
+/// `io::Error` once a cap is exceeded. The layer that ultimately converts
+/// this into `Error::ZipBombDetected` (the boundary where `parse/` converts
+/// a quick-xml error into `crate::error::Error`; see Error Handling Policy)
+/// is expected to downcast via `io::Error::get_ref()` to recover `limit` /
+/// `actual` (Open Question 3 is resolved per the PR #7 review; see Error
+/// Handling Policy).
 #[derive(Debug)]
 pub(crate) struct LimitExceeded {
     pub limit: u64,
@@ -63,29 +71,54 @@ impl std::error::Error for LimitExceeded {}
 /// A `Read` wrapper that enforces an uncompressed-size cap (Zip Bomb
 /// protection). The ZIP header's self-declared uncompressed size can be
 /// forged, so it is never trusted; instead, the number of bytes actually
-/// read is counted while streaming, and an error is returned the moment the
+/// read is counted while streaming, and an error is returned the moment a
 /// cap is exceeded. `container/mod.rs` wraps each entry's decompression
 /// stream with this before handing it to `parse/`.
-pub struct BoundedReader<R> {
+///
+/// In addition to the per-entry cap (`per_entry_limit`), it also adds every
+/// read to `cumulative_read` — the running total across the whole archive —
+/// and checks it against `cumulative_limit` (see
+/// [container/mod.md](mod.en.md). Reflects feedback from the PR #7 review;
+/// resolves Open Question 2). `cumulative_read` is a mutable reference into
+/// a field owned by `ZipContainer`; no interior mutability such as `Cell` is
+/// used. Because `get_entry` already requires `&mut self` (guaranteeing
+/// exclusive access at that point), it is enough to take disjoint field
+/// borrows of the `archive` field (for the entry's read stream) and the
+/// `cumulative_read` field from the same `self`.
+pub struct BoundedReader<'a, R> {
     inner: R,
-    limit: u64,
-    read_so_far: u64,
+    per_entry_limit: u64,
+    per_entry_read: u64,
+    cumulative_read: &'a mut u64,
+    cumulative_limit: u64,
 }
 
-impl<R: Read> BoundedReader<R> {
-    pub fn new(inner: R, limit: u64) -> Self {
-        Self { inner, limit, read_so_far: 0 }
+impl<'a, R: Read> BoundedReader<'a, R> {
+    pub fn new(
+        inner: R,
+        per_entry_limit: u64,
+        cumulative_read: &'a mut u64,
+        cumulative_limit: u64,
+    ) -> Self {
+        Self { inner, per_entry_limit, per_entry_read: 0, cumulative_read, cumulative_limit }
     }
 }
 
-impl<R: Read> Read for BoundedReader<R> {
+impl<'a, R: Read> Read for BoundedReader<'a, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
-        self.read_so_far += n as u64;
-        if self.read_so_far > self.limit {
+        self.per_entry_read += n as u64;
+        *self.cumulative_read += n as u64;
+        if self.per_entry_read > self.per_entry_limit {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                LimitExceeded { limit: self.limit, actual: self.read_so_far },
+                LimitExceeded { limit: self.per_entry_limit, actual: self.per_entry_read },
+            ));
+        }
+        if *self.cumulative_read > self.cumulative_limit {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                LimitExceeded { limit: self.cumulative_limit, actual: *self.cumulative_read },
             ));
         }
         Ok(n)
@@ -103,20 +136,27 @@ The reason Zip Slip is validated even though this library never extracts entries
 ## Error Handling Policy
 
 - Like the parsing code, `validate_entry_path` never `panic`s; it returns `Result<(), Error>`. Any entry name that is ambiguous or cannot be interpreted is rejected (fail closed).
-- Because `std::io::Read` constrains the return type, `BoundedReader::read` cannot directly return `crate::error::Error`; it returns an `io::Error` (with `LimitExceeded` embedded inside). The design of the boundary that converts this into `crate::error::Error::ZipBombDetected` on the caller side is not yet finalized (see Open Question 3).
+- Because `std::io::Read` constrains the return type, `BoundedReader::read` cannot directly return `crate::error::Error`; it returns an `io::Error` (with `LimitExceeded` embedded inside).
+
+  The boundary that ultimately converts this `io::Error` into `crate::error::Error::ZipBombDetected` is placed **not in `pipeline.rs`, but in the point where `parse/` converts a quick-xml error into `crate::error::Error`** (planned to live alongside `parse/mod.rs`'s secure Reader factory) (finalized following the PR #7 review; resolves the former Open Question 3).
+
+  Rationale: per the design settled in [error.md](../error.en.md), `Error::XmlParse::source` is already type-erased to `Box<dyn std::error::Error + Send + Sync + 'static>`. `pipeline.rs` only ever receives this already-erased `Error::XmlParse`, and `pipeline.rs` does not depend on `quick-xml` (by design, to avoid a public dependency) — so it has no way to downcast to `quick_xml::Error`'s concrete variants (e.g. `Io(io::Error)`). `parse/`, on the other hand, already depends on `quick-xml`, so at the point where it converts a `quick_xml::Error` into `crate::error::Error` — while it still holds the `io::Error` before it gets type-erased — it can call `io::Error::get_ref()` → `.downcast_ref::<LimitExceeded>()`. If that succeeds, it returns `Error::ZipBombDetected { limit, actual }` instead of `Error::XmlParse`.
+
+  Consolidating this conversion logic into a single function callable from every `parse/*.rs` file (e.g. `parse/mod.rs::convert_xml_error`) localizes the risk of a missed conversion (the exact function signature is to be finalized when `parse/` is designed).
 
 ## Testing Strategy
 
 - `validate_entry_path` rejection cases: `"../../../etc/passwd"`, `"/etc/passwd"`, `"xl/../../evil"`, `"C:\\Windows\\System32\\evil"`, the empty string
 - `validate_entry_path` acceptance cases: legitimate OPC entry names such as `"xl/worksheets/sheet1.xml"`, `"[Content_Types].xml"`, `"xl/_rels/workbook.xml.rels"`, `"xl/media/image1.png"`
-- `BoundedReader`: verify reads succeed up to exactly `limit` bytes (boundary test)
-- `BoundedReader`: verify a read that exceeds the limit by even one byte returns `Err`, with `LimitExceeded`'s `actual`/`limit` correctly set
-- `BoundedReader`: verify ordinary reads before the cap is reached correctly count and pass through bytes
+- `BoundedReader`: verify reads succeed up to exactly the per-entry limit (`per_entry_limit` bytes) (boundary test)
+- `BoundedReader`: verify a read that exceeds the per-entry limit by even one byte returns `Err`, with `LimitExceeded`'s `actual`/`limit` correctly reflecting `per_entry_limit`
+- `BoundedReader`: verify that even when a single entry stays within its own limit, cumulative reads spanning multiple entries that exceed `cumulative_limit` return `Err`, with `LimitExceeded`'s `actual`/`limit` correctly reflecting `cumulative_limit` (including verifying the cumulative counter correctly carries over across calls)
+- `BoundedReader`: verify ordinary reads before either cap is reached correctly count and pass through bytes, and that `cumulative_read` is incremented correctly
 
 ## Open Questions
 
-1. **Default size cap and configurability**: whether `DEFAULT_MAX_UNCOMPRESSED_SIZE`'s concrete value (provisionally 512 MiB) is appropriate, and whether callers should be able to override the cap via `lib.rs`'s public API (e.g. `parse_workbook`), is to be finalized alongside `lib.rs`'s design.
-2. **Scope of the cap: per-entry vs. cumulative**: the current `BoundedReader` only enforces a cap per individual entry (file). A Zip Bomb can also be constructed from many moderately-sized entries whose cumulative total becomes enormous, rather than a single extreme-ratio entry. Whether `container/mod.rs` should separately track and cap the cumulative uncompressed size across the whole archive is undecided.
-3. **The conversion layer from `LimitExceeded` to `Error::ZipBombDetected`**: `BoundedReader` is expected to be handed to the `quick-xml` `Reader` owned by `parse/`, so the `io::Error` from a cap violation will likely propagate already wrapped by `quick-xml`. In that case it risks being treated as `XmlParse::source` (already type-erased to `Box<dyn Error>` per error.md), losing `Error::ZipBombDetected`'s structured `limit`/`actual` information. Which layer (`parse/mod.rs`'s secure Reader factory, or `pipeline.rs`) should walk `io::Error::into_inner()`, downcast to `LimitExceeded`, and reconstruct `ZipBombDetected` instead of `XmlParse` is to be finalized when `parse/` is designed.
+1. **Default size caps and configurability**: whether the concrete values of `DEFAULT_MAX_UNCOMPRESSED_SIZE` (provisionally 512 MiB) and `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE` (provisionally 2 GiB) are appropriate, and whether callers should be able to override them via `lib.rs`'s public API (e.g. `parse_workbook`), is to be finalized alongside `lib.rs`'s design.
+2. ~~Scope of the cap: per-entry vs. cumulative~~ → **Resolved**: `BoundedReader` now monitors both a per-entry cap (`per_entry_limit`) and a cumulative cap across the whole archive (`cumulative_limit`) simultaneously. The cumulative counter itself is a field owned by `ZipContainer` in [container/mod.md](mod.en.md), passed into `BoundedReader` as `&mut u64` on each `get_entry` call (reflects feedback from the PR #7 review).
+3. ~~The conversion layer from `LimitExceeded` to `Error::ZipBombDetected`~~ → **Resolved**: the downcast happens where `parse/` converts a `quick_xml::Error` into `crate::error::Error` — not in `pipeline.rs`. See Error Handling Policy for the rationale and details (reflects feedback from the PR #7 review; the alternative initially considered — giving `ZipContainer` a shared flag via `Cell` that `pipeline.rs` checks — was not adopted, since it would create an ongoing risk of a missed check outside `container/sanitize.rs`'s own visibility, and would require extra interior mutability compared to converting at the `parse/` layer).
 4. **Whether to add compression-ratio-based detection**: the current design judges only by absolute uncompressed size. Whether `container/mod.rs` should additionally perform early screening using the ratio between the ZIP central directory's declared compressed and uncompressed sizes (e.g. flagging a ratio above 100:1) before actually decompressing anything is undecided; if added, whether that logic belongs in this file or in `container/mod.rs` is also undecided.
 5. **Allowlisting entry names**: the current `validate_entry_path` uses a denylist approach (e.g. "must not contain `..`"). Whether to instead adopt a stricter allowlist that only permits entries matching known OPC namespace prefixes (`xl/`, `docProps/`, `_rels/`, `[Content_Types].xml`, etc.) is undecided.

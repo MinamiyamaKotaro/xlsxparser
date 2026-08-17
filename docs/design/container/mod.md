@@ -14,7 +14,9 @@
 ## 主要な型（案）
 
 ```rust
-use crate::container::sanitize::{self, BoundedReader, DEFAULT_MAX_UNCOMPRESSED_SIZE};
+use crate::container::sanitize::{
+    self, BoundedReader, DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE, DEFAULT_MAX_UNCOMPRESSED_SIZE,
+};
 use crate::error::Error;
 use std::io::{Read, Seek};
 use std::path::Path;
@@ -28,6 +30,13 @@ use std::path::Path;
 pub struct ZipContainer<R> {
     archive: R, // 実際にはZIP操作クレートが提供するアーカイブ型を保持する想定のプレースホルダー
     max_entry_size: u64,
+    /// アーカイブ全体を通じた累積展開後サイズの上限（Zip Bomb対策、
+    /// [sanitize.md](sanitize.md) 参照。PR #7 レビュー指摘を反映）。
+    max_total_size: u64,
+    /// これまでに `get_entry` 経由で展開されたバイト数の累計。
+    /// `get_entry` が `BoundedReader` へ `&mut` で貸し出す
+    /// （依存関係セクション参照）。
+    total_read: u64,
 }
 
 impl ZipContainer<std::fs::File> {
@@ -66,10 +75,17 @@ impl<R: Read + Seek> ZipContainer<R> {
     ///   （`Error::DanglingRelationship`）なのかは呼び出し側の文脈でしか
     ///   判断できないため、本メソッドはエラーを構築しない。
     /// - 返すストリームは `BoundedReader` で包まれており、Zip Bomb対策の
-    ///   上限（`max_entry_size`）が適用済みである。
-    pub fn get_entry(&mut self, name: &str) -> Result<Option<BoundedReader<impl Read + '_>>, Error> {
+    ///   エントリ単体の上限（`max_entry_size`）と、アーカイブ全体の累積
+    ///   上限（`max_total_size`）の両方が適用済みである。
+    pub fn get_entry(&mut self, name: &str) -> Result<Option<BoundedReader<'_, impl Read + '_>>, Error> {
         sanitize::validate_entry_path(name)?;
-        let _ = name;
+        // `archive` フィールドから得るエントリの読み取りストリームと、
+        // `total_read` フィールドへの可変参照（`BoundedReader::new` の
+        // `cumulative_read` 引数として渡す）は、同一の `self` から
+        // 分割借用（disjoint field borrow）することで両立できる。
+        // `Cell` 等の内部可変性は不要（sanitize.md 参照）。
+        let Self { archive, total_read, max_entry_size, max_total_size, .. } = self;
+        let _ = (archive, name, *max_entry_size, total_read, *max_total_size);
         unimplemented!()
     }
 
@@ -80,11 +96,20 @@ impl<R: Read + Seek> ZipContainer<R> {
 }
 
 impl<R> ZipContainer<R> {
-    /// Zip Bomb対策の展開後サイズ上限を明示的に設定して開く。未指定時は
+    /// Zip Bomb対策のエントリ単体サイズ上限を明示的に設定して開く。未指定時は
     /// `DEFAULT_MAX_UNCOMPRESSED_SIZE`（[sanitize.md](sanitize.md)）を使う
     /// 想定（具体的なビルダーAPIの形は未確定。オープンクエスチョン3参照）。
     fn with_max_entry_size(mut self, limit: u64) -> Self {
         self.max_entry_size = limit;
+        self
+    }
+
+    /// Zip Bomb対策のアーカイブ全体累積サイズ上限を明示的に設定して開く。
+    /// 未指定時は `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE`（[sanitize.md](sanitize.md)）
+    /// を使う想定（PR #7 レビュー指摘を反映してオープンクエスチョン4を解決。
+    /// 具体的なビルダーAPIの形は `with_max_entry_size` 同様オープンクエスチョン3参照）。
+    fn with_max_total_size(mut self, limit: u64) -> Self {
+        self.max_total_size = limit;
         self
     }
 }
@@ -92,7 +117,7 @@ impl<R> ZipContainer<R> {
 
 ## 依存関係
 
-- 依存先: [`container/sanitize.rs`](sanitize.md)（`validate_entry_path`, `BoundedReader`, `DEFAULT_MAX_UNCOMPRESSED_SIZE`）、[`error.rs`](../error.md)。`model/` および `parse/` には依存しない。
+- 依存先: [`container/sanitize.rs`](sanitize.md)（`validate_entry_path`, `BoundedReader`, `DEFAULT_MAX_UNCOMPRESSED_SIZE`, `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE`）、[`error.rs`](../error.md)。`model/` および `parse/` には依存しない。
 - 依存元: `pipeline.rs` のみ。architecture.md 設計方針3（「`container` と `parse` は密に往復するが、この呼び出し順序とリソースのライフサイクル管理は `pipeline.rs` に一元化し、他のモジュールが互いを直接知らなくてよいようにする」）に基づき、`parse/` 配下の各モジュールは `container::ZipContainer` を直接知らず、`pipeline.rs` が `get_entry` で取得したバイト列（ストリーム）を受け渡す。
 
 `get_entry` が `name` を毎回再検証する理由: オープン時の `validate_entry_path` 適用対象はアーカイブが実際に持つエントリ名（中央ディレクトリ由来、静的な文字列）だが、`get_entry` に渡される `name` は `pipeline.rs` 経由で `parse/relationships.rs`（フェーズ1）が `.rels` 内の相対パス表記（例: `../media/image1.png`）とエントリ名を組み合わせて動的に計算した文字列でもありうる。この計算過程に正規化漏れ（`..` の未解決など）があった場合、オープン時検証をすり抜けたパスが `get_entry` に到達しうるため、独立した信頼できない入力として毎回検証する（多層防御）。
@@ -104,7 +129,8 @@ impl<R> ZipContainer<R> {
 - `open` / `open_reader` は、ZIPアーカイブとして破損している場合に `Error::InvalidPackage` を返す。使用するZIP操作クレートのエラー型をそのまま `String` 化するか、`error.md` の `XmlParse` と同様に `Box<dyn Error>` として型消去した専用フィールドを持たせるかは、クレート選定後に見直す（オープンクエスチョン1、[error.md オープンクエスチョン1](../error.md) と連動）。
 - `open_reader` は、中央ディレクトリ内のいずれかのエントリ名が `validate_entry_path` に失敗した場合、`Error::ZipSlipDetected` を返しアーカイブ全体を拒否する（部分的に安全なエントリのみを使う、という妥協はしない）。
 - `get_entry` はエントリ不在を `Result` ではなく `Ok(None)` として表現する（`model::Sheet::get` が空白セルを `None` で表すのと同じ設計原則。[model/sheet.md](../model/sheet.md) 参照）。
-- `get_entry` が返す `BoundedReader` からの読み込み中に上限超過が発生した場合の `io::Error` → `Error::ZipBombDetected` への変換は、[sanitize.md オープンクエスチョン3](sanitize.md) の通り未確定。
+- 必須パーツ（`[Content_Types].xml` / `xl/workbook.xml` 等）が存在しない場合のエラー構築は本ファイルの責務としない。`ZipContainer` は「安全なファイル取得」のみを扱う汎用コンテナ層に徹し、どのパーツが必須かというOPC特有のセマンティクスを持たない（PR #7 レビュー指摘を反映してオープンクエスチョン5を解決）。`get_entry` が返す `Ok(None)` を見て `Error::InvalidPackage` や `Error::DanglingRelationship` のいずれを構築するかは `pipeline.rs` / `parse/relationships.rs` 側の判断とする。
+- `get_entry` が返す `BoundedReader` からの読み込み中に上限超過が発生した場合の `io::Error` → `Error::ZipBombDetected` への変換は、`parse/` が `quick_xml::Error` を `crate::error::Error` へ変換する境界で行う（[sanitize.md エラー処理方針](sanitize.md) 参照。オープンクエスチョン3は解決済み）。
 
 ## テスト方針
 
@@ -115,11 +141,12 @@ impl<R> ZipContainer<R> {
 - `get_entry` に実在しないエントリ名を渡した場合に `Ok(None)` を返すことの確認（エラーにならないこと）
 - `get_entry` に `"../etc/passwd"` のような不正な形の `name` を渡した場合、アーカイブ内の実在有無に関わらず `Error::ZipSlipDetected` を返すことの確認（オープン時検証をすり抜けた想定の多層防御テスト）
 - `get_entry` が返すストリームが `max_entry_size` を超えて読まれた場合にエラーとなることの確認（`sanitize::BoundedReader` との結線テスト。`BoundedReader` 自体のロジック検証は [sanitize.md](sanitize.md) 側の責務）
+- 複数の `get_entry` 呼び出しにまたがって `total_read` が正しく累積し、`max_total_size` を超えた時点でエラーとなることの確認（`ZipContainer` が `BoundedReader` へ渡す累積カウンタの結線テスト）
 
 ## 未決事項 / オープンクエスチョン
 
-1. **ZIP操作に使用する外部クレートの選定**: [error.md オープンクエスチョン1](../error.md) と同一の論点。`Read + Seek` を要求する形で本ファイルの型を設計しているため、選定するクレートが提供するAPIがこの前提（シーク可能な入力からのランダムアクセス）と一致することを確認する必要がある。
-2. **`get_entry` の戻り値の型設計**: `impl Read + '_`（RPIT、`self` の借用に束縛）を採用しているため、あるエントリのストリームを保持している間は次の `get_entry` を呼べない（借用が競合する）。この制約は逐次アクセスパターン（依存関係セクション参照）を前提とすれば問題ないはずだが、`Box<dyn Read + '_>` などのトレイトオブジェクトにして制約を緩めるべきかは未決定。
-3. **`max_entry_size` の設定インターフェース**: `with_max_entry_size` のような後付けのビルダーメソッドにするか、`open` / `open_reader` の引数に含めるか、[sanitize.md オープンクエスチョン1](sanitize.md) で触れている `lib.rs` 公開APIからの可変性議論と合わせて確定させる。
-4. **アーカイブ全体の累積サイズ追跡**: [sanitize.md オープンクエスチョン2](sanitize.md) で触れた「エントリ単位でなく累積」対策を実装する場合、本ファイル（`ZipContainer` が複数エントリにまたがる状態を持つため自然な置き場所）に持たせるか、`sanitize.rs` に累積カウンタ型を追加してそちらに委譲するかは未決定。
-5. **必須パーツの存在チェックの責務分界**: `[Content_Types].xml` や `xl/workbook.xml` のような .xlsx として必須のパーツが欠落している場合の検知を、本ファイルが `open` 時点で行うか（「有効な.xlsxパッケージか」の判断を本ファイルの責務に含める）、あるいは `pipeline.rs` / `parse/relationships.rs` 側が `get_entry` の `Ok(None)` を見て判断するかは未決定。前者はfail-fastである一方、本ファイルがOPCの構造的知識（どのパーツが必須か）を持つことになり「ZIPの安全な取得のみを担う」という現在のスコープ定義から逸脱する可能性がある。
+1. **ZIP操作に使用する外部クレートの選定**: [error.md オープンクエスチョン1](../error.md) と同一の論点で未決定だが、PR #7 レビューでの一般的知見を踏まえ、Rustエコシステムにおける実績とシーク対応（`Read + Seek`）の観点から `zip` クレートを第一候補として設計を進める（本ファイルの型が要求する `Read + Seek` の前提とも合致する）。ただし具体的なバージョン固定・代替クレートとの最終比較は `Cargo.toml` 整備時に確定させる。
+2. ~~`get_entry` の戻り値の型設計~~ → **解決**: `impl Read + '_`（RPIT、`self` の借用に束縛）を採用する。本ライブラリの処理パイプラインは「rels読み込み→SST読み込み→worksheet逐次読み込み」という完全な逐次アクセスパターンであり、複数エントリのストリームを同時に開いておく必要性は設計上存在しない。アロケーションコストがなく、複数ストリームの同時オープン（借用競合）をコンパイル時に防げる `impl Read + '_` の方が `Box<dyn Read + '_>` より望ましい（PR #7 レビュー指摘を反映）。
+3. **`max_entry_size` / `max_total_size` の設定インターフェース**: `with_max_entry_size` / `with_max_total_size` のような後付けのビルダーメソッドにするか、`open` / `open_reader` の引数に含めるか、[sanitize.md オープンクエスチョン1](sanitize.md) で触れている `lib.rs` 公開APIからの可変性議論と合わせて確定させる。
+4. ~~アーカイブ全体の累積サイズ追跡~~ → **解決**: `ZipContainer` が `total_read` / `max_total_size` フィールドとして保持する（`ZipContainer` が複数エントリにまたがる状態を持つ自然な置き場所であるため）。`get_entry` が `BoundedReader` へ `&mut u64` として貸し出す設計とし、`Cell` 等の内部可変性は用いない（PR #7 レビュー指摘を反映。詳細は[sanitize.md](sanitize.md)参照）。
+5. ~~必須パーツの存在チェックの責務分界~~ → **解決**: `ZipContainer` は「ZIPアーカイブから安全にファイルを切り出す汎用コンテナ層」としての責務に徹し、`.xlsx` (OPC) 特有のセマンティクス（どのパーツが必須か）は持たない（単一責任の原則）。存在チェックは `pipeline.rs` / `parse/relationships.rs` 側が `get_entry` の `Ok(None)` を見てハンドリングする（PR #7 レビュー指摘を反映）。
