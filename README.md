@@ -2,6 +2,9 @@
 
 [![Rust CI](https://github.com/MinamiyamaKotaro/xlsxparser/actions/workflows/rust-ci.yml/badge.svg)](https://github.com/MinamiyamaKotaro/xlsxparser/actions/workflows/rust-ci.yml)
 [![Docs](https://github.com/MinamiyamaKotaro/xlsxparser/actions/workflows/docs.yml/badge.svg)](https://github.com/MinamiyamaKotaro/xlsxparser/actions/workflows/docs.yml)
+[![xlsxparser on crates.io](https://img.shields.io/crates/v/xlsxparser.svg)](https://crates.io/crates/xlsxparser)
+[![codecov](https://codecov.io/gh/MinamiyamaKotaro/xlsxparser/branch/master/graph/badge.svg)](https://codecov.io/gh/MinamiyamaKotaro/xlsxparser)
+[![License](https://img.shields.io/github/license/MinamiyamaKotaro/xlsxparser)](LICENSE)
 
 A lightweight, high-performance `.xlsx` (OOXML) parser library written in Rust.
 
