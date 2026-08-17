@@ -17,10 +17,15 @@ frontend or another system.
 
 ## Status
 
-Design stage — the requirement spec is finalized, and a detailed,
-module-by-module design has been completed for every file in `src/`
-(mirrored 1:1 under `docs/design/`). Implementation has not started yet;
-`src/` is still empty (and thus not yet tracked in this repository).
+Core implementation complete — every module in the planned architecture
+below is implemented and tested against the design in `docs/design/`. The
+public API (`parse_workbook`, `parse_workbook_reader`, `to_json_string`,
+`to_json_writer`) is wired up in `src/lib.rs`.
+
+```rust
+let workbook = xlsxparser::parse_workbook("book.xlsx")?;
+let json = xlsxparser::to_json_string(&workbook)?;
+```
 
 - [docs/requirement/requirements.md](docs/requirement/requirements.md)
   (Japanese) — the functional requirements and the 5-phase pipeline summarized below.
@@ -30,11 +35,12 @@ module-by-module design has been completed for every file in `src/`
   It links out to a per-module design doc for every file, covering
   responsibility/scope, key types and function signatures, dependencies,
   error handling policy, testing strategy, and open questions — each doc
-  written in both Japanese and English (`*.md` / `*.en.md`).
+  written in both Japanese and English (`*.md` / `*.en.md`). Where
+  implementation diverged from a design doc's draft (an external API
+  detail settled differently than planned, a bug found while writing
+  tests, etc.), the doc was updated in place to record what changed and why.
 
-## Planned architecture
-
-A one-way processing pipeline in five phases, orchestrated by `pipeline.rs`:
+## Architecture
 
 1. **Relationship resolution** — parse `_rels` parts to build a routing map
    from sheet `r:id` to worksheet file path, then discard the intermediate
@@ -55,13 +61,14 @@ Core requirements driving the design:
 - **Sparse storage** — cells are kept in a coordinate-keyed map, never a
   dense 2D array, so sparse "grid-paper" sheets stay cheap to hold in memory.
 - **Merge-cell transparency** — any coordinate inside a merged range
-  resolves (via an internal alias) to the same value and merge metadata as
-  the range's anchor cell.
+  resolves (via an O(1) bounding-box pre-check plus a geometric containment
+  scan over the sheet's merged regions) to the same value and merge
+  metadata as the range's anchor cell.
 - **I/O and domain logic stay separated** — XML/ZIP handling (`container/`,
   `parse/`) never mixes with the resolution logic (`resolve/`), which
   operates purely on in-memory data and needs no I/O to unit test.
 
-The planned module layout (see
+The module layout (see
 [docs/design/architecture.en.md](docs/design/architecture.en.md) for the
 full breakdown of each file's responsibility):
 
@@ -81,11 +88,17 @@ src/
 
 ## OOXML parts covered
 
-- `[Content_Types].xml`
+- `xl/_rels/workbook.xml.rels`
 - `xl/workbook.xml`
 - `xl/sharedStrings.xml` (including `xml:space="preserve"` handling)
 - `xl/styles.xml`
 - `xl/worksheets/sheetX.xml` (`<sheetData>`, `<mergeCells>`)
+
+`[Content_Types].xml` is not read; fixed paths such as `xl/workbook.xml`
+are accessed directly instead of being resolved through its Content-Type
+declarations (see
+[pipeline.en.md Open Question 3](docs/design/pipeline.en.md) for the
+rationale and the strict-OPC-conformance tradeoff this makes).
 
 ## License
 
