@@ -22,6 +22,13 @@ pub struct Workbook {
 }
 
 impl Workbook {
+    /// 解決済みシートのリストから構築する。`pipeline.rs` が全シートの
+    /// フェーズ3・4完了後に1回だけ呼び出す（pipeline.md 参照。設計時に
+    /// 発見した欠落のため追加）。
+    pub(crate) fn new(sheets: Vec<Sheet>) -> Self {
+        Self { sheets }
+    }
+
     /// ソースファイルでの定義順を維持したシート一覧。
     pub fn sheets(&self) -> &[Sheet] {
         &self.sheets
@@ -38,7 +45,7 @@ impl Workbook {
 ## 依存関係
 
 - 依存先: [`model/sheet.rs`](sheet.md)
-- 依存元: `pipeline.rs`（構築・返却）、`lib.rs`（公開APIの返り値型）、`json.rs`（トップレベルのシリアライズ対象）
+- 依存元: [`pipeline.rs`](../pipeline.md)（`Workbook::new` で構築・返却）、`lib.rs`（公開APIの返り値型）、[`json.rs`](../json.md)（トップレベルのシリアライズ対象）
 
 ## エラー処理方針
 

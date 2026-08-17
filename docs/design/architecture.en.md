@@ -64,6 +64,8 @@ Owns the `ZipContainer` and controls the execution order of each phase (borrowin
   Note: This disposal is only valid if `model::Cell` holds resolved actual data directly (the `String` or `ResolvedStyle` value itself, or an owned reference such as `Arc`) rather than an index. If the cell side holds only an index/reference, the lifetime of `SharedStringTable`/`StyleSheet` must be kept alive until Phase 5 (JSON generation) completes.
 - Per-row XML node disposal (Phase 3) is an internal implementation detail of `parse/worksheet.rs`, and `pipeline.rs` does not control it. `pipeline.rs` is only responsible for file/data-structure-level disposal.
 
+- Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [pipeline.md](pipeline.en.md)
+
 ### `container/`
 
 The entry point for ZIP (OPC) extraction. Responsible for detecting and blocking Zip Bomb / Zip Slip. Does not interpret (parse) the contents of the XML.
@@ -99,6 +101,8 @@ Responsible for Phase 4's analysis and deferred resolution. Since it has no depe
 ### `json.rs`
 
 Serializes the fully analyzed and resolved data model into JSON, including attributes such as `row_span` / `col_span` needed for frontend rendering.
+
+- Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [json.md](json.en.md)
 
 ## Discussion History
 

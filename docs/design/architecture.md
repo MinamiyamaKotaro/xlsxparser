@@ -64,6 +64,8 @@ src/
   ※この破棄が成立するのは、`model::Cell` がインデックスではなく解決済みの実データ（`String` や `ResolvedStyle` の値、または `Arc` などの所有権付き参照）を直接保持する設計を取る場合に限る。セル側がインデックス／参照のみを保持する設計にする場合は、フェーズ5（JSON生成）が完了するまで `SharedStringTable` や `StyleSheet` の生存期間を維持する必要がある。
 - 行単位のXMLノード破棄（フェーズ3）は `parse/worksheet.rs` 内部の実装詳細であり、`pipeline.rs` はこれを制御しない。ファイル/データ構造単位の破棄のみを担う。
 
+- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [pipeline.md](pipeline.md)
+
 ### `container/`
 
 ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブロックを担う。XMLの中身の解釈（パース）は行わない。
@@ -99,6 +101,8 @@ ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブ�
 ### `json.rs`
 
 分析・解決が完了したデータモデルを、`row_span` / `col_span` などフロントエンド描画に必要な属性を含むJSONへシリアライズする。
+
+- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [json.md](json.md)
 
 ## 議論の経緯
 

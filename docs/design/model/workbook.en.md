@@ -22,6 +22,14 @@ pub struct Workbook {
 }
 
 impl Workbook {
+    /// Builds a `Workbook` from a list of already-resolved sheets.
+    /// `pipeline.rs` calls this exactly once, after Phases 3 and 4 have
+    /// completed for every sheet (see pipeline.md; added after discovering
+    /// the gap while designing it).
+    pub(crate) fn new(sheets: Vec<Sheet>) -> Self {
+        Self { sheets }
+    }
+
     /// The list of sheets, preserving the definition order from the source file.
     pub fn sheets(&self) -> &[Sheet] {
         &self.sheets
@@ -39,7 +47,7 @@ impl Workbook {
 ## Dependencies
 
 - Depends on: [`model/sheet.rs`](sheet.en.md)
-- Depended on by: `pipeline.rs` (constructs and returns it), `lib.rs` (the return type of the public API), `json.rs` (the top-level serialization target)
+- Depended on by: [`pipeline.rs`](../pipeline.en.md) (constructs via `Workbook::new` and returns it), `lib.rs` (the return type of the public API), [`json.rs`](../json.en.md) (the top-level serialization target)
 
 ## Error Handling Policy
 
