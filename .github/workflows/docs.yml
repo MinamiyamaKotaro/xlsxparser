@@ -1,0 +1,42 @@
+name: Docs
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "docs/**/*.md"
+      - "README.md"
+      - ".markdownlint-cli2.jsonc"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "docs/**/*.md"
+      - "README.md"
+      - ".markdownlint-cli2.jsonc"
+      - ".github/workflows/docs.yml"
+
+jobs:
+  markdown-lint:
+    name: Markdown lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DavidAnson/markdownlint-cli2-action@v19
+        with:
+          globs: |
+            docs/**/*.md
+            README.md
+
+  link-check:
+    name: Link check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lycheeverse/lychee-action@v2
+        with:
+          args: --no-progress --verbose "docs/**/*.md" "README.md"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
