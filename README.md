@@ -14,14 +14,24 @@ frontend or another system.
 
 ## Status
 
-Early stage — the requirement spec has been drafted and implementation has
-not started yet. See [docs/requirement/requirements.md](docs/requirement/requirements.md)
-(Japanese) for the full architecture and functional requirements, summarized
-below.
+Design stage — the requirement spec is finalized, and a detailed,
+module-by-module design has been completed for every file in `src/`
+(mirrored 1:1 under `docs/design/`). Implementation has not started yet;
+`src/` is still empty (and thus not yet tracked in this repository).
+
+- [docs/requirement/requirements.md](docs/requirement/requirements.md)
+  (Japanese) — the functional requirements and the 5-phase pipeline summarized below.
+- [docs/design/architecture.en.md](docs/design/architecture.en.md) — the
+  overall `src/` directory layout, module responsibilities, and design
+  principles (also available in [Japanese](docs/design/architecture.md)).
+  It links out to a per-module design doc for every file, covering
+  responsibility/scope, key types and function signatures, dependencies,
+  error handling policy, testing strategy, and open questions — each doc
+  written in both Japanese and English (`*.md` / `*.en.md`).
 
 ## Planned architecture
 
-A one-way processing pipeline in five phases:
+A one-way processing pipeline in five phases, orchestrated by `pipeline.rs`:
 
 1. **Relationship resolution** — parse `_rels` parts to build a routing map
    from sheet `r:id` to worksheet file path, then discard the intermediate
@@ -35,7 +45,7 @@ A one-way processing pipeline in five phases:
    against the collected cells after the stream pass completes.
 5. **JSON output** — the resolved data model is serialized to structured
    JSON (including `row_span`/`col_span` for merged cells) for downstream
-   consumption.
+   consumption, as a separate step from the primary `Workbook`-returning API.
 
 Core requirements driving the design:
 
@@ -44,6 +54,27 @@ Core requirements driving the design:
 - **Merge-cell transparency** — any coordinate inside a merged range
   resolves (via an internal alias) to the same value and merge metadata as
   the range's anchor cell.
+- **I/O and domain logic stay separated** — XML/ZIP handling (`container/`,
+  `parse/`) never mixes with the resolution logic (`resolve/`), which
+  operates purely on in-memory data and needs no I/O to unit test.
+
+The planned module layout (see
+[docs/design/architecture.en.md](docs/design/architecture.en.md) for the
+full breakdown of each file's responsibility):
+
+```text
+src/
+  lib.rs        # public API entry point (parse_workbook, parse_workbook_reader, to_json_string, ...)
+  error.rs      # crate-wide error type
+  pipeline.rs   # orchestrates the 5-phase pipeline and resource lifetimes
+
+  container/    # ZIP (OPC) extraction, zip-bomb/zip-slip guarding
+  parse/        # XML parsing (quick-xml usage is confined here), XXE mitigation
+  model/        # pure data structures (Workbook, Sheet, Cell, CellValue, ...)
+  resolve/      # shared-string/style/merge-cell resolution, I/O-independent
+
+  json.rs       # serializes a resolved Workbook to JSON
+```
 
 ## OOXML parts covered
 
