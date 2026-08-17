@@ -64,6 +64,15 @@ pub enum Error {
     #[error("missing required element/attribute `{name}` in {path}")]
     MissingRequiredElement { path: String, name: &'static str },
 
+    /// `<!DOCTYPE ...>` 宣言を検知し無条件に拒否した（XXE対策。
+    /// [parse/mod.md](parse/mod.md) `read_event` が生成する）。OOXMLの
+    /// `_rels`/`workbook.xml`/`sharedStrings.xml`/`styles.xml`/`sheetX.xml`
+    /// はいずれも仕様上DOCTYPE宣言を持たないため、正当な `.xlsx` に対して
+    /// 本バリアントが発生することはない（[セキュリティレビュー](../security/design-review.md)
+    /// Finding 1を反映して新設）。
+    #[error("DOCTYPE declaration rejected in {path} (XXE defense)")]
+    DoctypeRejected { path: String },
+
     // --- フェーズ4: 分析と遅延解決 ---
     /// A1形式のセル参照文字列が不正（構文エラー・桁溢れ・空文字列など、
     /// model/cell.md の `CellRef::from_a1` が返す）。

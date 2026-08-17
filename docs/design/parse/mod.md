@@ -9,6 +9,7 @@
 - サブモジュールの宣言（`mod relationships; mod workbook; mod shared_strings; mod styles; mod worksheet;`）とクレート内公開型の再エクスポート
 - XXE対策を適用済みの `quick_xml::Reader` を生成する唯一の窓口 `create_secure_reader` を提供する。`parse/` 配下の各モジュールはこの関数経由でのみ `Reader` を取得しなければならず、個別に `Reader::from_reader` を呼ばない（architecture.md 「各パーサーが個別に `Reader` を初期化すると設定漏れのリスクがあるため」を実装する）
 - `quick_xml::Error` を [`crate::error::Error`](../error.md) へ変換する唯一の窓口 `convert_xml_error` を提供する。[container/sanitize.md](../container/sanitize.md) が定義する `BoundedReader` からの上限超過（Zip Bomb）を検知し `Error::ZipBombDetected` へ変換する処理もここに集約する
+- イベント読み取りの唯一の窓口 `read_event` を提供する。`quick-xml` はDTD内部サブセット・外部実体を解決しない非検証型パーサーであり通常の構成でも古典的なXXEは成立しないが、この前提のみに依拠せず、`<!DOCTYPE ...>` 宣言（`Event::DocType`）自体をXMLの構文として検知した時点で無条件に拒否する（fail closed）ことで、パーサーの内部実装や将来のバージョン変更に依存しない明示的・検証可能なXXE対策とする。`parse/` 配下の各モジュールはこの関数経由でのみイベントを読み取り、`Reader::read_event_into` を直接呼ばない（[セキュリティレビュー](../../security/design-review.md) Finding 1を反映）
 - 必須属性の取得（欠落時に `Error::MissingRequiredElement` を返す）、共有文字列・インラインストリングのリッチテキストラン（`<r><t>...</t></r>` の連結）といった、複数モジュールで重複しがちな小さな共通処理をヘルパー関数として提供する
 - **含まない責務**: 個々のXMLパーツ（`_rels` / `workbook.xml` / `sharedStrings.xml` / `styles.xml` / `sheetX.xml`）固有の構造解釈（各サブモジュールの責務）、パース結果の意味的な検証・解決（`resolve/`）
 
@@ -79,6 +80,38 @@ pub(crate) fn convert_xml_error(path: &str, err: quick_xml::Error) -> Error {
     }
 }
 
+/// イベント読み取りの唯一の窓口。`reader.read_event_into(buf)` を呼び出し
+/// `convert_xml_error` でエラー変換したうえで、返された `Event` が
+/// `Event::DocType`（`<!DOCTYPE ...>` 宣言）であれば内容を一切解釈せず
+/// 無条件に `Error::DoctypeRejected` を返す（fail closed）。
+///
+/// OOXMLの `_rels`/`workbook.xml`/`sharedStrings.xml`/`styles.xml`/
+/// `sheetX.xml` はいずれも仕様上DOCTYPE宣言を持たないため、正当な
+/// `.xlsx` をこの検査が誤って拒否することはない。`quick-xml` 自体が
+/// DTD内部サブセット・外部実体を解決しない非検証型パーサーであり
+/// 標準構成のままでも古典的なXXEは成立しないという設計上の前提
+/// （[責務・スコープ](#責務スコープ)参照）はそのまま残るが、本関数は
+/// その前提が将来のバージョン変更や別パーサーへの移行によって崩れた
+/// 場合にも独立して機能する多層防御として、DOCTYPE宣言の存在自体を
+/// XML構文レベルで検知した時点で処理を打ち切る。`parse/` 配下の
+/// 各モジュールは本関数経由でのみイベントを読み取り、
+/// `reader.read_event_into` を直接呼ばない。
+pub(crate) fn read_event<'a>(
+    reader: &mut Reader<impl BufRead>,
+    buf: &'a mut Vec<u8>,
+    path: &str,
+) -> Result<Event<'a>, Error> {
+    let event = reader
+        .read_event_into(buf)
+        .map_err(|err| convert_xml_error(path, err))?;
+    if matches!(event, Event::DocType(_)) {
+        return Err(Error::DoctypeRejected {
+            path: path.to_string(),
+        });
+    }
+    Ok(event)
+}
+
 /// `start` の属性から `name` を取得する。欠落時は `Error::MissingRequiredElement`
 /// を返す。デコード・アンエスケープ済みの文字列を返すか生バイト列のままにするかは
 /// quick-xmlのバージョン選定と合わせて確定させる（オープンクエスチョン3参照）。
@@ -115,10 +148,13 @@ pub(crate) fn concat_rich_text<R: BufRead>(
 
 `convert_xml_error` が `container::sanitize::LimitExceeded` を参照する設計は、[container/sanitize.md エラー処理方針](../container/sanitize.md)・[container/mod.md エラー処理方針](../container/mod.md) の双方が既に「変換境界は `parse/` が `quick_xml::Error` を `crate::error::Error` へ変換する箇所に置く」と確定させていた内容をそのまま実装したものであり、両ファイルのオープンクエスチョンとして残されていた論点はこれで解決済みとなる。
 
+`read_event` が `Error::DoctypeRejected`（[error.md](../error.md) に新設）を返す設計は、`create_secure_reader`・`convert_xml_error` と並ぶ第3の「唯一の窓口」であり、XXE対策を `Reader` の生成設定という受動的な仕組みだけに委ねず、実際に読み取られる各イベントに対する能動的な検査として二重化する（[セキュリティレビュー](../../security/design-review.md) Finding 1を反映）。
+
 ## エラー処理方針
 
 - `create_secure_reader` はエラーを返さない（`Reader` の生成自体は失敗しない。入力ストリームのI/Oエラーは実際に読み取りを行う `read_event` 呼び出し時に顕在化する）
 - `convert_xml_error` はあらゆる `quick_xml::Error` を必ず `crate::error::Error` のいずれかのバリアントへ変換する（`panic` しない）。`Error::ZipBombDetected` に該当しない場合のフォールバックは常に `Error::XmlParse` とし、未知のバリアントを握りつぶさない
+- `read_event` は `Event::DocType` を検知した場合、宣言の中身（内部サブセットに実体定義を含むか等）を一切解釈せず即座に `Error::DoctypeRejected` を返す。判定を「怪しい実体定義を含む場合のみ拒否する」という許可リスト的な解釈にせず、DOCTYPE宣言の存在そのものを拒否理由とすることで、実体定義の構文解析ミスに起因する検知漏れの余地を構造的に排除する（fail closed。[container/sanitize.md](../container/sanitize.md) の `validate_entry_path` が採る「あいまい・解釈できない入力は安全側に倒す」という方針と同じ考え方）
 - `required_attr` は信頼できない外部入力（不正な `.xlsx`）由来の欠落を扱うため `panic` せず `Result` を返す
 
 ## テスト方針
@@ -128,12 +164,15 @@ pub(crate) fn concat_rich_text<R: BufRead>(
 - `convert_xml_error`: 通常のXML構文エラー（不正なタグの閉じ忘れ等）を渡した場合に `Error::XmlParse` へ変換され、`path` が正しく設定されることの確認
 - `required_attr`: 属性が存在する場合に値を取得できること、存在しない場合に `Error::MissingRequiredElement` を返すことの確認
 - `concat_rich_text`: 単一の `<t>`、複数の `<r><t>` ラン、および `<rPh>` を含む入力それぞれについて期待どおりの文字列が得られることの確認（詳細な網羅ケースは [shared_strings.md テスト方針](shared_strings.md) 側で行う。本ファイルでは結線の確認に留める）
-- DOCTYPE宣言と外部実体参照を含む悪意あるXML（XXE攻撃ペイロード）を `create_secure_reader` 経由でパースさせた場合に、外部ファイルの内容がパース結果に一切現れないことを確認する統合的なテスト（要求仕様書2章のXXE要件そのものの検証。[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を踏まえ、本ファイルへ集約して実施し、個々の `parse/*.rs` 側では重ねて実施しない。XXE対策の核心は `create_secure_reader` が安全に構成された `Reader` を返すことにあり、このファクトリ関数が定義されている本ファイルでテストすることが最も直接的でメンテナンスしやすいため）
+- **`read_event`: DOCTYPE宣言と外部実体参照を含む悪意あるXML（XXE攻撃ペイロード。例: `<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>`）を渡した場合に、`Event::DocType` を検知した時点で `Error::DoctypeRejected` を返し、後続のイベントを一切読み進めないことの確認**（要求仕様書2章のXXE要件そのものの検証。[セキュリティレビュー](../../security/design-review.md) Finding 1で指摘された、暗黙の前提のみに依拠しない明示的・検証可能な対策の回帰テスト）
+- `read_event`: 外部実体参照を含まない、DOCTYPE宣言を含まない正当なXML（`_rels`/`workbook.xml`/`sharedStrings.xml`/`styles.xml`/`sheetX.xml` 相当）に対しては通常どおりイベントを返し、`Error::DoctypeRejected` が誤って発生しないことの確認（正当な `.xlsx` に対する偽陽性がないことの回帰テスト）
+- `read_event`: DOCTYPE宣言を含まないが構文的に不正なXML、および `BoundedReader` の上限超過を渡した場合に、それぞれ `convert_xml_error` 経由で `Error::XmlParse`/`Error::ZipBombDetected` へ正しく変換されること（`Event::DocType` の判定より前にエラー変換が行われる経路の結線確認）
+- 個々の `parse/*.rs` 側では上記のXXE関連テストを重ねて実施しない（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を踏まえ、`read_event` が定義されている本ファイルへ集約する）
 
 ## 未決事項 / オープンクエスチョン
 
-1. **quick-xmlのバージョン選定と `Reader` 設定APIの確定**: [error.md オープンクエスチョン1](../error.md)・[container/mod.md オープンクエスチョン1](../container/mod.md) と連動する論点。バージョンによって `Reader::config_mut()` の有無や設定項目名が異なるため、`Cargo.toml` 整備時に本ファイルのコード例を実際のAPIに合わせて更新する。
-2. ~~XXE非該当の実証テストの置き場所~~ → **解決**: 本ファイルのユニットテストへ集約する（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を反映）。`create_secure_reader` が定義された箇所と同一ファイルに置くことで、対策の核心（安全に構成された `Reader` を返すこと）を直接検証できる。個々の `parse/*.rs` 側で重ねて実施しない。
+1. **quick-xmlのバージョン選定と `Reader` 設定APIの確定**: [error.md オープンクエスチョン1](../error.md)・[container/mod.md オープンクエスチョン1](../container/mod.md) と連動する論点。バージョンによって `Reader::config_mut()` の有無や設定項目名が異なるため、`Cargo.toml` 整備時に本ファイルのコード例を実際のAPIに合わせて更新する。**ただし `read_event` によるXXE対策（`Event::DocType` の無条件拒否）自体はこのオープンクエスチョンの解決結果に依存しない**（[セキュリティレビュー](../../security/design-review.md) Finding 1を反映）。`Event` enumの構造（`DocType` バリアントの存在）はquick-xmlの主要バージョンを通じて安定しており、`Reader::config_mut()` のような設定APIの詳細が変わってもXXE対策の実効性には影響しない。この独立性こそが、当初「`Reader` の既定動作という暗黙の前提」に依拠していた設計（Finding 1が指摘した課題）に対する根本的な解決である。
+2. ~~XXE非該当の実証テストの置き場所~~ → **解決**: 本ファイルのユニットテストへ集約する（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を反映）。`read_event` が定義された箇所と同一ファイルに置くことで、対策の核心（`Event::DocType` を確実に検知・拒否すること）を直接検証できる。個々の `parse/*.rs` 側で重ねて実施しない。
 3. **`required_attr` の返り値の型**: `String`（アンエスケープ・アロケーション済み）ではなく `Cow<str>` や `&str` を返すことで不要なアロケーションを避けられる可能性があるが、quick-xmlの属性デコードAPI（バージョン依存）と合わせて確定させる。
 4. ~~名前空間（`r:id` 等）の解決方式~~ → **解決**: `quick_xml::NsReader` による名前空間URIベースの解決は採用せず、`"r:id"` のようなプレフィックス込みの文字列前方一致（`required_attr` へ渡す属性名にプレフィックスを含めて照合する）で簡略化する（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を反映）。Excel・Google スプレッドシート・LibreOffice・Apache POI等、主要な生成ツールがリレーションシップ名前空間のプレフィックスとして例外なく `r` を使用する実務上の慣行を踏まえ、要求仕様書1章が掲げる「軽量かつ高速」という方針を優先する。仮に別名プレフィックスで宣言された正当だが非常に稀なXMLが入力された場合でも、属性が「見つからない」扱いとなり `Error::MissingRequiredElement` として安全側（fail closed）に倒れるため、誤った値を静かに読み取ってしまうリスクはない。
 5. **`worksheet.xml` のような大容量ストリームに対する `Reader` の内部バッファサイズ**: quick-xmlはデフォルトでバッファを動的に拡張するが、要求仕様書が想定する「方眼紙Excel」規模のシートに対しては初期バッファサイズを明示的にチューニングする余地がある。[worksheet.md](worksheet.md) の設計・実装時にプロファイリング結果を踏まえて確定させる。
