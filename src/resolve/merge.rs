@@ -4,12 +4,34 @@
 use crate::error::Error;
 use crate::model::{MergedRegion, Sheet};
 
+/// Cap on the number of `<mergeCell>` entries accepted for a single sheet.
+///
+/// `validate_region` checks each new region against every region already
+/// accepted, so the whole batch costs O(N^2) in the number of regions —
+/// each `<mergeCell ref="A1:B1"/>` entry is only ~20-30 bytes, so the Zip
+/// Bomb byte-size cap (512 MiB by default) alone permits well over 10
+/// million of them, which is already an effectively-unbounded amount of
+/// O(N^2) work. This cap keeps the worst case bounded to roughly a few
+/// hundred milliseconds instead (security review
+/// `docs/security/code-review.md` Finding 1, which measured this scaling
+/// directly: N=40,000 took ~424ms, and N=194,000 was already extrapolated
+/// to ~10s). 20,000 leaves ample headroom over the tens-to-hundreds of
+/// merged regions a real-world sheet typically has.
+pub(crate) const MAX_MERGE_REGIONS: usize = 20_000;
+
 /// Validates `regions` while registering them into `sheet` in order.
-/// Rejects a reversed start/end coordinate pair or a range that overlaps
-/// one already validated, as `Error::InvalidMergedRange`. If even one range
-/// is invalid, nothing is registered (reject the whole batch — fail
-/// closed).
+/// Rejects a batch larger than [`MAX_MERGE_REGIONS`] as
+/// `Error::TooManyMergedRanges` before doing any O(N^2) work, a reversed
+/// start/end coordinate pair or a range that overlaps one already
+/// validated as `Error::InvalidMergedRange`. If even one range is invalid,
+/// nothing is registered (reject the whole batch — fail closed).
 pub(crate) fn resolve(sheet: &mut Sheet, regions: Vec<MergedRegion>) -> Result<(), Error> {
+    if regions.len() > MAX_MERGE_REGIONS {
+        return Err(Error::TooManyMergedRanges {
+            count: regions.len(),
+            limit: MAX_MERGE_REGIONS,
+        });
+    }
     let mut accepted: Vec<MergedRegion> = Vec::with_capacity(regions.len());
     for region in &regions {
         validate_region(region, &accepted)?;
@@ -138,6 +160,37 @@ mod tests {
     fn empty_region_list_is_a_no_op() {
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
         resolve(&mut sheet, vec![]).unwrap();
+    }
+
+    #[test]
+    fn region_count_at_the_limit_is_accepted() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let regions: Vec<MergedRegion> = (1..=MAX_MERGE_REGIONS as u32)
+            .map(|row| region((row, 1), (row, 2)))
+            .collect();
+        resolve(&mut sheet, regions).unwrap();
+    }
+
+    #[test]
+    fn region_count_over_the_limit_is_too_many_merged_ranges() {
+        // Security review docs/security/code-review.md Finding 1: without
+        // this cap, validating N regions costs O(N^2) (each new region is
+        // checked against every already-accepted one), so a file with a
+        // few hundred KB of `<mergeCell>` entries could block the caller
+        // for minutes. The identical/overlapping regions here are
+        // irrelevant — the count check must reject the batch before any
+        // O(N^2) validation work ever runs.
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let regions = vec![region((1, 1), (1, 1)); MAX_MERGE_REGIONS + 1];
+        let err = resolve(&mut sheet, regions).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::TooManyMergedRanges {
+                count,
+                limit
+            } if count == MAX_MERGE_REGIONS + 1 && limit == MAX_MERGE_REGIONS
+        ));
+        assert!(sheet.get(CellRef { row: 1, col: 1 }).is_none());
     }
 
     #[test]
