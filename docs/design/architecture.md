@@ -19,10 +19,10 @@ src/
 
   container/               # I/O & セキュリティガード
     mod.rs                # ZIP展開のエントリポイント、安全なファイル取得
-    sanitize.rs           # フェーズ2: Zip Bomb / Zip Slip 検知ロジック、XXE無効化設定
+    sanitize.rs           # フェーズ2: Zip Bomb / Zip Slip 検知ロジック
 
   parse/                    # XMLパース専用（quick-xml依存コードを集約）
-    mod.rs                # XMLパーサーの共通ヘルパー等
+    mod.rs                # XMLパーサーの共通ヘルパー、フェーズ2: XXE無効化設定（Reader初期化）
     relationships.rs      # フェーズ1: _rels 解析（ルーティングマップ構築用データのパース）
     workbook.rs           # workbook.xml のパース
     shared_strings.rs     # sharedStrings.xml のパース（SSTの構造化データ抽出）
@@ -57,11 +57,11 @@ src/
 
 ### `container/`
 
-ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブロック、XMLパース時の外部エンティティ展開無効化（XXE対策）を担う。XMLの中身の解釈（パース）は行わない。
+ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブロックを担う。XMLの中身の解釈（パース）は行わない。
 
 ### `parse/`
 
-`quick-xml` などXMLパースライブラリへの依存を集約する層。XML要素から純粋な構造体への詰め替えのみを行い、ビジネスロジック（結合セル解決・共有文字列解決など）は持たない。`parse/worksheet.rs` は行/セルデータと `<mergeCells>` 情報をストリームで順次送出する。
+`quick-xml` などXMLパースライブラリへの依存を集約する層。XML要素から純粋な構造体への詰め替えのみを行い、ビジネスロジック（結合セル解決・共有文字列解決など）は持たない。XMLパース時の外部エンティティ展開無効化（XXE対策）は quick-xml の `Reader` 初期化設定であるため、quick-xml依存を集約する本層（`parse/mod.rs`）の責務とする。`parse/worksheet.rs` は行/セルデータと `<mergeCells>` 情報をストリームで順次送出する。
 
 ### `model/`
 
@@ -88,3 +88,4 @@ ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブ�
 - 共有文字列解決の置き場所の明確化（`resolve/shared_strings.rs`）
 - `container` と `parse` の往復呼び出しに対するオーケストレーション層（`pipeline.rs`）の新設
 - 行単位破棄（`parse` 層の内部詳細）とファイル単位破棄（`pipeline.rs` が制御）の粒度分離
+- XXE無効化設定の置き場所を `container/sanitize.rs` から `parse/mod.rs` へ変更（ZIP層の脅威であるZip Bomb/Zip SlipとXMLパーサー設定であるXXE対策は別レイヤーの関心事であり、後者は「quick-xml依存を`parse/`に集約する」という設計方針（設計方針2）と一致させるべきという指摘のため）
