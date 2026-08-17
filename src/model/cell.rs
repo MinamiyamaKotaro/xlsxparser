@@ -18,10 +18,22 @@ pub struct CellRef {
 }
 
 impl CellRef {
+    /// Excel's real maximum row (1,048,576) and column (16,384, "XFD") —
+    /// ECMA-376 Part 1 §18.3.1.35 / ISO 29500. A coordinate beyond this can
+    /// never come from genuine Excel output; `from_a1` rejects it rather
+    /// than accepting it as "valid", since letting it through would
+    /// propagate an attacker-controlled bound into `Sheet::max_row`/
+    /// `max_col` and, from there, into `json.rs`'s `maxRow`/`maxCol`
+    /// output — which a downstream consumer might trust to size a dense
+    /// grid (security review `docs/security/code-review.md` Finding 2).
+    pub const MAX_ROW: u32 = 1_048_576;
+    pub const MAX_COL: u32 = 16_384;
+
     /// Builds from an "A1"-style string (uppercase column letters followed by
     /// a decimal row number, e.g. `"B12"`). Returns `Err` for anything else:
     /// lowercase letters, mixed/extra symbols, a missing letter or digit
-    /// part, or a row number that overflows `u32` or is `0`.
+    /// part, a row/column number that overflows `u32`, is `0`, or exceeds
+    /// Excel's real maximum ([`Self::MAX_ROW`]/[`Self::MAX_COL`]).
     pub fn from_a1(s: &str) -> Result<Self, Error> {
         let invalid = || Error::InvalidCellRef(s.to_string());
 
@@ -37,7 +49,7 @@ impl CellRef {
 
         let col = column_letters_to_number(letters).ok_or_else(invalid)?;
         let row: u32 = digits.parse().map_err(|_| invalid())?;
-        if row == 0 {
+        if row == 0 || row > Self::MAX_ROW || col > Self::MAX_COL {
             return Err(invalid());
         }
 
@@ -144,11 +156,26 @@ mod tests {
             "",                // empty
             "A0",              // row 0 is out of range
             "A10000000000000", // row overflows u32
+            "A1048577",        // row exceeds Excel's real maximum (1,048,576) by 1
+            "XFE1",            // column exceeds Excel's real maximum (16,384 = XFD) by 1
         ];
 
         for s in invalid {
             assert!(CellRef::from_a1(s).is_err(), "expected {s:?} to be invalid");
         }
+    }
+
+    #[test]
+    fn from_a1_rejects_row_or_col_far_beyond_excels_real_maximum() {
+        // Security review docs/security/code-review.md Finding 2: a
+        // coordinate like this parsed successfully before this bound was
+        // added, and its row/col flowed unclamped into Sheet::max_row/
+        // max_col and from there into json.rs's maxRow/maxCol output — a
+        // downstream consumer trusting those to size a dense grid could be
+        // driven into the same kind of allocation failure this project's
+        // own benchmarking observed calamine hit (README.md "Benchmarks").
+        let err = CellRef::from_a1("ZZZZZZ4294967294").unwrap_err();
+        assert!(matches!(err, Error::InvalidCellRef(_)));
     }
 
     #[test]

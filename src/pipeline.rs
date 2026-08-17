@@ -204,6 +204,24 @@ mod tests {
     }
 
     #[test]
+    fn cell_ref_beyond_excels_real_maximum_is_invalid_cell_ref() {
+        // Security review docs/security/code-review.md Finding 2, exercised
+        // end to end through real worksheet XML rather than a direct
+        // CellRef::from_a1 call.
+        let sheet_with_forged_coordinate: &[u8] =
+            br#"<worksheet><sheetData><row r="1"><c r="ZZZZZZ4294967294"><v>1</v></c></row></sheetData></worksheet>"#;
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            ("xl/worksheets/sheet1.xml", sheet_with_forged_coordinate),
+        ]);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::InvalidCellRef(_)));
+    }
+
+    #[test]
     fn package_absolute_relationship_target_resolves_like_openpyxl_output() {
         // openpyxl writes the worksheet relationship as a package-absolute
         // target (Target="/xl/worksheets/sheet1.xml") while leaving styles/
