@@ -3,6 +3,11 @@
 //! submodule live here; each submodule interprets one OOXML part's
 //! structure.
 
+mod relationships;
+
+#[allow(unused_imports)]
+pub(crate) use relationships::{parse_relationships, Relationship, RelationshipMap, TargetMode};
+
 use crate::error::Error;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
