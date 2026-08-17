@@ -6,5 +6,10 @@
 //! every module they depend on exists.
 
 mod error;
+mod model;
 
 pub use error::{Error, Result};
+pub use model::{
+    Cell, CellRef, CellValue, DateTimeValue, MergedRegion, ResolvedStyle, Sheet, SheetVisibility,
+    StyleId, Workbook,
+};
