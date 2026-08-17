@@ -49,6 +49,12 @@ src/
 
 ## モジュール責務の詳細
 
+### `lib.rs`
+
+クレートのルート。公開APIのエントリポイント（`parse_workbook(path) -> Result<Workbook>` 等）を定義するとともに、`container/` `parse/` `resolve/` `pipeline.rs` `json.rs` を非公開の `mod` として宣言してクレート内部実装として隠蔽し、`model/` の一部の型と `error::Error` のみを外部へ再エクスポートする。
+
+- 詳細設計: [lib.md](lib.md)
+
 ### `error.rs`
 
 クレート全体で共有する単一のエラー列挙型 `Error` を定義する。`model/` を含むクレート内の他モジュールに依存しない最も基底のリーフモジュールであり、`container/` `parse/` `model/` `resolve/` `pipeline.rs` `lib.rs` のほぼ全モジュールがこの型に依存する。

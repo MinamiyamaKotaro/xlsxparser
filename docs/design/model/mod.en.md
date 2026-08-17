@@ -24,7 +24,7 @@ pub use workbook::Workbook;
 pub use style::{ResolvedStyle, StyleId, StyleSheet};
 ```
 
-`DateTimeValue` (see open question 4 in [model/cell.md](cell.en.md)) is already defined inside `model/cell.rs`, so it is expected to be covered by the `cell::{..}` re-export (whether it needs an explicit re-export will be confirmed when `cell.rs` is implemented). Where `ResolvedStyle` / `StyleSheet` / `StyleId` live has now been settled by adding [`model/style.rs`](style.en.md) (resolves the former Open Question 1 — addresses PR #8 review feedback).
+`DateTimeValue` (see open question 4 in [model/cell.md](cell.en.md)) is already defined inside `model/cell.rs`, so it is included in the `cell::{..}` re-export. [`lib.md`](../lib.en.md)'s design settled that re-exporting `DateTimeValue` is mandatory, since `CellValue::DateTime` is part of the crate's public API (the concrete type itself remains a separate matter, handled by [model/cell.md Open Question 4](cell.en.md)). Where `ResolvedStyle` / `StyleSheet` / `StyleId` live has now been settled by adding [`model/style.rs`](style.en.md) (resolves the former Open Question 1 — addresses PR #8 review feedback).
 
 ## Dependencies
 
@@ -42,4 +42,4 @@ None. Since this file only contains type definitions and re-exports, it has no u
 ## Open Questions
 
 1. ~~Where `ResolvedStyle` is defined~~ → **Resolved**: newly added [`model/style.rs`](style.en.md) and defined it there (addresses PR #8 review feedback). `DateTimeValue` has always been a placeholder defined inside `model/cell.rs`; its location was never in question (its concrete type is a separate matter, handled by [model/cell.md Open Question 4](cell.en.md)).
-2. **Visibility scope**: Whether fields of `MergedRegion` or `CellRef` (`row` / `col`) should be made `pub` and exposed externally, or restricted to constructor-only access, is to be decided together with the public API design of `lib.rs` (a separate issue).
+2. ~~Visibility scope~~ → **Resolved**: [`lib.md`](../lib.en.md)'s design settled that `model/`'s main types themselves (`Workbook`/`Sheet`/`Cell`/`CellValue`/`CellRef`/`SheetVisibility`/`MergedRegion`/`ResolvedStyle`/`StyleId`/`DateTimeValue`) are re-exported outward. `MergedRegion`/`CellRef`'s `row`/`col` fields are carried forward as `pub`, unchanged from their existing type definitions (see [lib.md Open Question 4](../lib.en.md)). `StyleSheet` is never reachable from any public type's field (e.g. `Cell`'s), so it is not re-exported and stays crate-internal implementation (see [lib.md Dependencies](../lib.en.md)).
