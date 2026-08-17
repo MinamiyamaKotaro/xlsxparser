@@ -94,6 +94,15 @@ pub enum Error {
         reason: String,
     },
 
+    /// The number of `<mergeCell>` entries in a single sheet exceeded
+    /// `resolve::merge::MAX_MERGE_REGIONS`. `resolve::merge::resolve`'s
+    /// overlap check is O(N^2) in the number of regions, so N itself — not
+    /// just the byte size of the XML that declares it, which the Zip Bomb
+    /// cap already bounds — must be bounded independently (security review
+    /// `docs/security/code-review.md` Finding 1).
+    #[error("too many merged cell ranges in one sheet: {count} exceeds limit {limit}")]
+    TooManyMergedRanges { count: usize, limit: usize },
+
     // --- Phase 5: JSON generation ---
     /// JSON serialization failed (wraps the error `serde_json` returns).
     /// `source` is type-erased for the same reason as `XmlParse::source`. In
@@ -246,6 +255,15 @@ mod tests {
             }
             .to_string(),
             "invalid merged cell range A1:B2: overlaps existing range"
+        );
+
+        assert_eq!(
+            Error::TooManyMergedRanges {
+                count: 20_001,
+                limit: 20_000,
+            }
+            .to_string(),
+            "too many merged cell ranges in one sheet: 20001 exceeds limit 20000"
         );
 
         assert_eq!(

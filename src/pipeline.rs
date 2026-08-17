@@ -204,6 +204,24 @@ mod tests {
     }
 
     #[test]
+    fn cell_ref_beyond_excels_real_maximum_is_invalid_cell_ref() {
+        // Security review docs/security/code-review.md Finding 2, exercised
+        // end to end through real worksheet XML rather than a direct
+        // CellRef::from_a1 call.
+        let sheet_with_forged_coordinate: &[u8] =
+            br#"<worksheet><sheetData><row r="1"><c r="ZZZZZZ4294967294"><v>1</v></c></row></sheetData></worksheet>"#;
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            ("xl/worksheets/sheet1.xml", sheet_with_forged_coordinate),
+        ]);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::InvalidCellRef(_)));
+    }
+
+    #[test]
     fn package_absolute_relationship_target_resolves_like_openpyxl_output() {
         // openpyxl writes the worksheet relationship as a package-absolute
         // target (Target="/xl/worksheets/sheet1.xml") while leaving styles/
@@ -228,6 +246,39 @@ mod tests {
         ]);
         let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
         assert_eq!(workbook.sheets().len(), 1);
+    }
+
+    #[test]
+    fn excessive_merge_cell_count_is_too_many_merged_ranges() {
+        // Security review docs/security/code-review.md Finding 1: without
+        // resolve::merge's MAX_MERGE_REGIONS cap, a sheet with a large
+        // number of non-overlapping <mergeCell> entries costs O(N^2) to
+        // validate, letting a file of a few hundred KB block the caller
+        // for minutes. 20,001 (one over the cap) is used here rather than
+        // the exact constant to keep this an end-to-end, XML-driven check
+        // independent of resolve::merge's private module path; the
+        // boundary itself is covered precisely by
+        // resolve::merge::tests::region_count_over_the_limit_is_too_many_merged_ranges.
+        let mut merge_cells = String::from("<mergeCells count=\"20001\">");
+        for i in 1..=20_001u32 {
+            merge_cells.push_str(&format!("<mergeCell ref=\"A{i}:B{i}\"/>"));
+        }
+        merge_cells.push_str("</mergeCells>");
+        let sheet_with_excessive_merges =
+            format!("<worksheet><sheetData></sheetData>{merge_cells}</worksheet>");
+
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            (
+                "xl/worksheets/sheet1.xml",
+                sheet_with_excessive_merges.as_bytes(),
+            ),
+        ]);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::TooManyMergedRanges { .. }));
     }
 
     #[test]
