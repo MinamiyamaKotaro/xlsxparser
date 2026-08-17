@@ -5,12 +5,15 @@
 
 mod relationships;
 mod shared_strings;
+mod styles;
 mod workbook;
 
 #[allow(unused_imports)]
 pub(crate) use relationships::{parse_relationships, Relationship, RelationshipMap, TargetMode};
 #[allow(unused_imports)]
 pub(crate) use shared_strings::{parse_shared_strings, SharedStringTable};
+#[allow(unused_imports)]
+pub(crate) use styles::parse_styles;
 #[allow(unused_imports)]
 pub(crate) use workbook::{parse_workbook_xml, WorkbookSheetEntry};
 
