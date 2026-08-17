@@ -52,6 +52,12 @@ pub struct Sheet {
     /// コードブロック直後の注記でセル単位エイリアスマップから
     /// 置き換えた経緯を説明）。
     merged_regions: HashMap<CellRef, MergedRegion>,
+    /// 全結合範囲の`start`/`end`を包含する合成バウンディングボックス
+    /// （min_row, max_row, min_col, max_col）。結合が無ければ`None`。
+    /// `resolve_origin`がこれを先に確認し、範囲外の座標をO(1)で
+    /// 早期棄却できるようにする（PR #23 レビュー。コードブロック直後の
+    /// 注記参照）。
+    merge_bounds: Option<(u32, u32, u32, u32)>,
     /// 挿入されたセルのうち最大の行・列番号。セル挿入のたびに
     /// インクリメンタルに更新し、`<dimension>` 要素の値には依存しない。
     pub max_row: u32,
@@ -71,20 +77,25 @@ impl Sheet {
             visibility,
             cells: HashMap::new(),
             merged_regions: HashMap::new(),
+            merge_bounds: None,
             max_row: 0,
             max_col: 0,
         }
     }
 
     /// `r` が結合範囲内に収まる場合はその起点座標へ解決し、収まらない
-    /// 場合は `r` をそのまま返す。`merged_regions` への線形走査（結合が
-    /// 一件も無い場合は走査自体をスキップする、最も一般的なケース）。
-    /// 実運用のシートはシートの寸法によらず結合範囲の件数はせいぜい
-    /// 数千件程度に収まるため、この方式でも十分軽量である —
+    /// 場合は `r` をそのまま返す。まず `merge_bounds` により全結合範囲の
+    /// 合成バウンディングボックス外であればO(1)で棄却し、それ以外の場合は
+    /// `merged_regions` への線形走査へフォールバックする。実運用のシートは
+    /// シートの寸法によらず結合範囲の件数はせいぜい数千件程度に収まるため、
+    /// フォールバック走査自体も十分軽量である —
     /// `resolve::merge` の重複検証が既に採用している「想定件数が
     /// 小さい前提でのシンプルなO(N)」と同じ判断。
     fn resolve_origin(&self, r: CellRef) -> CellRef {
-        if self.merged_regions.is_empty() {
+        let Some((min_row, max_row, min_col, max_col)) = self.merge_bounds else {
+            return r;
+        };
+        if r.row < min_row || r.row > max_row || r.col < min_col || r.col > max_col {
             return r;
         }
         self.merged_regions
@@ -139,6 +150,15 @@ impl Sheet {
             self.insert_cell(region.start, Cell { value: None, style: None });
         }
         self.merged_regions.insert(region.start, region);
+        let (min_row, max_row, min_col, max_col) = self.merge_bounds.unwrap_or((
+            region.start.row, region.end.row, region.start.col, region.end.col,
+        ));
+        self.merge_bounds = Some((
+            min_row.min(region.start.row),
+            max_row.max(region.end.row),
+            min_col.min(region.start.col),
+            max_col.max(region.end.col),
+        ));
         self.max_row = self.max_row.max(region.end.row);
         self.max_col = self.max_col.max(region.end.col);
     }
@@ -163,6 +183,8 @@ impl Sheet {
 
 **実装時の修正: `merge_aliases` を廃止（ハングするバグ、`resolve/` 実装時に発覚）。** 上記コードブロックは当初、`insert_merge` が範囲内の全 `(row, col)` の組を走査して `merge_aliases: HashMap<CellRef, CellRef>` へエイリアスを1件ずつ登録するドラフトだった——これは O(row_span × col_span) のループである。Excelの実際の最大寸法いっぱいの正当なシート全体結合（`A1:XFD1048576`、約170億セル）に対してはこのコストが無制限に膨れ上がり、実際に `resolve/merge.rs` のテストを書いている最中にハングすることが判明した（実シートの最大寸法から構築した結合範囲で、テストスイートが2分のタイムアウトを大幅に超過した）。修正では `merge_aliases` を完全に廃止し、`get`/`get_mut`/`iter_cells` は代わりに `resolve_origin` の O(N) 幾何学的走査（N はシート上の結合範囲の件数であり、個々の結合範囲の面積ではない）でオンデマンドに所属を判定する。結合が無ければこの走査自体が完全にスキップされる。これにより `get` の計算量はO(1)からO(N)へ後退するが、Nは実運用では小さく保たれる（結合範囲がどれだけ巨大であっても、実際のスプレッドシートが持つ結合範囲の件数自体はせいぜい数千件程度）。一方でハングは完全に解消され、`insert_merge` 自体もO(1)になる。
 
+**追加の最適化: `merge_bounds`（PR #23 レビュー）。** `Sheet` はさらに `merge_bounds: Option<(u32, u32, u32, u32)>`——全結合範囲の `start`/`end` を包含する合成バウンディングボックス（行・列それぞれの最小値・最大値）——を保持し、`insert_merge` 内で `merged_regions` と合わせて更新する。`resolve_origin` はまずこれを確認し、合成バウンディングボックスの外側にある座標はO(N)の個別範囲走査に入る前にO(1)で棄却する。結合範囲が特定の領域に集中しているシートでは、大半のセルがその領域の外側にあるため、この事前チェックにより一般的なケースを実質O(1)に戻せる。一方で、バウンディングボックス内だが個々のどの範囲にも属さない座標（2つの結合範囲の間の隙間など）については、O(N)のフォールバック走査が引き続き正しく機能することを回帰テスト `get_inside_bounding_box_but_outside_any_region_resolves_to_itself` で確認している。このバウンディングボックスは常に最もタイトな値とは限らない保守的な上限である点に注意: 同じ起点セルへの `insert_merge` の上書きでより小さい範囲に置き換わっても、古い（より大きい）境界は縮小されない。これはまれなケースでO(1)早期棄却の機会を1回逃すだけであり、正当性には影響しない——バウンディングボックスチェックが座標を棄却しない限り、最終的な判定は常にO(N)の全走査が担うため。
+
 ## 依存関係
 
 - 依存先: [`model/cell.rs`](cell.md)（`Cell`, `CellRef`）
@@ -185,6 +207,7 @@ impl Sheet {
 - **`insert_merge` で仮想座標になる前に `insert_cell` で `cells` に既存エントリがあった座標も、`iter_cells` から正しく除外されることの確認** — `parse/worksheet.rs` が結合範囲内（後に起点でないと判明する座標、例: 罫線のみのスタイル）に `<c>` 要素をストリームするケース（[PR #20 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/20#pullrequestreview-4949786605)で追加した回帰テスト観点。`iter_cells` にこのフィルタが無いと、このセルが起点セルの重複として `json.rs` の出力に漏れ出る）
 - **`insert_merge` にシート全体規模の結合範囲（例: Excelの実際の最大寸法 `A1:XFD1048576`）を渡した場合、ハングせずほぼ一定時間で登録が完了することの確認**（上記コードブロック直後で説明した `merge_aliases` 廃止の回帰テスト）
 - **どの結合範囲にも属さない座標が自分自身へ解決され、シート上の他の無関係な結合範囲の存在に影響されないことの確認**（`resolve_origin` の幾何学的包含判定に対する正しさの検証）
+- **合成バウンディングボックス `merge_bounds` の内側だが個々のどの結合範囲にも属さない座標（2つの結合範囲の間の隙間）が正しく自分自身へ解決されることの確認**（PR #23 レビューで追加した `merge_bounds` のO(1)事前チェックに特化した正当性テスト。バウンディングボックスが座標を棄却しなかった場合でも、最終判定を担うO(N)の全走査を迂回してはならない）
 - `insert_cell` 呼び出しのたびに `max_row` / `max_col` が正しく更新されることの確認（`<dimension>` を信頼せずに算出できることの確認）
 - **値も書式も持たない結合範囲に対して `insert_merge` を呼んだ場合、起点セルが空セルとして `cells` に挿入され、`iter_cells` / `merged_region_at` から正しく参照できることの確認**（PR #5 レビューで追加した回帰テスト観点）
 - **実データが `A1` のみだが `A1:C3` として結合されているケースで、`insert_merge` 呼び出し後に `max_row == 3` かつ `max_col == 3` となることの確認**（結合範囲の終点がシートの実質的な使用範囲を広げるケースの回帰テスト）

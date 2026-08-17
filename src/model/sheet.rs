@@ -54,6 +54,17 @@ pub struct Sheet {
     /// cells) — and was found to hang in practice (see the regression test
     /// `insert_merge_on_huge_region_does_not_hang`).
     merged_regions: HashMap<CellRef, MergedRegion>,
+    /// Union bounding box (min_row, max_row, min_col, max_col) across every
+    /// merged region's `start`/`end`. `None` when there are no merges. Lets
+    /// `resolve_origin` reject a coordinate clearly outside every merge in
+    /// O(1), before falling back to the O(N) per-region scan — most cells
+    /// on a sheet with merges concentrated in one area are outside all of
+    /// them (PR #23 review). May end up looser than the tightest possible
+    /// box after a same-origin `insert_merge` overwrite shrinks a region
+    /// (the old, larger bound is never retracted); that only costs a missed
+    /// early exit, never correctness, since the full scan below is still
+    /// authoritative.
+    merge_bounds: Option<(u32, u32, u32, u32)>,
     /// The largest row/column number among inserted cells. Updated
     /// incrementally on each cell insertion; does not depend on the
     /// `<dimension>` element's value.
@@ -74,20 +85,25 @@ impl Sheet {
             visibility,
             cells: HashMap::new(),
             merged_regions: HashMap::new(),
+            merge_bounds: None,
             max_row: 0,
             max_col: 0,
         }
     }
 
     /// Resolves `r` to a merged region's origin coordinate, if `r` falls
-    /// inside one; otherwise returns `r` unchanged. A linear scan over
-    /// `merged_regions` (skipped entirely when there are none, the common
-    /// case): real-world sheets have at most a few thousand merged regions
-    /// regardless of sheet dimensions, so this stays cheap in practice —
-    /// the same "simple O(N) is fine for expected-small N" tradeoff
-    /// `resolve::merge`'s overlap validation already makes.
+    /// inside one; otherwise returns `r` unchanged. First rejects `r` in
+    /// O(1) via `merge_bounds` if it falls outside every merge's combined
+    /// bounding box; otherwise falls back to a linear scan over
+    /// `merged_regions`. Real-world sheets have at most a few thousand
+    /// merged regions regardless of sheet dimensions, so even the fallback
+    /// scan stays cheap — the same "simple O(N) is fine for expected-small
+    /// N" tradeoff `resolve::merge`'s overlap validation already makes.
     fn resolve_origin(&self, r: CellRef) -> CellRef {
-        if self.merged_regions.is_empty() {
+        let Some((min_row, max_row, min_col, max_col)) = self.merge_bounds else {
+            return r;
+        };
+        if r.row < min_row || r.row > max_row || r.col < min_col || r.col > max_col {
             return r;
         }
         self.merged_regions
@@ -161,6 +177,18 @@ impl Sheet {
             );
         }
         self.merged_regions.insert(region.start, region);
+        let (min_row, max_row, min_col, max_col) = self.merge_bounds.unwrap_or((
+            region.start.row,
+            region.end.row,
+            region.start.col,
+            region.end.col,
+        ));
+        self.merge_bounds = Some((
+            min_row.min(region.start.row),
+            max_row.max(region.end.row),
+            min_col.min(region.start.col),
+            max_col.max(region.end.col),
+        ));
         self.max_row = self.max_row.max(region.end.row);
         self.max_col = self.max_col.max(region.end.col);
     }
@@ -438,6 +466,38 @@ mod tests {
         // itself rather than being swept into the unrelated A1:B2 region.
         assert_eq!(
             sheet.get(r(10, 10)),
+            Some(&Cell {
+                value: Some(crate::model::CellValue::Boolean(true)),
+                style: None,
+            })
+        );
+    }
+
+    #[test]
+    fn get_inside_bounding_box_but_outside_any_region_resolves_to_itself() {
+        // Two merges with a gap between them: their combined merge_bounds
+        // spans rows 1-10, but row 5 (inside the bounds, outside both
+        // regions) must still resolve to itself rather than being
+        // incorrectly swept into a region by the O(1) bounds pre-check.
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.insert_cell(
+            r(5, 1),
+            Cell {
+                value: Some(crate::model::CellValue::Boolean(true)),
+                style: None,
+            },
+        );
+        sheet.insert_merge(MergedRegion {
+            start: r(1, 1),
+            end: r(2, 1),
+        });
+        sheet.insert_merge(MergedRegion {
+            start: r(9, 1),
+            end: r(10, 1),
+        });
+
+        assert_eq!(
+            sheet.get(r(5, 1)),
             Some(&Cell {
                 value: Some(crate::model::CellValue::Boolean(true)),
                 style: None,
