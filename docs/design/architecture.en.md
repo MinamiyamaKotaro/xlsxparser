@@ -36,6 +36,7 @@ src/
     cell.rs               # CellValue, Cell, CellRef (A1 notation <-> coordinates)
     sheet.rs              # Sparse matrix Sheet (HashMap<(u32, u32), Cell>)
     workbook.rs           # Resolved Workbook model
+    style.rs              # ResolvedStyle / StyleSheet / StyleId (shared vocabulary between parse/styles.rs and resolve/style.rs; added per PR #8 review feedback)
 
   resolve/                  # Phase 4: analysis and deferred resolution (I/O-independent, operates only on model::Sheet)
     mod.rs                # Entry point for Phase 4 resolution processing
@@ -81,7 +82,7 @@ The layer that aggregates dependencies on XML parsing libraries such as `quick-x
 
 Defines pure Rust data structures such as `Cell` / `Sheet` / `Workbook`. Has no dependency on XML parsing or resolution logic. Optimizes memory usage via a sparse matrix (`HashMap<(row, col), Cell>`).
 
-- Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [mod.md](model/mod.en.md) / [cell.md](model/cell.en.md) / [sheet.md](model/sheet.en.md) / [workbook.md](model/workbook.en.md)
+- Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [mod.md](model/mod.en.md) / [cell.md](model/cell.en.md) / [sheet.md](model/sheet.en.md) / [workbook.md](model/workbook.en.md) / [style.md](model/style.en.md)
 
 ### `resolve/`
 
@@ -90,6 +91,8 @@ Responsible for Phase 4's analysis and deferred resolution. Since it has no depe
 - `shared_strings.rs`: resolves `t="s"` indices to the actual strings in the `SharedStringTable`.
 - `merge.rs`: after the stream completes, matches the merged-range list from `<mergeCells>` against the collected cell data, mapping alias references from virtual cell coordinates to their origin cell.
 - `style.rs`: applies resolved formatting information from `styles.xml` to cells.
+
+- Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [mod.md](resolve/mod.en.md) / [shared_strings.md](resolve/shared_strings.en.md) / [merge.md](resolve/merge.en.md) / [style.md](resolve/style.en.md)
 
 ### `json.rs`
 
