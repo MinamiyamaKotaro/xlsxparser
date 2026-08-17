@@ -78,6 +78,8 @@ The layer that aggregates dependencies on XML parsing libraries such as `quick-x
 
 `parse/worksheet.rs` streams out row/cell data and `<mergeCells>` information sequentially.
 
+- Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [mod.md](parse/mod.en.md) / [relationships.md](parse/relationships.en.md) / [workbook.md](parse/workbook.en.md) / [shared_strings.md](parse/shared_strings.en.md) / [styles.md](parse/styles.en.md) / [worksheet.md](parse/worksheet.en.md)
+
 ### `model/`
 
 Defines pure Rust data structures such as `Cell` / `Sheet` / `Workbook`. Has no dependency on XML parsing or resolution logic. Optimizes memory usage via a sparse matrix (`HashMap<(row, col), Cell>`).

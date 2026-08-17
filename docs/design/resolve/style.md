@@ -98,6 +98,6 @@ fn serial_to_date_time(serial: f64) -> Option<DateTimeValue> {
 ## 未決事項 / オープンクエスチョン
 
 1. ~~`ResolvedStyle` / `StyleSheet` / `StyleId` の最終的な配置場所~~ → **解決**: [`model/style.rs`](../model/style.md) を新設し、そちらに定義する。`parse/styles.rs`（構築主体）と `resolve/style.rs`（適用主体）の双方が `model/` にのみ依存する構造とすることで、レイヤー間の独立性を保つ（PR #8 レビュー指摘を反映）。
-2. **日付/時刻書式の判定ロジックの置き場所**: 本ファイルは `ResolvedStyle.is_date_time` を既に判定済みの値として受け取る設計としたが、OOXMLの numFmt判定（組み込みID 14〜22等の範囲判定、カスタムフォーマット文字列のパターンマッチ）を `parse/styles.rs` 側で行うか、`resolve/style.rs` 側に判定ロジックそのものを持ち込むか（`ResolvedStyle` が生のフォーマット文字列を保持し、本ファイルが解釈する）は未決定。前者はarchitecture.md 設計方針2（`resolve/` はI/O非依存だが判定ロジック自体はドメイン知識でありどちらに置いても矛盾しない）を踏まえるとどちらでも成立するため、`parse/styles.rs` の設計時にあわせて確定させる。
+2. ~~日付/時刻書式の判定ロジックの置き場所~~ → **解決**: [`parse/styles.rs`](../parse/styles.md) 側で判定する（OOXMLの numFmt判定を含む）。本ファイルは引き続き `ResolvedStyle.is_date_time` を既に判定済みの値として受け取るのみで、判定ロジックそのものは持たない。判定ヒューリスティックの精度自体は [parse/styles.md オープンクエスチョン2](../parse/styles.md) として引き続き未解決。
 3. ~~`serial_to_date_time` の実装~~ → **一部解決**: 変換不能な値に対しては `Error` を返さず `None` を返し、呼び出し側（本ファイルの `resolve`）が `CellValue::Number` を維持するフォールバックとする方針を確定した（PR #8 レビュー指摘を反映）。ただし変換式そのもの（1900年うるう年バグの扱いを含む）は [model/cell.md オープンクエスチョン4](../model/cell.md) の `DateTimeValue` 型確定と合わせて未確定のまま。
 4. **フォント/塗りつぶし/罫線などの具体的なスタイル要素**: [model/style.md オープンクエスチョン1](../model/style.md) と同一の論点（未解決）。要求仕様書がセルスタイルとしてどこまでの要素をJSON出力に含める必要があるかは `json.rs` の設計、または要求仕様書自体の詳細化と合わせて確定させる。

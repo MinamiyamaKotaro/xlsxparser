@@ -74,6 +74,6 @@ pub(crate) fn resolve(
 
 ## 未決事項 / オープンクエスチョン
 
-1. **`SharedStringTable` の型・配置場所**: `parse/shared_strings.rs`（本Issueのスコープ外）が未設計のため、`get(index) -> Option<&Arc<str>>` 相当のAPIを持つという前提のみで設計している。実際の型定義（`Vec<Arc<str>>` のラッパーか等）は当該モジュールの設計時に確定させる。
-2. **`parse/worksheet.rs` との不変条件の明文化**: 「`t="s"` セルを検出したら `PendingSharedString` の記録と空の `Cell`（`value: None`）の `insert_cell` を必ず対で行う」という契約は現状このファイルのコメントにのみ存在する。`parse/worksheet.rs` の設計時に、この契約をどちらのファイルのドキュメントに正として記載するかを確定させる。
-3. **数式セル（`t="str"`）とインラインストリング（`t="inlineStr"`）の解決タイミングの妥当性**: 責務・スコープで述べた「`parse/worksheet.rs` がストリーム中に直接 `CellValue::Text` を挿入する」という前提が本当に成立するか（例えば `Arc<str>` へのラップコストがストリーム処理を圧迫しないか）は、`parse/worksheet.rs` の設計・実装時に再検証する。
+1. ~~`SharedStringTable` の型・配置場所~~ → **解決**: [`parse/shared_strings.rs`](../parse/shared_strings.md) が `Vec<Arc<str>>` をラップした型として定義し、`get(index) -> Option<&Arc<str>>` / `len()` を提供する。
+2. ~~`parse/worksheet.rs` との不変条件の明文化~~ → **解決**: 「`t="s"` セルを検出したら `PendingSharedString` の記録と空の `Cell`（`value: None`）の `insert_cell` を必ず対で行う」という契約は [`parse/worksheet.rs`](../parse/worksheet.md) 側のドキュメントを正として記載する。
+3. ~~数式セル（`t="str"`）とインラインストリング（`t="inlineStr"`）の解決タイミングの妥当性~~ → **確認済み**: [`parse/worksheet.rs`](../parse/worksheet.md) の設計で、ストリーム中に直接 `CellValue::Text` へ解決する前提のまま設計を確定した。`Arc<str>` へのラップコストの実測は実装時のプロファイリングに委ねる。
