@@ -77,6 +77,19 @@ impl<R: Read + Seek> ZipContainer<R> {
     /// - The returned stream is wrapped in `BoundedReader`, so both the
     ///   per-entry cap (`max_entry_size`) and the archive-wide cumulative
     ///   cap (`max_total_size`) are already applied.
+    ///
+    /// Lookup is case-sensitive (`zip::ZipArchive::by_name`'s behavior),
+    /// whereas OPC part names (ECMA-376 Part 2) are formally
+    /// case-insensitive (ASCII case folding). In practice every real-world
+    /// producer (Excel, Google Sheets, LibreOffice, Apache POI) keeps entry
+    /// names and `.rels` `Target` references byte-identical, so this has not
+    /// caused an observed interop failure; staying case-sensitive keeps
+    /// `entry_names()`/`get_entry` simple and avoids allocating a
+    /// lowercased-name lookup table for every archive. If a non-conforming
+    /// producer is found in the wild, revisit by building a
+    /// `HashMap<String, String>` (lowercased name -> original name) once at
+    /// `open_reader` time, alongside the existing `validate_entry_path` pass
+    /// (PR #21 review).
     #[allow(dead_code)]
     pub fn get_entry(
         &mut self,
