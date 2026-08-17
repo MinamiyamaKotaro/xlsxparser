@@ -1,0 +1,363 @@
+//! Orchestrates Phases 1-4 of the pipeline: wires together `container/`,
+//! `parse/`, `resolve/`, and `model/` in call order, and controls resource
+//! lifetimes (see `docs/design/architecture.en.md` design principle 3).
+
+use crate::container::ZipContainer;
+use crate::error::Error;
+use crate::model::{Sheet, SheetVisibility, Workbook};
+use crate::parse::SharedStringTable;
+use crate::{parse, resolve};
+use std::io::{BufReader, Read, Seek};
+
+const WORKBOOK_RELS_PATH: &str = "xl/_rels/workbook.xml.rels";
+const WORKBOOK_PATH: &str = "xl/workbook.xml";
+const SHARED_STRINGS_REL_TYPE_SUFFIX: &str = "/relationships/sharedStrings";
+const STYLES_REL_TYPE_SUFFIX: &str = "/relationships/styles";
+
+/// One sheet's routing info, finalized once Phase 1 completes.
+struct SheetRoute {
+    name: String,
+    visibility: SheetVisibility,
+    /// A ZIP-entry-name-equivalent absolute path, ready to pass directly to
+    /// `container::get_entry`.
+    worksheet_path: String,
+}
+
+/// Runs Phases 1 through 4 end to end and returns the fully resolved
+/// `Workbook`. `lib.rs`'s public API (`parse_workbook`, etc. — Issue #15)
+/// calls this function. Generic over `Read + Seek` since it simply carries
+/// forward `container::ZipContainer::open_reader`'s constraint (reading the
+/// ZIP central directory requires a seekable input).
+#[allow(dead_code)]
+pub(crate) fn run<R: Read + Seek>(reader: R) -> Result<Workbook, Error> {
+    let mut container = ZipContainer::open_reader(reader)?;
+
+    // --- Phase 1: relationship resolution and building the routing plan ---
+    let rels_reader = container
+        .get_entry(WORKBOOK_RELS_PATH)?
+        .ok_or_else(|| Error::MissingRelationshipPart(WORKBOOK_RELS_PATH.to_string()))?;
+    let relationships =
+        parse::parse_relationships(BufReader::new(rels_reader), "xl", WORKBOOK_RELS_PATH)?;
+
+    let workbook_reader = container
+        .get_entry(WORKBOOK_PATH)?
+        .ok_or_else(|| Error::InvalidPackage(WORKBOOK_PATH.to_string()))?;
+    let sheet_entries = parse::parse_workbook_xml(BufReader::new(workbook_reader), WORKBOOK_PATH)?;
+
+    let mut routes = Vec::with_capacity(sheet_entries.len());
+    for entry in sheet_entries {
+        let rel = relationships
+            .get(&entry.r_id)
+            .ok_or_else(|| Error::DanglingRelationship {
+                r_id: entry.r_id.clone(),
+            })?;
+        routes.push(SheetRoute {
+            name: entry.name,
+            visibility: entry.visibility,
+            worksheet_path: rel.target.clone(),
+        });
+    }
+    let shared_strings_path = relationships
+        .values()
+        .find(|r| r.rel_type.ends_with(SHARED_STRINGS_REL_TYPE_SUFFIX))
+        .map(|r| r.target.clone());
+    // styles.xml is a mandatory part in OOXML, so its absence is Error::InvalidPackage.
+    let styles_path = relationships
+        .values()
+        .find(|r| r.rel_type.ends_with(STYLES_REL_TYPE_SUFFIX))
+        .map(|r| r.target.clone())
+        .ok_or_else(|| Error::InvalidPackage("styles relationship not found".to_string()))?;
+
+    // The reader used for the rels read, and the RelationshipMap, go out of
+    // scope and are dropped here (implements architecture.md's "dispose of
+    // the _rels scratch buffer at the end of Phase 1").
+    drop(relationships);
+
+    // --- Shared tables, built exactly once between Phases 1-3 ---
+    let shared_string_table = match shared_strings_path {
+        Some(path) => {
+            let reader = container
+                .get_entry(&path)?
+                .ok_or_else(|| Error::InvalidPackage(path.clone()))?;
+            parse::parse_shared_strings(BufReader::new(reader), &path)?
+        }
+        // sharedStrings.xml itself is an optional OOXML part (may be
+        // omitted for a workbook with no string cells at all).
+        None => SharedStringTable::default(),
+    };
+    let styles_reader = container
+        .get_entry(&styles_path)?
+        .ok_or_else(|| Error::InvalidPackage(styles_path.clone()))?;
+    let stylesheet = parse::parse_styles(BufReader::new(styles_reader), &styles_path)?;
+
+    // --- Per sheet: Phase 3 (streaming parse) -> Phase 4 (resolution) ---
+    let mut sheets = Vec::with_capacity(routes.len());
+    for route in routes {
+        let mut sheet = Sheet::new(route.name, route.visibility);
+        let reader = container.get_entry(&route.worksheet_path)?.ok_or_else(|| {
+            Error::DanglingRelationship {
+                r_id: route.worksheet_path.clone(),
+            }
+        })?;
+        let output =
+            parse::parse_worksheet(BufReader::new(reader), &route.worksheet_path, &mut sheet)?;
+        resolve::resolve_sheet(
+            &mut sheet,
+            &output.pending_shared_strings,
+            &shared_string_table,
+            &output.pending_styles,
+            &stylesheet,
+            output.merge_regions,
+        )?;
+        sheets.push(sheet);
+    }
+    // shared_string_table / stylesheet go out of scope and are dropped here
+    // (implements architecture.md's "dispose of SharedStringTable and
+    // StyleSheet once Phase 4 completes").
+
+    Ok(Workbook::new(sheets))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{CellRef, CellValue};
+    use std::io::{Cursor, Write};
+
+    fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for (name, data) in entries {
+                writer.start_file(*name, options).unwrap();
+                writer.write_all(data).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    const RELS_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"#;
+
+    const WORKBOOK_XML: &[u8] = br#"<?xml version="1.0"?>
+<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="Sheet1" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>"#;
+
+    const SHARED_STRINGS_XML: &[u8] = b"<sst><si><t>hello</t></si></sst>";
+
+    const STYLES_XML: &[u8] = br#"<styleSheet><cellXfs><xf numFmtId="0"/></cellXfs></styleSheet>"#;
+
+    const WORKSHEET_XML: &[u8] = br#"<worksheet><sheetData>
+<row r="1">
+  <c r="A1"><v>42</v></c>
+  <c r="B1" t="s"><v>0</v></c>
+</row>
+</sheetData>
+<mergeCells count="1"><mergeCell ref="C1:D1"/></mergeCells>
+</worksheet>"#;
+
+    fn minimal_xlsx() -> Vec<u8> {
+        build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            ("xl/worksheets/sheet1.xml", WORKSHEET_XML),
+        ])
+    }
+
+    #[test]
+    fn minimal_valid_xlsx_resolves_end_to_end() {
+        let workbook = run(Cursor::new(minimal_xlsx())).unwrap();
+
+        assert_eq!(workbook.sheets().len(), 1);
+        let sheet = &workbook.sheets()[0];
+        assert_eq!(sheet.name, "Sheet1");
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
+            Some(CellValue::Number(42.0))
+        );
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 2 }).unwrap().value,
+            Some(CellValue::Text(std::sync::Arc::from("hello")))
+        );
+        // The merged range C1:D1 makes D1 resolve to the same cell as C1.
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 3 }),
+            sheet.get(CellRef { row: 1, col: 4 })
+        );
+    }
+
+    #[test]
+    fn missing_workbook_rels_is_missing_relationship_part() {
+        let zip = build_zip(&[("xl/workbook.xml", WORKBOOK_XML)]);
+        let err = run(Cursor::new(zip)).unwrap_err();
+        assert!(matches!(err, Error::MissingRelationshipPart(_)));
+    }
+
+    #[test]
+    fn missing_workbook_xml_is_invalid_package() {
+        let zip = build_zip(&[("xl/_rels/workbook.xml.rels", RELS_XML)]);
+        let err = run(Cursor::new(zip)).unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
+    }
+
+    #[test]
+    fn dangling_sheet_relationship_is_dangling_relationship() {
+        let rels_without_sheet_rel: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"#;
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", rels_without_sheet_rel),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/styles.xml", STYLES_XML),
+        ]);
+        let err = run(Cursor::new(zip)).unwrap_err();
+        assert!(matches!(err, Error::DanglingRelationship { .. }));
+    }
+
+    #[test]
+    fn missing_styles_entity_is_invalid_package() {
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            // xl/styles.xml intentionally omitted, even though rels points to it.
+            ("xl/worksheets/sheet1.xml", WORKSHEET_XML),
+        ]);
+        let err = run(Cursor::new(zip)).unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
+    }
+
+    #[test]
+    fn missing_worksheet_entity_is_dangling_relationship() {
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            // xl/worksheets/sheet1.xml intentionally omitted.
+        ]);
+        let err = run(Cursor::new(zip)).unwrap_err();
+        assert!(matches!(err, Error::DanglingRelationship { .. }));
+    }
+
+    #[test]
+    fn missing_shared_strings_part_falls_back_to_empty_table() {
+        // No relationship of type .../relationships/sharedStrings at all —
+        // the genuine "this OOXML part is entirely absent" case. (Merely
+        // omitting the sharedStrings.xml *entry* while keeping a
+        // relationship that points to it is a different, dangling-part
+        // case that correctly errors as Error::InvalidPackage instead.)
+        let rels_without_shared_strings: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"#;
+        let workbook_no_strings: &[u8] = br#"<worksheet><sheetData>
+<row r="1"><c r="A1"><v>1</v></c></row>
+</sheetData></worksheet>"#;
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", rels_without_shared_strings),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/styles.xml", STYLES_XML),
+            ("xl/worksheets/sheet1.xml", workbook_no_strings),
+        ]);
+        let workbook = run(Cursor::new(zip)).unwrap();
+        assert_eq!(workbook.sheets().len(), 1);
+    }
+
+    #[test]
+    fn multiple_sheets_preserve_definition_order() {
+        let workbook_two_sheets: &[u8] = br#"<?xml version="1.0"?>
+<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="First" sheetId="1" r:id="rId1"/>
+    <sheet name="Second" sheetId="2" r:id="rId4"/>
+  </sheets>
+</workbook>"#;
+        let rels_two_sheets: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"#;
+        let blank_sheet: &[u8] = b"<worksheet><sheetData></sheetData></worksheet>";
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", rels_two_sheets),
+            ("xl/workbook.xml", workbook_two_sheets),
+            ("xl/styles.xml", STYLES_XML),
+            ("xl/worksheets/sheet1.xml", blank_sheet),
+            ("xl/worksheets/sheet2.xml", blank_sheet),
+        ]);
+        let workbook = run(Cursor::new(zip)).unwrap();
+        let names: Vec<&str> = workbook.sheets().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["First", "Second"]);
+    }
+
+    #[test]
+    fn second_sheet_failure_fails_the_whole_run() {
+        let workbook_two_sheets: &[u8] = br#"<?xml version="1.0"?>
+<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="First" sheetId="1" r:id="rId1"/>
+    <sheet name="Second" sheetId="2" r:id="rId4"/>
+  </sheets>
+</workbook>"#;
+        let rels_two_sheets: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"#;
+        let good_sheet: &[u8] = b"<worksheet><sheetData></sheetData></worksheet>";
+        // Missing `r` attribute on <c> makes Phase 3 fail for this sheet.
+        let broken_sheet: &[u8] =
+            br#"<worksheet><sheetData><row r="1"><c t="n"><v>1</v></c></row></sheetData></worksheet>"#;
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", rels_two_sheets),
+            ("xl/workbook.xml", workbook_two_sheets),
+            ("xl/styles.xml", STYLES_XML),
+            ("xl/worksheets/sheet1.xml", good_sheet),
+            ("xl/worksheets/sheet2.xml", broken_sheet),
+        ]);
+        let err = run(Cursor::new(zip)).unwrap_err();
+        assert!(matches!(err, Error::MissingRequiredElement { .. }));
+    }
+
+    #[test]
+    fn hidden_and_very_hidden_sheets_are_all_included() {
+        let workbook_hidden: &[u8] = br#"<?xml version="1.0"?>
+<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="Visible" sheetId="1" r:id="rId1"/>
+    <sheet name="Hidden" sheetId="2" r:id="rId4" state="hidden"/>
+    <sheet name="VeryHidden" sheetId="3" r:id="rId5" state="veryHidden"/>
+  </sheets>
+</workbook>"#;
+        let rels_hidden: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+  <Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet3.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>"#;
+        let blank_sheet: &[u8] = b"<worksheet><sheetData></sheetData></worksheet>";
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", rels_hidden),
+            ("xl/workbook.xml", workbook_hidden),
+            ("xl/styles.xml", STYLES_XML),
+            ("xl/worksheets/sheet1.xml", blank_sheet),
+            ("xl/worksheets/sheet2.xml", blank_sheet),
+            ("xl/worksheets/sheet3.xml", blank_sheet),
+        ]);
+        let workbook = run(Cursor::new(zip)).unwrap();
+        assert_eq!(workbook.sheets().len(), 3);
+    }
+}

@@ -9,6 +9,7 @@ mod container;
 mod error;
 mod model;
 mod parse;
+mod pipeline;
 mod resolve;
 
 pub use error::{Error, Result};
