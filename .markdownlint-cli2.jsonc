@@ -1,0 +1,8 @@
+{
+  "config": {
+    "default": true,
+    // 日本語の文章は英単語のような折り返し単位を持たないため、行長制限は無効化する
+    "MD013": false
+  },
+  "globs": ["docs/**/*.md", "README.md"]
+}

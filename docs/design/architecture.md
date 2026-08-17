@@ -11,7 +11,7 @@ Issue [#1](https://github.com/MinamiyamaKotaro/xlsxparser/issues/1) での議論
 
 ## ディレクトリ構成
 
-```
+```text
 src/
   lib.rs                  # 公開APIのエントリポイント (例: parse_workbook(path) -> Result<Workbook>)
   error.rs                # ライブラリ全体の共通エラー定義
@@ -47,6 +47,7 @@ src/
 ## モジュール責務の詳細
 
 ### `pipeline.rs`
+
 `ZipContainer` を所有し、各フェーズの実行順序（`container` からストリームを借りて `parse` へ渡し、結果を `resolve` で解決して `json.rs` でシリアライズする）とリソース破棄タイミングを制御する。
 
 - フェーズ1完了時（ルーティングマップ構築後）に `_rels` の一時バッファを破棄する。
@@ -54,15 +55,19 @@ src/
 - 行単位のXMLノード破棄（フェーズ3）は `parse/worksheet.rs` 内部の実装詳細であり、`pipeline.rs` はこれを制御しない。ファイル/データ構造単位の破棄のみを担う。
 
 ### `container/`
+
 ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブロック、XMLパース時の外部エンティティ展開無効化（XXE対策）を担う。XMLの中身の解釈（パース）は行わない。
 
 ### `parse/`
+
 `quick-xml` などXMLパースライブラリへの依存を集約する層。XML要素から純粋な構造体への詰め替えのみを行い、ビジネスロジック（結合セル解決・共有文字列解決など）は持たない。`parse/worksheet.rs` は行/セルデータと `<mergeCells>` 情報をストリームで順次送出する。
 
 ### `model/`
+
 `Cell` / `Sheet` / `Workbook` などの純粋なRustデータ構造を定義する。XMLパースや解決ロジックへの依存を持たない。疎行列（`HashMap<(row, col), Cell>`）によりメモリを最適化する。
 
 ### `resolve/`
+
 フェーズ4の分析・遅延解決を担う。I/OやXML構造に依存しないため、`model::Sheet` などメモリ上のデータのみを用いてユニットテストできる。
 
 - `shared_strings.rs`: `t="s"` のインデックスを `SharedStringTable` の実文字列に解決する。
@@ -70,6 +75,7 @@ ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブ�
 - `style.rs`: `styles.xml` から解決済みの書式情報をセルに適用する。
 
 ### `json.rs`
+
 分析・解決が完了したデータモデルを、`row_span` / `col_span` などフロントエンド描画に必要な属性を含むJSONへシリアライズする。
 
 ## 議論の経緯
