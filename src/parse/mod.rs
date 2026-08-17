@@ -4,10 +4,13 @@
 //! structure.
 
 mod relationships;
+mod shared_strings;
 mod workbook;
 
 #[allow(unused_imports)]
 pub(crate) use relationships::{parse_relationships, Relationship, RelationshipMap, TargetMode};
+#[allow(unused_imports)]
+pub(crate) use shared_strings::{parse_shared_strings, SharedStringTable};
 #[allow(unused_imports)]
 pub(crate) use workbook::{parse_workbook_xml, WorkbookSheetEntry};
 
@@ -181,16 +184,38 @@ pub(crate) fn concat_rich_text<R: BufRead>(
             Event::End(e) if e.local_name().as_ref() == b"rPr" => skip_depth -= 1,
             Event::End(e) if e.local_name().as_ref() == b"rPh" => skip_depth -= 1,
             Event::Text(e) if skip_depth == 0 => {
+                // Plain text content only: quick-xml 0.41 tokenizes any
+                // `&...;` reference within content as a separate
+                // `Event::GeneralRef`, never leaving escaped syntax inside
+                // `Event::Text` for `.decode()` to unescape.
                 let decoded = e.decode().map_err(|err| Error::XmlParse {
                     path: path.to_string(),
                     source: Box::new(err),
                 })?;
-                let unescaped =
-                    quick_xml::escape::unescape(&decoded).map_err(|err| Error::XmlParse {
-                        path: path.to_string(),
-                        source: Box::new(err),
-                    })?;
-                text.push_str(&unescaped);
+                text.push_str(&decoded);
+            }
+            // `&#x...;`/`&#...;` (character references) or `&amp;`/`&lt;`/etc.
+            // (the 5 predefined XML entities — the only ones that can occur
+            // without a DTD, which `read_event` already rejects outright).
+            Event::GeneralRef(e) if skip_depth == 0 => {
+                match e.resolve_char_ref().map_err(|err| Error::XmlParse {
+                    path: path.to_string(),
+                    source: Box::new(err),
+                })? {
+                    Some(ch) => text.push(ch),
+                    None => {
+                        let decoded = e.decode().map_err(|err| Error::XmlParse {
+                            path: path.to_string(),
+                            source: Box::new(err),
+                        })?;
+                        let resolved = quick_xml::escape::resolve_predefined_entity(&decoded)
+                            .ok_or_else(|| Error::XmlParse {
+                                path: path.to_string(),
+                                source: format!("unknown XML entity reference: &{decoded};").into(),
+                            })?;
+                        text.push_str(resolved);
+                    }
+                }
             }
             Event::End(e)
                 if e.local_name().as_ref() == b"si" || e.local_name().as_ref() == b"is" =>

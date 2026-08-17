@@ -165,9 +165,26 @@ pub(crate) fn concat_rich_text<R: BufRead>(
             Event::Start(e) if e.local_name().as_ref() == b"rPr" || e.local_name().as_ref() == b"rPh" => skip_depth += 1,
             Event::End(e) if e.local_name().as_ref() == b"rPr" || e.local_name().as_ref() == b"rPh" => skip_depth -= 1,
             Event::Text(e) if skip_depth == 0 => {
+                // No entity syntax survives into Text content in quick-xml
+                // 0.41 — see Open Question 1 — so only charset decoding is
+                // needed here.
                 let decoded = e.decode().map_err(|err| Error::XmlParse { path: path.to_string(), source: Box::new(err) })?;
-                let unescaped = quick_xml::escape::unescape(&decoded).map_err(|err| Error::XmlParse { path: path.to_string(), source: Box::new(err) })?;
-                text.push_str(&unescaped);
+                text.push_str(&decoded);
+            }
+            // `&#x...;`/`&#...;` or one of the 5 predefined XML entities
+            // (`&amp;`/`&lt;`/`&gt;`/`&apos;`/`&quot;`) — the only entities
+            // that can legally appear without a DTD, which `read_event`
+            // already rejects.
+            Event::GeneralRef(e) if skip_depth == 0 => {
+                match e.resolve_char_ref().map_err(|err| Error::XmlParse { path: path.to_string(), source: Box::new(err) })? {
+                    Some(ch) => text.push(ch),
+                    None => {
+                        let decoded = e.decode().map_err(|err| Error::XmlParse { path: path.to_string(), source: Box::new(err) })?;
+                        let resolved = quick_xml::escape::resolve_predefined_entity(&decoded)
+                            .ok_or_else(|| Error::XmlParse { path: path.to_string(), source: format!("unknown XML entity reference: &{decoded};").into() })?;
+                        text.push_str(resolved);
+                    }
+                }
             }
             Event::End(e) if e.local_name().as_ref() == b"si" || e.local_name().as_ref() == b"is" => break,
             Event::Eof => return Err(Error::MissingRequiredElement { path: path.to_string(), name: "si/is closing tag" }),
@@ -211,7 +228,7 @@ pub(crate) fn concat_rich_text<R: BufRead>(
 
 1. ~~Finalizing the quick-xml version and `Reader` configuration API~~ → **Resolved**: quick-xml 0.41. `Reader::config_mut().trim_text(false)` matches the draft exactly. Two API changes from the draft, both surfaced by the compiler as deprecation/missing-method errors rather than silent behavior differences:
    - `Attribute::unescape_value()` is deprecated in favor of `Attribute::normalized_value(XmlVersion::Implicit1_0)`, used by `required_attr`. It performs the same decode+entity-unescape+AttValue-normalization as the old method.
-   - `BytesText` no longer has an `unescape()` method at all; text-event content now requires two explicit steps — `.decode()` (charset → UTF-8) then the free function `quick_xml::escape::unescape(&decoded)` (entity resolution) — used by `concat_rich_text`.
+   - `BytesText` no longer has an `unescape()` method at all. More importantly, in 0.41 a `&...;` reference (character reference or the 5 predefined XML entities) is no longer embedded inside the surrounding `Event::Text`'s raw content for a caller to unescape — the tokenizer splits it out as its own interleaved `Event::GeneralRef(BytesRef)` event. `concat_rich_text` (the only caller that needs to reconstruct entity-bearing text) therefore handles both: `Event::Text` content only ever needs `.decode()` (no entities left to unescape), and `Event::GeneralRef` is resolved via `BytesRef::resolve_char_ref()` (numeric refs) falling back to `quick_xml::escape::resolve_predefined_entity()` (named refs — the only ones that can legally occur, since `read_event` already rejects any DOCTYPE that could define a custom entity). Discovered by a failing test (`rPh` furigana case using `&#x...;` numeric escapes) rather than a compiler error, since `Event::Text` still compiled and ran, just silently omitted the referenced characters.
 
    `read_event`'s XXE mitigation (unconditionally rejecting `Event::DocType`) was unaffected by either change, confirming the independence this open question anticipated (reflects [the security review](../../security/design-review.en.md) Finding 1): the `Event` enum's shape (the existence of the `DocType` variant) stayed stable across the version bump.
 2. ~~Where the XXE-non-applicability test lives~~ → **Resolved**: centralized in this file's unit tests (reflects the [PR #9 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)). Placing it alongside where `read_event` is defined lets it directly verify the core of the mitigation — that `Event::DocType` is reliably detected and rejected — without repeating it in individual `parse/*.rs` files.

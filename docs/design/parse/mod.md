@@ -173,7 +173,7 @@ pub(crate) fn concat_rich_text<R: BufRead>(
 
 1. ~~quick-xmlのバージョン選定と `Reader` 設定APIの確定~~ → **解決**: quick-xml 0.41を採用。`Reader::config_mut().trim_text(false)` はドラフト通り。ドラフトからのAPI差分は2点（コンパイルエラー/非推奨警告として顕在化、実装時に修正）:
    - `Attribute::unescape_value()` は非推奨化されており、`Attribute::normalized_value(XmlVersion::Implicit1_0)` を用いる（`required_attr` で使用）。デコード・実体アンエスケープ・AttValue正規化を単一呼び出しで行う点は旧APIと同等
-   - `BytesText` は `unescape()` メソッドを持たなくなった。テキストイベントの内容は `.decode()`（文字コード→UTF-8）した上でフリー関数 `quick_xml::escape::unescape(&decoded)`（実体解決）を別途呼ぶ2段階が必要（`concat_rich_text` で使用）
+   - `BytesText` は `unescape()` メソッドを持たなくなった。さらに重要な変更として、0.41では `&...;` 参照（文字参照・XML定義済み実体）が周囲の `Event::Text` の生データに埋め込まれなくなり、トークナイザが独立した `Event::GeneralRef(BytesRef)` として分離して出力するようになった。そのため `concat_rich_text`（実体を含むテキストを再構成する唯一の呼び出し元）は両方を処理する: `Event::Text` は `.decode()` のみで済む（アンエスケープすべき実体がもう残っていないため）一方、`Event::GeneralRef` は `BytesRef::resolve_char_ref()`（数値参照）、フォールバックで `quick_xml::escape::resolve_predefined_entity()`（名前付き参照。DOCTYPEを`read_event`が既に拒否しているためカスタム実体は原理上存在せず、正当に出現しうるのはこれらのみ）で解決する。この変更はコンパイルエラーではなく、テスト失敗（`&#x...;` 形式の数値文字参照を使う`rPh`ふりがなのテストケース）で発覚した — `Event::Text` はそのままコンパイル・実行でき、参照先の文字が黙って欠落するだけだったため。
 
    `read_event` によるXXE対策（`Event::DocType` の無条件拒否）はこれらのAPI変更の影響を受けず、このオープンクエスチョンが想定していた独立性が実装でも確認された（[セキュリティレビュー](../../security/design-review.md) Finding 1を反映）。
 2. ~~XXE非該当の実証テストの置き場所~~ → **解決**: 本ファイルのユニットテストへ集約する（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を反映）。`read_event` が定義された箇所と同一ファイルに置くことで、対策の核心（`Event::DocType` を確実に検知・拒否すること）を直接検証できる。個々の `parse/*.rs` 側で重ねて実施しない。
