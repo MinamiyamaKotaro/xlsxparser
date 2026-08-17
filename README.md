@@ -17,7 +17,7 @@ frontend or another system.
 Design stage — the requirement spec is finalized, and a detailed,
 module-by-module design has been completed for every file in `src/`
 (mirrored 1:1 under `docs/design/`). Implementation has not started yet;
-[src/](src/) is still empty.
+`src/` is still empty (and thus not yet tracked in this repository).
 
 - [docs/requirement/requirements.md](docs/requirement/requirements.md)
   (Japanese) — the functional requirements and the 5-phase pipeline summarized below.
