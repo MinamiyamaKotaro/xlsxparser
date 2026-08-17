@@ -25,8 +25,12 @@ pub struct MergedRegion {
 }
 
 impl MergedRegion {
-    pub fn row_span(&self) -> u32 { self.end.row - self.start.row + 1 }
-    pub fn col_span(&self) -> u32 { self.end.col - self.start.col + 1 }
+    // `start <= end` is a precondition enforced by the caller
+    // (`resolve/merge.rs`), not by this type; `row_span`/`col_span` assert it
+    // (debug-only) rather than silently underflowing `u32` in release builds
+    // (finalized at implementation time — PR #20 review).
+    pub fn row_span(&self) -> u32 { debug_assert!(self.start.row <= self.end.row); self.end.row - self.start.row + 1 }
+    pub fn col_span(&self) -> u32 { debug_assert!(self.start.col <= self.end.col); self.end.col - self.start.col + 1 }
 }
 
 /// A sheet's visibility (`workbook.xml`'s `<sheet state="...">`).
@@ -110,6 +114,8 @@ impl Sheet {
     /// like "the only real data is at A1, but it is merged as A1:C3" still expands
     /// the sheet's effective used range.
     pub(crate) fn insert_merge(&mut self, region: MergedRegion) {
+        debug_assert!(region.start.row <= region.end.row);
+        debug_assert!(region.start.col <= region.end.col);
         if !self.cells.contains_key(&region.start) {
             self.insert_cell(region.start, Cell { value: None, style: None });
         }
@@ -132,8 +138,17 @@ impl Sheet {
         self.merged_regions.get(&origin)
     }
 
-    /// An iterator over origin cells only (for JSON generation).
-    pub fn iter_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)>;
+    /// An iterator over origin cells only (for JSON generation). Filters out
+    /// any coordinate present in `merge_aliases`: `parse/worksheet.rs`
+    /// inserts a `Cell` for every `<c>` element it streams, including ones
+    /// inside a merged range that later turn out not to be the origin (e.g.
+    /// a virtual cell carrying only border styling), so `cells` cannot be
+    /// assumed to hold origin cells exclusively (fixed at implementation
+    /// time — PR #20 review; `cells.iter()` without this filter would leak
+    /// such virtual cells into `json.rs`'s output as duplicates).
+    pub fn iter_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
+        self.cells.iter().filter(|(r, _)| !self.merge_aliases.contains_key(r)).map(|(&r, c)| (r, c))
+    }
 }
 ```
 
@@ -156,6 +171,7 @@ The `cells` / `merge_aliases` / `merged_regions` fields themselves stay fully pr
 - Boundary-value tests for `MergedRegion::row_span` / `col_span` (a 1x1 range, a large range)
 - Verifying that `merged_region_at` retrieves the corresponding `MergedRegion` from an origin cell coordinate in O(1) (including behavior on a sheet with many merged regions)
 - Verifying that `iter_cells` returns only origin cells and never includes virtual coordinates
+- **Verifying that `iter_cells` still excludes a coordinate that already had a `cells` entry (via `insert_cell`) before `insert_merge` made it a virtual/alias coordinate** — the case where `parse/worksheet.rs` streamed a `<c>` element (e.g. border-only styling) for a cell inside a merged range that later turns out not to be the origin (a regression-test point added following the [PR #20 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/20#pullrequestreview-4949786605); without the `merge_aliases` filter in `iter_cells`, such a cell would leak into `json.rs`'s output as a duplicate of the origin)
 - Verifying that `max_row` / `max_col` are updated correctly on every `insert_cell` call (confirming they can be computed without trusting `<dimension>`)
 - **Verifying that calling `insert_merge` on a range with neither value nor formatting inserts a blank placeholder at the origin cell, and that it is then correctly retrievable via `iter_cells` / `merged_region_at`** (a regression-test point added following the [PR #5 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948259819))
 - **Verifying that when the only real data is at `A1`, but it is merged as `A1:C3`, calling `insert_merge` results in `max_row == 3` and `max_col == 3`** (regression test for the case where a merge region's end coordinate expands the sheet's effective used range)

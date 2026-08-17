@@ -14,11 +14,17 @@ pub struct MergedRegion {
 }
 
 impl MergedRegion {
+    /// Callers (`resolve/merge.rs`) are expected to validate that `start <=
+    /// end` before constructing a region; this is asserted (debug-only) so
+    /// a violation is caught during testing rather than silently
+    /// underflowing `u32` in release builds.
     pub fn row_span(&self) -> u32 {
+        debug_assert!(self.start.row <= self.end.row);
         self.end.row - self.start.row + 1
     }
 
     pub fn col_span(&self) -> u32 {
+        debug_assert!(self.start.col <= self.end.col);
         self.end.col - self.start.col + 1
     }
 }
@@ -115,6 +121,9 @@ impl Sheet {
     /// `resolve/merge.rs` (Issue #15) calls it.
     #[allow(dead_code)]
     pub(crate) fn insert_merge(&mut self, region: MergedRegion) {
+        debug_assert!(region.start.row <= region.end.row);
+        debug_assert!(region.start.col <= region.end.col);
+
         if !self.cells.contains_key(&region.start) {
             self.insert_cell(
                 region.start,
@@ -143,11 +152,18 @@ impl Sheet {
         self.merged_regions.get(&origin)
     }
 
-    /// An iterator over origin cells only (for JSON generation). Virtual
-    /// merge-alias coordinates are never present in `cells`, so no filtering
-    /// is needed here.
+    /// An iterator over origin cells only (for JSON generation). A
+    /// coordinate that is a merge alias is excluded even if `cells` holds an
+    /// entry for it: `parse/worksheet.rs` inserts a `Cell` for every `<c>`
+    /// element it streams, including ones inside a merged range that later
+    /// turn out not to be the origin (e.g. a virtual cell carrying only
+    /// border styling), so `cells` cannot be assumed to hold origin cells
+    /// exclusively (PR #20 review).
     pub fn iter_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
-        self.cells.iter().map(|(&r, c)| (r, c))
+        self.cells
+            .iter()
+            .filter(|(r, _)| !self.merge_aliases.contains_key(r))
+            .map(|(&r, c)| (r, c))
     }
 }
 
@@ -245,6 +261,37 @@ mod tests {
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
         sheet.insert_cell(
             r(1, 1),
+            Cell {
+                value: None,
+                style: None,
+            },
+        );
+        sheet.insert_merge(MergedRegion {
+            start: r(1, 1),
+            end: r(2, 2),
+        });
+
+        let coords: Vec<CellRef> = sheet.iter_cells().map(|(coord, _)| coord).collect();
+        assert_eq!(coords, vec![r(1, 1)]);
+    }
+
+    #[test]
+    fn iter_cells_excludes_cells_pre_inserted_at_alias_coordinates() {
+        // parse/worksheet.rs streams a `<c>` element for every cell it
+        // encounters, including ones inside a merged range that later turn
+        // out not to be the origin (e.g. border-only styling on B2 within
+        // A1:B2). insert_merge must not let a pre-existing `cells` entry at
+        // an alias coordinate leak into iter_cells.
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.insert_cell(
+            r(1, 1),
+            Cell {
+                value: Some(crate::model::CellValue::Boolean(true)),
+                style: None,
+            },
+        );
+        sheet.insert_cell(
+            r(2, 2),
             Cell {
                 value: None,
                 style: None,
