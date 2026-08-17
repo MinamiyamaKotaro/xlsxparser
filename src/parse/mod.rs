@@ -4,9 +4,12 @@
 //! structure.
 
 mod relationships;
+mod workbook;
 
 #[allow(unused_imports)]
 pub(crate) use relationships::{parse_relationships, Relationship, RelationshipMap, TargetMode};
+#[allow(unused_imports)]
+pub(crate) use workbook::{parse_workbook_xml, WorkbookSheetEntry};
 
 use crate::error::Error;
 use quick_xml::events::{BytesStart, Event};
@@ -122,6 +125,33 @@ pub(crate) fn required_attr(
         path: path.to_string(),
         name,
     })
+}
+
+/// Like [`required_attr`], but returns `Ok(None)` rather than an error when
+/// `name` is absent (used for optional attributes such as `state`/
+/// `TargetMode`).
+#[allow(dead_code)]
+pub(crate) fn optional_attr(
+    start: &BytesStart<'_>,
+    path: &str,
+    name: &str,
+) -> Result<Option<String>, Error> {
+    for attr in start.attributes() {
+        let attr = attr.map_err(|err| Error::XmlParse {
+            path: path.to_string(),
+            source: Box::new(err),
+        })?;
+        if attr.key.as_ref() == name.as_bytes() {
+            let value = attr
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .map_err(|err| Error::XmlParse {
+                    path: path.to_string(),
+                    source: Box::new(err),
+                })?;
+            return Ok(Some(value.into_owned()));
+        }
+    }
+    Ok(None)
 }
 
 /// Shared helper that extracts text-only content from the rich-text run

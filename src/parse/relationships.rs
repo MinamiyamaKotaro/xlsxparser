@@ -3,8 +3,8 @@
 //! target part.
 
 use crate::error::Error;
-use crate::parse::{create_secure_reader, read_event, required_attr};
-use quick_xml::events::{BytesStart, Event};
+use crate::parse::{create_secure_reader, optional_attr, read_event, required_attr};
+use quick_xml::events::Event;
 use std::collections::HashMap;
 use std::io::BufRead;
 
@@ -92,27 +92,6 @@ pub(crate) fn parse_relationships(
     }
 
     Ok(map)
-}
-
-/// Like `required_attr`, but returns `Ok(None)` rather than an error when
-/// `name` is absent (used for optional attributes such as `TargetMode`).
-fn optional_attr(start: &BytesStart<'_>, path: &str, name: &str) -> Result<Option<String>, Error> {
-    for attr in start.attributes() {
-        let attr = attr.map_err(|err| Error::XmlParse {
-            path: path.to_string(),
-            source: Box::new(err),
-        })?;
-        if attr.key.as_ref() == name.as_bytes() {
-            let value = attr
-                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                .map_err(|err| Error::XmlParse {
-                    path: path.to_string(),
-                    source: Box::new(err),
-                })?;
-            return Ok(Some(value.into_owned()));
-        }
-    }
-    Ok(None)
 }
 
 /// Resolves the relative-path notation `target` from a rels part, anchored
