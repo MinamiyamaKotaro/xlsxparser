@@ -1,0 +1,83 @@
+# src/ アーキテクチャ設計
+
+Issue [#1](https://github.com/MinamiyamaKotaro/xlsxparser/issues/1) での議論を経て確定した `src/` ディレクトリ構成と、各モジュールの責務をまとめたドキュメント。要求仕様書（[requirements.md](../requirement/requirements.md)）が定義する5フェーズ・パイプラインに対応させている。
+
+## 設計方針
+
+1. **フェーズごとの責務分離**: rels解決 → サニタイズ → ストリームパース → 分析/遅延解決 → JSON生成という一方向パイプラインの各フェーズを、対応するモジュールに一対一で割り当てる。
+2. **I/O とドメインロジックの分離**: ZIP展開・XMLパースといった I/O 層（`container/` `parse/`）と、共有文字列解決・結合セル解決・スタイル適用といったドメインロジック（`resolve/`）を分離する。`resolve/` 配下は I/O やXML構造に一切依存せず、`model::Sheet` などメモリ上のデータ構造のみで完結させることでテスト容易性を確保する。
+3. **オーケストレーションの一元化**: `container` と `parse` は実際には「ZIPからバイト列を取得 → パース → 結果に基づき次のZIPエントリを取得」という形で密に往復する。この呼び出し順序とリソース（`ZipContainer` 等）のライフサイクル管理は `pipeline.rs` に一元化し、他のモジュールが互いを直接知らなくてよいようにする。
+4. **命名規則**: `package` は Cargo package と混同しやすいため使用せず、OPC (Open Packaging Conventions) の性質を表す `container` を用いる。
+
+## ディレクトリ構成
+
+```
+src/
+  lib.rs                  # 公開APIのエントリポイント (例: parse_workbook(path) -> Result<Workbook>)
+  error.rs                # ライブラリ全体の共通エラー定義
+  pipeline.rs              # フェーズ1〜5全体のオーケストレーター（I/Oとライフサイクル管理）
+
+  container/               # I/O & セキュリティガード
+    mod.rs                # ZIP展開のエントリポイント、安全なファイル取得
+    sanitize.rs           # フェーズ2: Zip Bomb / Zip Slip 検知ロジック、XXE無効化設定
+
+  parse/                    # XMLパース専用（quick-xml依存コードを集約）
+    mod.rs                # XMLパーサーの共通ヘルパー等
+    relationships.rs      # フェーズ1: _rels 解析（ルーティングマップ構築用データのパース）
+    workbook.rs           # workbook.xml のパース
+    shared_strings.rs     # sharedStrings.xml のパース（SSTの構造化データ抽出）
+    styles.rs             # styles.xml のパース（fonts/fills/borders/numFmts/cellXfs）
+    worksheet.rs          # フェーズ3: sheetX.xml の SAXストリームパース（行単位の破棄はここで完結）
+
+  model/                    # 純粋なドメインモデル（XMLパースや解決ロジックに依存しない）
+    mod.rs
+    cell.rs               # CellValue, Cell, CellRef (A1形式 <-> 座標)
+    sheet.rs              # 疎行列 Sheet (HashMap<(u32, u32), Cell>)
+    workbook.rs           # 解決済みの Workbook モデル
+
+  resolve/                  # フェーズ4: 分析と遅延解決（I/O非依存、model::Sheet のみで動作）
+    mod.rs                # フェーズ4の解決処理のエントリポイント
+    shared_strings.rs     # 共有文字列(SST)のインデックス解決
+    merge.rs              # 結合セルの遅延解決・エイリアス参照マッピング
+    style.rs              # セルスタイルの適用
+
+  json.rs                   # フェーズ5: row_span/col_span を含むJSONシリアライズ
+```
+
+## モジュール責務の詳細
+
+### `pipeline.rs`
+`ZipContainer` を所有し、各フェーズの実行順序（`container` からストリームを借りて `parse` へ渡し、結果を `resolve` で解決して `json.rs` でシリアライズする）とリソース破棄タイミングを制御する。
+
+- フェーズ1完了時（ルーティングマップ構築後）に `_rels` の一時バッファを破棄する。
+- フェーズ4完了時（共有文字列・スタイルの解決完了後）に `SharedStringTable` や `StyleSheet` を破棄する。
+- 行単位のXMLノード破棄（フェーズ3）は `parse/worksheet.rs` 内部の実装詳細であり、`pipeline.rs` はこれを制御しない。ファイル/データ構造単位の破棄のみを担う。
+
+### `container/`
+ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブロック、XMLパース時の外部エンティティ展開無効化（XXE対策）を担う。XMLの中身の解釈（パース）は行わない。
+
+### `parse/`
+`quick-xml` などXMLパースライブラリへの依存を集約する層。XML要素から純粋な構造体への詰め替えのみを行い、ビジネスロジック（結合セル解決・共有文字列解決など）は持たない。`parse/worksheet.rs` は行/セルデータと `<mergeCells>` 情報をストリームで順次送出する。
+
+### `model/`
+`Cell` / `Sheet` / `Workbook` などの純粋なRustデータ構造を定義する。XMLパースや解決ロジックへの依存を持たない。疎行列（`HashMap<(row, col), Cell>`）によりメモリを最適化する。
+
+### `resolve/`
+フェーズ4の分析・遅延解決を担う。I/OやXML構造に依存しないため、`model::Sheet` などメモリ上のデータのみを用いてユニットテストできる。
+
+- `shared_strings.rs`: `t="s"` のインデックスを `SharedStringTable` の実文字列に解決する。
+- `merge.rs`: ストリーム完了後に `<mergeCells>` の結合範囲リストとセルデータを突き合わせ、仮想セル座標から起点セルへのエイリアス参照をマッピングする。
+- `style.rs`: `styles.xml` から解決済みの書式情報をセルに適用する。
+
+### `json.rs`
+分析・解決が完了したデータモデルを、`row_span` / `col_span` などフロントエンド描画に必要な属性を含むJSONへシリアライズする。
+
+## 議論の経緯
+
+構成の妥当性検証および段階的な改訂の詳細は Issue [#1](https://github.com/MinamiyamaKotaro/xlsxparser/issues/1) のコメント履歴を参照。主な論点は以下の通り:
+
+- `package/` → `container/` への改名（Cargo package との命名衝突回避）
+- XMLパースコードの `parse/` への集約（技術スタックの隠蔽、テスト容易性の向上）
+- 共有文字列解決の置き場所の明確化（`resolve/shared_strings.rs`）
+- `container` と `parse` の往復呼び出しに対するオーケストレーション層（`pipeline.rs`）の新設
+- 行単位破棄（`parse` 層の内部詳細）とファイル単位破棄（`pipeline.rs` が制御）の粒度分離
