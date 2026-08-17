@@ -176,6 +176,13 @@ The structure now fully matches the spirit of architecture.md design policy 2: n
 - Verify that a malformed A1-notation `r` attribute or `mergeCell ref` attribute returns `Error::InvalidCellRef`
 - Verify that for a cell containing an `<f>` element (a formula cell), the `<f>` content is ignored and only `<v>` (the cached computed value) is used as the `Cell`'s value
 
+## Implementation Notes
+
+- **State machine shape**: implemented with flat `cur_*` local variables (`cur_ref: Option<CellRef>` doubling as "are we inside a `<c>`?", plus `cur_type`/`cur_style`/`cur_value_text`/`cur_inline`) rather than a dedicated state enum, since `<c>`'s children (`<v>`, `<f>`, `<is>`) never nest into each other. Each is freshly reset the moment a `<c>` start tag is seen and fully consumed (via a shared `flush_cell` helper) by its end tag (or immediately, for a self-closing `<c/>`), which is what actually guarantees no state leaks across cells or rows — not an explicit per-row reset.
+- **`build_cell` signature**: dropped the draft's unused `cell_ref`/`style_id` parameters (the draft itself discarded them via `let _ = (cell_ref, style_id);`) — the value/style split is fully handled by the caller (`flush_cell`), not `build_cell` itself.
+- **`<v>`/`<f>` text reading**: added a `read_leaf_text` helper (not in the draft) that reads a leaf element's text content — including `Event::GeneralRef` entities via [`parse/mod.rs`](mod.en.md)'s `push_general_ref`, the same helper `concat_rich_text` uses — since quick-xml 0.41 tokenizes entities separately from `Event::Text` (see [parse/mod.md Open Question 1](mod.en.md)).
+- **`flush_cell`'s insert decision**: a `<c>` is inserted only if it carries a style (`s` attribute), a value (`<v>`/`<is>` text), or is a `t="s"` reference (which will gain a value once resolved) — matching the sparse-matrix requirement that a fully blank `<c r="A1"/>` never gets instantiated.
+
 ## Open Questions
 
 1. ~~Reconsidering where `PendingSharedString` / `PendingStyle` live~~ → **Resolved**: both types' definitions were relocated to this file (`parse/worksheet.rs`), with [`resolve/shared_strings.rs`](../resolve/shared_strings.en.md) / [`resolve/style.rs`](../resolve/style.en.md) each `use`-ing them (reflects the [PR #9 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)). See Dependencies for details.

@@ -7,6 +7,7 @@ mod relationships;
 mod shared_strings;
 mod styles;
 mod workbook;
+mod worksheet;
 
 #[allow(unused_imports)]
 pub(crate) use relationships::{parse_relationships, Relationship, RelationshipMap, TargetMode};
@@ -16,6 +17,10 @@ pub(crate) use shared_strings::{parse_shared_strings, SharedStringTable};
 pub(crate) use styles::parse_styles;
 #[allow(unused_imports)]
 pub(crate) use workbook::{parse_workbook_xml, WorkbookSheetEntry};
+#[allow(unused_imports)]
+pub(crate) use worksheet::{
+    parse_worksheet, PendingSharedString, PendingStyle, WorksheetParseOutput,
+};
 
 use crate::error::Error;
 use quick_xml::events::{BytesStart, Event};
@@ -160,6 +165,41 @@ pub(crate) fn optional_attr(
     Ok(None)
 }
 
+/// Resolves an `Event::GeneralRef` (a `&#x...;`/`&#...;` character
+/// reference, or one of the 5 predefined XML entities — the only entities
+/// that can legally occur without a DTD, which `read_event` already
+/// rejects) and appends the resolved text to `text`. Shared by
+/// [`concat_rich_text`] and `parse/worksheet.rs`'s leaf-element text reader,
+/// both of which need to reconstruct entity-bearing text content.
+#[allow(dead_code)]
+pub(crate) fn push_general_ref(
+    text: &mut String,
+    r: &quick_xml::events::BytesRef<'_>,
+    path: &str,
+) -> Result<(), Error> {
+    match r.resolve_char_ref().map_err(|err| Error::XmlParse {
+        path: path.to_string(),
+        source: Box::new(err),
+    })? {
+        Some(ch) => text.push(ch),
+        None => {
+            let decoded = r.decode().map_err(|err| Error::XmlParse {
+                path: path.to_string(),
+                source: Box::new(err),
+            })?;
+            let resolved =
+                quick_xml::escape::resolve_predefined_entity(&decoded).ok_or_else(|| {
+                    Error::XmlParse {
+                        path: path.to_string(),
+                        source: format!("unknown XML entity reference: &{decoded};").into(),
+                    }
+                })?;
+            text.push_str(resolved);
+        }
+    }
+    Ok(())
+}
+
 /// Shared helper that extracts text-only content from the rich-text run
 /// structure under `<si>` (shared strings) or `<is>` (inline strings) — a
 /// sequence of `<r><t>...</t></r>` runs, or a single bare `<t>...</t>`.
@@ -200,26 +240,7 @@ pub(crate) fn concat_rich_text<R: BufRead>(
             // `&#x...;`/`&#...;` (character references) or `&amp;`/`&lt;`/etc.
             // (the 5 predefined XML entities — the only ones that can occur
             // without a DTD, which `read_event` already rejects outright).
-            Event::GeneralRef(e) if skip_depth == 0 => {
-                match e.resolve_char_ref().map_err(|err| Error::XmlParse {
-                    path: path.to_string(),
-                    source: Box::new(err),
-                })? {
-                    Some(ch) => text.push(ch),
-                    None => {
-                        let decoded = e.decode().map_err(|err| Error::XmlParse {
-                            path: path.to_string(),
-                            source: Box::new(err),
-                        })?;
-                        let resolved = quick_xml::escape::resolve_predefined_entity(&decoded)
-                            .ok_or_else(|| Error::XmlParse {
-                                path: path.to_string(),
-                                source: format!("unknown XML entity reference: &{decoded};").into(),
-                            })?;
-                        text.push_str(resolved);
-                    }
-                }
-            }
+            Event::GeneralRef(e) if skip_depth == 0 => push_general_ref(&mut text, &e, path)?,
             Event::End(e)
                 if e.local_name().as_ref() == b"si" || e.local_name().as_ref() == b"is" =>
             {
