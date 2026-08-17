@@ -24,11 +24,10 @@ struct SheetRoute {
 }
 
 /// Runs Phases 1 through 4 end to end and returns the fully resolved
-/// `Workbook`. `lib.rs`'s public API (`parse_workbook`, etc. — Issue #15)
-/// calls this function. Generic over `Read + Seek` since it simply carries
+/// `Workbook`. `lib.rs`'s public API (`parse_workbook`, etc.) calls this
+/// function. Generic over `Read + Seek` since it simply carries
 /// forward `container::ZipContainer::open_reader`'s constraint (reading the
 /// ZIP central directory requires a seekable input).
-#[allow(dead_code)]
 pub(crate) fn run<R: Read + Seek>(reader: R) -> Result<Workbook, Error> {
     let mut container = ZipContainer::open_reader(reader)?;
 

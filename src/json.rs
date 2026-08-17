@@ -12,7 +12,6 @@ use std::io::Write;
 /// time, without buffering a whole sheet's `Vec<JsonCell>` in memory. If
 /// `writer` is, say, a `BufWriter<File>`, additional memory usage stays at
 /// O(1) — one cell's worth at a time.
-#[allow(dead_code)]
 pub fn to_json_writer<W: Write>(workbook: &Workbook, writer: W) -> Result<(), Error> {
     let json_workbook = JsonWorkbook { workbook };
     serde_json::to_writer(writer, &json_workbook).map_err(|source| Error::JsonSerialize {
@@ -25,7 +24,6 @@ pub fn to_json_writer<W: Write>(workbook: &Workbook, writer: W) -> Result<(), Er
 /// additional memory usage is O(n) in the output size (unlike
 /// `to_json_writer`'s O(1) — prefer `to_json_writer` whenever the caller
 /// can write directly to a file, HTTP response, etc.).
-#[allow(dead_code)]
 pub fn to_json_string(workbook: &Workbook) -> Result<String, Error> {
     let mut buf = Vec::new();
     to_json_writer(workbook, &mut buf)?;
@@ -139,8 +137,8 @@ enum JsonCellValue {
     /// cannot construct this variant since the placeholder type carries no
     /// data yet.
     ///
-    /// `#[allow(dead_code)]`: not constructed by `cell_value_to_json` for
-    /// the reason above, but exercised directly by the test
+    /// Not constructed by `cell_value_to_json` for the reason above, but
+    /// exercised directly by the test
     /// `date_time_value_currently_serializes_as_empty` to pin down the
     /// serialized tag shape ahead of time.
     #[allow(dead_code)]

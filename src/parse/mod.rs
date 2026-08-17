@@ -9,18 +9,11 @@ mod styles;
 mod workbook;
 mod worksheet;
 
-#[allow(unused_imports)]
-pub(crate) use relationships::{parse_relationships, Relationship, RelationshipMap, TargetMode};
-#[allow(unused_imports)]
+pub(crate) use relationships::parse_relationships;
 pub(crate) use shared_strings::{parse_shared_strings, SharedStringTable};
-#[allow(unused_imports)]
 pub(crate) use styles::parse_styles;
-#[allow(unused_imports)]
-pub(crate) use workbook::{parse_workbook_xml, WorkbookSheetEntry};
-#[allow(unused_imports)]
-pub(crate) use worksheet::{
-    parse_worksheet, PendingSharedString, PendingStyle, WorksheetParseOutput,
-};
+pub(crate) use workbook::parse_workbook_xml;
+pub(crate) use worksheet::{parse_worksheet, PendingSharedString, PendingStyle};
 
 use crate::error::Error;
 use quick_xml::events::{BytesStart, Event};
@@ -41,7 +34,6 @@ use std::io::BufRead;
 /// Sets `trim_text(false)` so element text is never auto-trimmed — needed to
 /// not lose shared strings' `xml:space="preserve"`; whether to actually
 /// preserve whitespace is decided per submodule.
-#[allow(dead_code)]
 pub(crate) fn create_secure_reader<R: BufRead>(inner: R) -> Reader<R> {
     let mut reader = Reader::from_reader(inner);
     reader.config_mut().trim_text(false);
@@ -56,7 +48,6 @@ pub(crate) fn create_secure_reader<R: BufRead>(inner: R) -> Reader<R> {
 /// `Error::ZipBombDetected`. Otherwise it wraps the error as
 /// `Error::XmlParse`, type-erased per `error.rs`'s policy of never exposing
 /// `quick_xml::Error` directly in the public API.
-#[allow(dead_code)]
 pub(crate) fn convert_xml_error(path: &str, err: quick_xml::Error) -> Error {
     if let quick_xml::Error::Io(io_err) = &err {
         if let Some(limit) = io_err
@@ -90,7 +81,6 @@ pub(crate) fn convert_xml_error(path: &str, err: quick_xml::Error) -> Error {
 /// declaration's mere presence is detected at the XML syntax level. Every
 /// module under `parse/` reads events only through this function, never
 /// calling `reader.read_event_into` directly.
-#[allow(dead_code)]
 pub(crate) fn read_event<'a>(
     reader: &mut Reader<impl BufRead>,
     buf: &'a mut Vec<u8>,
@@ -111,7 +101,6 @@ pub(crate) fn read_event<'a>(
 /// `Error::MissingRequiredElement` if it is absent, or wraps a malformed
 /// attribute (invalid UTF-8, a stray `&` not part of a valid entity, etc.)
 /// as `Error::XmlParse`.
-#[allow(dead_code)]
 pub(crate) fn required_attr(
     start: &BytesStart<'_>,
     path: &str,
@@ -141,7 +130,6 @@ pub(crate) fn required_attr(
 /// Like [`required_attr`], but returns `Ok(None)` rather than an error when
 /// `name` is absent (used for optional attributes such as `state`/
 /// `TargetMode`).
-#[allow(dead_code)]
 pub(crate) fn optional_attr(
     start: &BytesStart<'_>,
     path: &str,
@@ -171,7 +159,6 @@ pub(crate) fn optional_attr(
 /// rejects) and appends the resolved text to `text`. Shared by
 /// [`concat_rich_text`] and `parse/worksheet.rs`'s leaf-element text reader,
 /// both of which need to reconstruct entity-bearing text content.
-#[allow(dead_code)]
 pub(crate) fn push_general_ref(
     text: &mut String,
     r: &quick_xml::events::BytesRef<'_>,
@@ -209,7 +196,6 @@ pub(crate) fn push_general_ref(
 ///
 /// Called with the reader positioned just after the opening `<si>`/`<is>`
 /// tag; consumes events up to and including the matching closing tag.
-#[allow(dead_code)]
 pub(crate) fn concat_rich_text<R: BufRead>(
     reader: &mut Reader<R>,
     path: &str,

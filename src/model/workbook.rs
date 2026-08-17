@@ -13,10 +13,6 @@ impl Workbook {
     /// Builds a `Workbook` from a list of already-resolved sheets.
     /// `pipeline.rs` calls this exactly once, after Phases 3 and 4 have
     /// completed for every sheet.
-    ///
-    /// `#[allow(dead_code)]`: only exercised by tests until `pipeline.rs`
-    /// (Issue #15) calls it.
-    #[allow(dead_code)]
     pub(crate) fn new(sheets: Vec<Sheet>) -> Self {
         Self { sheets }
     }

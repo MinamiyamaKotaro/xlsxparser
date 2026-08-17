@@ -9,7 +9,6 @@ use std::io::BufRead;
 
 /// One `<sheet>` entry from `workbook.xml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct WorkbookSheetEntry {
     pub name: String,
     /// The r:id from `<sheets><sheet r:id="rId1" .../></sheets>`. Used by
@@ -24,7 +23,6 @@ pub(crate) struct WorkbookSheetEntry {
 /// the `<sheets>` element itself is absent. Returns an empty `Vec` if
 /// `<sheets></sheets>` is empty (a zero-sheet workbook is structurally
 /// valid).
-#[allow(dead_code)]
 pub(crate) fn parse_workbook_xml(
     reader: impl BufRead,
     path: &str,

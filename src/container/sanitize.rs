@@ -4,22 +4,14 @@
 use crate::error::Error;
 use std::io::{self, Read};
 
-// `#[allow(dead_code)]` throughout this file: every item here is used by
-// `container/mod.rs`, but that module's own public API is only exercised by
-// tests until `pipeline.rs` (Issue #15) is implemented, which makes this
-// file's items transitively dead-code too under rustc's reachability
-// analysis (not a caller chain rustc credits as "live").
-
 /// The default uncompressed-size cap for Phase 2, per individual entry (in
 /// bytes).
-#[allow(dead_code)]
 pub const DEFAULT_MAX_UNCOMPRESSED_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB (provisional)
 
 /// The default cumulative uncompressed-size cap for Phase 2, across the
 /// whole archive (in bytes). Defends against the variant of Zip Bomb built
 /// from many moderately-sized entries whose cumulative total becomes
 /// enormous.
-#[allow(dead_code)]
 pub const DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB (provisional)
 
 /// Validates that a ZIP entry name cannot escape the archive's logical root
@@ -42,7 +34,6 @@ pub const DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 
 /// compiled per target OS (e.g. backslash is only a separator, and drive
 /// letters only recognized, on a `windows` target) — this validation must
 /// behave identically regardless of which OS the library is built for.
-#[allow(dead_code)]
 pub fn validate_entry_path(name: &str) -> Result<(), Error> {
     let reject = || Error::ZipSlipDetected {
         entry_name: name.to_string(),
@@ -74,7 +65,6 @@ pub fn validate_entry_path(name: &str) -> Result<(), Error> {
 /// quick-xml error into `crate::error::Error`) downcasts via
 /// `io::Error::get_ref()` to recover `limit` / `actual`.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct LimitExceeded {
     pub limit: u64,
     pub actual: u64,
@@ -105,7 +95,6 @@ impl std::error::Error for LimitExceeded {}
 /// reference into a field owned by `ZipContainer`; no interior mutability
 /// such as `Cell` is used.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct BoundedReader<'a, R> {
     inner: R,
     per_entry_limit: u64,
@@ -115,7 +104,6 @@ pub struct BoundedReader<'a, R> {
 }
 
 impl<'a, R: Read> BoundedReader<'a, R> {
-    #[allow(dead_code)]
     pub fn new(
         inner: R,
         per_entry_limit: u64,

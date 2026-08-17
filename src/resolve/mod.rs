@@ -21,7 +21,6 @@ use crate::parse::{PendingSharedString, PendingStyle, SharedStringTable};
 /// Runs shared-string resolution, then style application, then merge
 /// resolution; if any step fails, the remaining steps do not run, so a
 /// partially-resolved sheet is never returned to the caller (fail closed).
-#[allow(dead_code)]
 pub(crate) fn resolve_sheet(
     sheet: &mut Sheet,
     pending_shared_strings: &[PendingSharedString],

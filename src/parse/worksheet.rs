@@ -19,20 +19,17 @@ use std::sync::Arc;
 /// and has no variant that holds a raw index, so at parse time the cell
 /// itself is inserted into `Sheet` with `value: None`, and the index is
 /// kept outside the sheet in this struct instead.
-/// `resolve/shared_strings.rs` (Issue #15) consumes this to resolve the
-/// actual string.
+/// `resolve/shared_strings.rs` consumes this to resolve the actual string.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub(crate) struct PendingSharedString {
     pub cell_ref: CellRef,
     pub index: usize,
 }
 
 /// The pending entry Phase 3 records when it detects a cell carrying an `s`
-/// (style index) attribute. `resolve/style.rs` (Issue #15) consumes this to
-/// apply the `ResolvedStyle`.
+/// (style index) attribute. `resolve/style.rs` consumes this to apply the
+/// `ResolvedStyle`.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub(crate) struct PendingStyle {
     pub cell_ref: CellRef,
     pub style_id: StyleId,
@@ -42,7 +39,6 @@ pub(crate) struct PendingStyle {
 /// the `&mut` argument, so this only returns the three remaining pieces of
 /// unresolved data Phase 4 needs.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct WorksheetParseOutput {
     pub pending_shared_strings: Vec<PendingSharedString>,
     pub pending_styles: Vec<PendingStyle>,
@@ -58,14 +54,13 @@ pub(crate) struct WorksheetParseOutput {
 /// `PendingSharedString` always happen together. When a cell carries an `s`
 /// attribute, `insert_cell` and recording the corresponding `PendingStyle`
 /// always happen together. `resolve/shared_strings.rs` and
-/// `resolve/style.rs` (Issue #15) both rely on `Sheet::get_mut` succeeding
-/// on the assumption that this invariant holds.
+/// `resolve/style.rs` both rely on `Sheet::get_mut` succeeding on the
+/// assumption that this invariant holds.
 ///
 /// Each `<c>`'s attributes/text state is freshly initialized when that
 /// `<c>`'s start tag is seen and fully consumed (inserted or discarded) by
 /// the time its end tag is processed, so no state survives from one cell —
 /// or one row — into the next.
-#[allow(dead_code)]
 pub(crate) fn parse_worksheet(
     reader: impl BufRead,
     path: &str,
@@ -208,8 +203,7 @@ fn flush_cell(
 /// `t` attribute (absent implies Number). For `t="s"`, `value` is left
 /// `None` — the caller ([`flush_cell`]) records the corresponding
 /// `PendingSharedString` separately. `style` is always `None` here;
-/// `resolve/style.rs` (Issue #15) fills it in from the corresponding
-/// `PendingStyle`.
+/// `resolve/style.rs` fills it in from the corresponding `PendingStyle`.
 fn build_cell(
     cell_type: Option<&str>,
     value_text: Option<&str>,
@@ -242,7 +236,7 @@ fn parse_number(text: &str, path: &str) -> Result<f64, Error> {
 /// Parses a `<mergeCell ref="A1:C3"/>` reference into a `MergedRegion`. Only
 /// syntactic validity (two `:`-separated A1 coordinates) is checked here;
 /// range soundness (start/end ordering, overlaps) is `resolve/merge.rs`'s
-/// (Issue #15) job.
+/// job.
 fn parse_merge_ref(cell_range: &str) -> Result<MergedRegion, Error> {
     let (start_str, end_str) = cell_range
         .split_once(':')

@@ -22,7 +22,6 @@ const BUILTIN_DATE_TIME_NUMFMT_IDS: &[u32] = &[14, 15, 16, 17, 18, 19, 20, 21, 2
 /// `<cellXfs>` in a schema-valid file, so a single streaming pass suffices:
 /// custom format codes are collected first and are already available by the
 /// time `<cellXfs>` is reached.
-#[allow(dead_code)]
 pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleSheet, Error> {
     let mut xml_reader = create_secure_reader(reader);
     let mut buf = Vec::new();

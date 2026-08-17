@@ -9,8 +9,5 @@ mod workbook;
 
 pub use cell::{Cell, CellRef, CellValue, DateTimeValue};
 pub use sheet::{MergedRegion, Sheet, SheetVisibility};
-// `StyleSheet` is unused within the crate until `parse/styles.rs` and
-// `resolve/style.rs` (Issue #15) exist to build/consume it.
-#[allow(unused_imports)]
 pub use style::{ResolvedStyle, StyleId, StyleSheet};
 pub use workbook::Workbook;

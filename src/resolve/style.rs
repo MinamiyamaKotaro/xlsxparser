@@ -9,7 +9,6 @@ use crate::parse::PendingStyle;
 /// sets it on the corresponding cell in `sheet`. Also converts
 /// `CellValue::Number` to `CellValue::DateTime` when an `is_date_time`
 /// format is applied.
-#[allow(dead_code)]
 pub(crate) fn resolve(
     sheet: &mut Sheet,
     pending: &[PendingStyle],

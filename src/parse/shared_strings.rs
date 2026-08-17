@@ -19,12 +19,10 @@ impl SharedStringTable {
     /// Looks up the string at an index. Used by
     /// `resolve/shared_strings.rs::resolve` to build
     /// `Error::SharedStringIndexOutOfBounds` when out of range.
-    #[allow(dead_code)]
     pub(crate) fn get(&self, index: usize) -> Option<&Arc<str>> {
         self.strings.get(index)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.strings.len()
     }
@@ -33,7 +31,6 @@ impl SharedStringTable {
 /// Parses `xl/sharedStrings.xml` and builds a `SharedStringTable`. Each
 /// `<si>` under `<sst>` resolves to a single string via `concat_rich_text`
 /// (plain `<t>`, rich-text runs, or empty for a bare `<si/>`).
-#[allow(dead_code)]
 pub(crate) fn parse_shared_strings(
     reader: impl BufRead,
     path: &str,

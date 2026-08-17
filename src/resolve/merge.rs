@@ -9,7 +9,6 @@ use crate::model::{MergedRegion, Sheet};
 /// one already validated, as `Error::InvalidMergedRange`. If even one range
 /// is invalid, nothing is registered (reject the whole batch — fail
 /// closed).
-#[allow(dead_code)]
 pub(crate) fn resolve(sheet: &mut Sheet, regions: Vec<MergedRegion>) -> Result<(), Error> {
     let mut accepted: Vec<MergedRegion> = Vec::with_capacity(regions.len());
     for region in &regions {

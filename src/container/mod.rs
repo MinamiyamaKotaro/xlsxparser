@@ -6,17 +6,18 @@ pub mod sanitize;
 use crate::error::Error;
 use sanitize::{BoundedReader, DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE, DEFAULT_MAX_UNCOMPRESSED_SIZE};
 use std::io::{Read, Seek};
-use std::path::Path;
 
 /// The entry point for ZIP extraction of a .xlsx (OPC) package. All entry
 /// names in the central directory are validated via
 /// `sanitize::validate_entry_path` at open time, so the type itself
 /// guarantees that any entry name that makes it past `get_entry` is safe.
-// `#[allow(dead_code)]` throughout this file: `ZipContainer` and its methods
-// are only exercised by tests until `pipeline.rs` (Issue #15) owns one and
-// drives Phase 1/2 through it.
+///
+/// Constructed only via `open_reader` — `lib.rs::parse_workbook` opens its
+/// own `std::fs::File` and passes it in as a generic `Read + Seek`, rather
+/// than going through a path-based constructor on this type, since
+/// `pipeline::run` itself is generic over the input and needs to support
+/// non-file readers (`parse_workbook_reader`) the same way.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct ZipContainer<R> {
     archive: zip::ZipArchive<R>,
     max_entry_size: u64,
@@ -28,17 +29,6 @@ pub struct ZipContainer<R> {
     total_read: u64,
 }
 
-impl ZipContainer<std::fs::File> {
-    /// Opens an archive from a file path.
-    #[allow(dead_code)]
-    pub fn open(path: &Path) -> Result<Self, Error> {
-        Self::open_reader(std::fs::File::open(path).map_err(|source| Error::Io {
-            path: Some(path.to_path_buf()),
-            source,
-        })?)
-    }
-}
-
 impl<R: Read + Seek> ZipContainer<R> {
     /// Opens an archive from any `Read + Seek` (e.g. an in-memory buffer).
     /// The ZIP format's central directory sits at the end of the file, so a
@@ -47,7 +37,6 @@ impl<R: Read + Seek> ZipContainer<R> {
     /// Once the central directory has been read successfully, every entry
     /// name is validated via `sanitize::validate_entry_path`. If even one is
     /// invalid, the whole archive is rejected with `Error::ZipSlipDetected`.
-    #[allow(dead_code)]
     pub fn open_reader(reader: R) -> Result<Self, Error> {
         let archive =
             zip::ZipArchive::new(reader).map_err(|e| Error::InvalidPackage(e.to_string()))?;
@@ -90,7 +79,6 @@ impl<R: Read + Seek> ZipContainer<R> {
     /// `HashMap<String, String>` (lowercased name -> original name) once at
     /// `open_reader` time, alongside the existing `validate_entry_path` pass
     /// (PR #21 review).
-    #[allow(dead_code)]
     pub fn get_entry(
         &mut self,
         name: &str,
@@ -119,6 +107,12 @@ impl<R: Read + Seek> ZipContainer<R> {
 
     /// Lists all entry names in the archive (already validated at open
     /// time).
+    ///
+    /// Not called by `pipeline::run` today (it only ever fetches entries by
+    /// a path it already knows), so this is currently exercised only by
+    /// this module's own tests, which use it to confirm `open_reader`
+    /// picked up the expected set of entries. Kept as the natural
+    /// introspection counterpart to `get_entry`.
     #[allow(dead_code)]
     pub fn entry_names(&self) -> impl Iterator<Item = &str> {
         self.archive.file_names()
@@ -127,10 +121,11 @@ impl<R: Read + Seek> ZipContainer<R> {
 
 impl<R> ZipContainer<R> {
     /// Opens with an explicitly set per-entry uncompressed-size cap for Zip
-    /// Bomb protection. `pub(crate)` (rather than exposed on the public API
-    /// directly): `pipeline.rs` is expected to call this once `lib.rs`'s
-    /// public API for overriding the default caps is designed (Issue #15;
-    /// security review Finding 2).
+    /// Bomb protection. `pub(crate)` rather than exposed on the public API
+    /// directly: `lib.rs` doesn't yet expose a way for callers to override
+    /// the default caps, so nothing calls this today. Tracked as follow-up
+    /// work (security review Finding 2: "whether callers should be able to
+    /// override the default size caps via `lib.rs`'s public API").
     #[allow(dead_code)]
     pub(crate) fn with_max_entry_size(mut self, limit: u64) -> Self {
         self.max_entry_size = limit;
@@ -138,8 +133,7 @@ impl<R> ZipContainer<R> {
     }
 
     /// Opens with an explicitly set archive-wide cumulative uncompressed-size
-    /// cap for Zip Bomb protection. Same visibility rationale as
-    /// `with_max_entry_size`.
+    /// cap for Zip Bomb protection. Same rationale as `with_max_entry_size`.
     #[allow(dead_code)]
     pub(crate) fn with_max_total_size(mut self, limit: u64) -> Self {
         self.max_total_size = limit;
