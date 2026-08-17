@@ -113,15 +113,35 @@ pub enum Error {
     /// ファイルI/O由来のエラー（対象ファイルが開けない、読み込めないなど）。
     /// `path` はファイルパスを経由しない入力（例: `Cursor<Vec<u8>>` などの
     /// インメモリバッファ、または将来 `lib.rs` が `Read` トレイト入力を
-    /// 受け付ける場合）ではパスが存在しないため `Option` とする。
-    /// Display文言は単純化のため `path` を含めない（`None` の場合と `Some` の
-    /// 場合とで文言を分岐させたい場合は実装時に見直す）。
-    #[error("I/O error: {source}")]
+    /// 受け付ける場合）ではパスが存在しないため `Option` とする。`Some` の
+    /// 場合は `io_path_suffix` ヘルパー経由でDisplay文言に付加し、エラー
+    /// テキストだけで原因ファイルを特定できるようにする（実装時に確定。
+    /// PR #19 レビュー指摘を反映）。
+    #[error("I/O error{}: {source}", io_path_suffix(path))]
     Io {
         path: Option<PathBuf>,
         #[source]
         source: std::io::Error,
     },
+}
+
+/// `Error::Io` の `path`（`Option`）をDisplayメッセージの接尾辞として整形する
+/// （`None` の場合は空文字列）。
+fn io_path_suffix(path: &Option<PathBuf>) -> String {
+    match path {
+        Some(p) => format!(" (path: {})", p.display()),
+        None => String::new(),
+    }
+}
+
+/// パス情報を持たないI/Oエラー（インメモリバッファ由来など）を `?` で
+/// 変換するための実装。パスが判明している場合は `Error::Io { path: Some(..),
+/// source }` を明示的に構築し、パス情報を残すこと（実装時に追加。
+/// PR #19 レビュー指摘を反映）。
+impl From<std::io::Error> for Error {
+    fn from(source: std::io::Error) -> Self {
+        Error::Io { path: None, source }
+    }
 }
 ```
 
@@ -145,8 +165,9 @@ pub enum Error {
 
 ## テスト方針
 
-- 各バリアントの `Display`（`#[error(...)]` メッセージ）が意図した文字列を生成することの確認
+- 各バリアントの `Display`（`#[error(...)]` メッセージ）が意図した文字列を生成することの確認。`Io` は `path: Some(..)` / `path: None` の両方（`io_path_suffix` の分岐）を確認する
 - `std::error::Error::source()` が `XmlParse` / `Io` / `JsonSerialize` について正しく根本原因を返すことの確認
+- `From<std::io::Error>` が `Error::Io { path: None, .. }` を生成し、`?` 経由で正しく伝播することの確認
 - `#[non_exhaustive]` により、クレート利用者側の `match` で `_ =>` アームなしにコンパイルできない（＝将来のバリアント追加が破壊的変更にならない）ことをドキュメント上明記し、コンパイル可否のテストは行わない（`#[non_exhaustive]` 自体はコンパイラが保証する言語機能のため）
 - 本ファイル単体のロジックテストは型定義のみのため最小限とし、実際のバリアント生成・伝播の検証は各生成元モジュール（`model/cell.rs` の `from_a1` 等）のテストで行う
 

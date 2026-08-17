@@ -127,16 +127,36 @@ pub enum Error {
     /// An I/O error (e.g. the target file cannot be opened or read).
     /// `path` is `Option` because inputs that don't go through a file path
     /// (e.g. an in-memory buffer such as `Cursor<Vec<u8>>`, or a future
-    /// `Read`-trait input accepted by `lib.rs`) have no path to report.
-    /// The Display message intentionally omits `path` for simplicity
-    /// (revisit at implementation time if `Some`/`None` should render
-    /// differently).
-    #[error("I/O error: {source}")]
+    /// `Read`-trait input accepted by `lib.rs`) have no path to report. When
+    /// present, `path` is appended to the `Display` message (via the
+    /// `io_path_suffix` helper) so the offending file can be identified from
+    /// the error text alone (finalized at implementation time — PR #19
+    /// review).
+    #[error("I/O error{}: {source}", io_path_suffix(path))]
     Io {
         path: Option<PathBuf>,
         #[source]
         source: std::io::Error,
     },
+}
+
+/// Formats `Error::Io`'s optional `path` as a `Display`-message suffix
+/// (empty when `None`).
+fn io_path_suffix(path: &Option<PathBuf>) -> String {
+    match path {
+        Some(p) => format!(" (path: {})", p.display()),
+        None => String::new(),
+    }
+}
+
+/// Converts a path-less I/O error (e.g. from an in-memory buffer) via `?`.
+/// Errors with a known path should still be constructed explicitly as
+/// `Error::Io { path: Some(..), source }` so the path is reported (added at
+/// implementation time — PR #19 review).
+impl From<std::io::Error> for Error {
+    fn from(source: std::io::Error) -> Self {
+        Error::Io { path: None, source }
+    }
 }
 ```
 
@@ -160,8 +180,9 @@ pub enum Error {
 
 ## Testing Strategy
 
-- Verify that each variant's `Display` (the `#[error(...)]` message) produces the intended string
+- Verify that each variant's `Display` (the `#[error(...)]` message) produces the intended string, including `Io`'s `path: Some(..)` vs. `path: None` cases (the `io_path_suffix` branch)
 - Verify that `std::error::Error::source()` correctly returns the root cause for `XmlParse` / `Io` / `JsonSerialize`
+- Verify that `From<std::io::Error>` produces `Error::Io { path: None, .. }` and propagates correctly via `?`
 - Document (rather than test for compilation) that `#[non_exhaustive]` prevents crate consumers from `match`-ing without a `_ =>` arm — i.e. adding a future variant is not a breaking change; this is a compiler-guaranteed language feature, so no separate compile-pass test is needed
 - Since this file only defines types, its own unit-test surface is minimal; verification of actual variant construction and propagation is left to the tests of each originating module (e.g. `from_a1` in `model/cell.rs`)
 
