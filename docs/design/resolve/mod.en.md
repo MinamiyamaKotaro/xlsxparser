@@ -17,12 +17,13 @@ mod shared_strings;
 mod merge;
 mod style;
 
-pub use shared_strings::PendingSharedString;
-pub use style::PendingStyle;
-
 use crate::error::Error;
 use crate::model::sheet::{MergedRegion, Sheet};
 use crate::model::style::StyleSheet;
+// PendingSharedString/PendingStyle are Phase 3's own output data, so
+// parse/worksheet.rs defines them (reflects the PR #9 review — see
+// Dependencies).
+use crate::parse::worksheet::{PendingSharedString, PendingStyle};
 
 /// Runs Phase 4 resolution over one sheet's worth of unresolved data.
 /// Intended to be called once per sheet by `pipeline.rs`.
@@ -48,7 +49,7 @@ pub fn resolve_sheet(
 
 ## Dependencies
 
-- Depends on: [`resolve/shared_strings.rs`](shared_strings.en.md), [`resolve/merge.rs`](merge.en.md), [`resolve/style.rs`](style.en.md) (all as `mod` declarations), [`model/sheet.rs`](../model/sheet.en.md) (`Sheet`, `MergedRegion`), [`error.rs`](../error.en.md). It also depends on `parse::shared_strings::SharedStringTable` (not yet designed — see Open Question 1), but this is not the kind of "dependency on I/O" that architecture.md design principle 2 forbids; it is a dependency on in-memory structured data that Phase 3 has already built. It therefore does not contradict `resolve/`'s I/O-independence policy (there is no dependency on actual I/O or XML structure such as quick-xml or `std::fs`).
+- Depends on: [`resolve/shared_strings.rs`](shared_strings.en.md), [`resolve/merge.rs`](merge.en.md), [`resolve/style.rs`](style.en.md) (all as `mod` declarations), [`model/sheet.rs`](../model/sheet.en.md) (`Sheet`, `MergedRegion`), [`error.rs`](../error.en.md). It also depends on [`parse::shared_strings::SharedStringTable`](../parse/shared_strings.en.md) and [`parse::worksheet::{PendingSharedString, PendingStyle}`](../parse/worksheet.en.md), but these are not the kind of "dependency on I/O" that architecture.md design principle 2 forbids; they are dependencies on in-memory structured data that Phase 3 has already built. This therefore does not contradict `resolve/`'s I/O-independence policy (there is no dependency on actual I/O or XML structure such as quick-xml or `std::fs`).
 - Depended on by: `pipeline.rs` (calls `resolve_sheet` once Phase 3 completes for each sheet)
 
 There is no strong ordering requirement among the three sub-steps inside `resolve_sheet` (shared-string resolution → style application → merge resolution), because each submodule reads/writes independent cell fields. Merge resolution is placed last as a defensive ordering choice, since [merge.md](merge.en.md)'s `insert_merge` assumes the origin cell already exists in `cells` at call time, and this ordering makes it easier to surface problems early if shared-string or style resolution was missed (see Open Question 2 for details).
@@ -66,6 +67,6 @@ There is no strong ordering requirement among the three sub-steps inside `resolv
 
 ## Open Questions
 
-1. **Which module builds `SharedStringTable`**: `parse/shared_strings.rs` is out of scope for this Issue (only the modules listed in architecture.md) and has not been designed yet. The concrete type and location of `SharedStringTable` (`parse::shared_strings` vs. `resolve::shared_strings`) will be finalized when `parse/shared_strings.rs` is designed. `StyleSheet` / `ResolvedStyle` / `StyleId` were defined preemptively on the [`model/style.rs`](../model/style.en.md) side (addresses PR #8 review feedback), but consistency will need to be re-checked when `parse/styles.rs` is designed.
+1. ~~Which module builds `SharedStringTable`~~ → **Resolved**: [`parse/shared_strings.rs`](../parse/shared_strings.en.md) defines and builds `SharedStringTable`. `StyleSheet` / `ResolvedStyle` / `StyleId` were defined preemptively on the [`model/style.rs`](../model/style.en.md) side (addresses PR #8 review feedback), and consistency has now been re-checked against [`parse/styles.rs`](../parse/styles.en.md)'s design.
 2. **Validity of the sub-step ordering**: There is currently no strong technical reason for the order "shared-string resolution → style application → merge resolution" beyond the loose requirement that a test should eventually confirm the numFmt date detection in style application does not accidentally overwrite the result of shared-string resolution (`CellValue::Text`). Whether running steps concurrently (not possible under the current design, since it would require simultaneous mutable access to `sheet`) is worthwhile will be reconsidered based on implementation-time profiling.
-3. **How `pending_shared_strings` / `pending_styles` are passed**: Since `parse/worksheet.rs` is not yet designed, it is undecided whether these lists are passed as a batched `Vec`, or resolved incrementally as part of streaming processing interleaved with `Sheet` construction. The current design assumes batched `Vec` passing, following architecture.md's one-directional pipeline policy of "run Phase 4 after Phase 3 completes."
+3. ~~How `pending_shared_strings` / `pending_styles` are passed~~ → **Resolved**: [`parse/worksheet.rs`](../parse/worksheet.en.md) builds them as batched `Vec`s and passes them straight into `resolve_sheet` (following architecture.md's one-directional pipeline policy of "run Phase 4 after Phase 3 completes"). `PendingSharedString`/`PendingStyle`'s own type definitions were relocated to [`parse/worksheet.rs`](../parse/worksheet.en.md) (reflects the [PR #9 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)), so this file, [`resolve/shared_strings.rs`](shared_strings.en.md), and [`resolve/style.rs`](style.en.md) all uniformly `use` them (resolves [parse/worksheet.md Open Question 1](../parse/worksheet.en.md)).

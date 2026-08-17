@@ -16,15 +16,11 @@
 ```rust
 use crate::error::Error;
 use crate::model::cell::{CellValue, DateTimeValue};
-use crate::model::sheet::{CellRef, Sheet};
-use crate::model::style::{ResolvedStyle, StyleId, StyleSheet};
-
-/// フェーズ3が `s`（style index）属性を持つセルを検出した時点で記録する保留エントリ。
-#[derive(Debug, Clone, Copy)]
-pub struct PendingStyle {
-    pub cell_ref: CellRef,
-    pub style_id: StyleId,
-}
+use crate::model::sheet::Sheet;
+use crate::model::style::{ResolvedStyle, StyleSheet};
+// PendingStyleはフェーズ3の出力データそのものであるため
+// parse/worksheet.rsが定義する（PR #9レビューを反映。依存関係セクション参照）。
+use crate::parse::worksheet::PendingStyle;
 
 /// `pending` の各エントリについて `stylesheet` から `ResolvedStyle` を引き、
 /// `sheet` の対応セルへ設定する。あわせて `is_date_time` な書式が
@@ -69,7 +65,7 @@ fn serial_to_date_time(serial: f64) -> Option<DateTimeValue> {
 
 ## 依存関係
 
-- 依存先: [`model/sheet.rs`](../model/sheet.md)（`Sheet::get_mut`, `CellRef`）、[`model/cell.rs`](../model/cell.md)（`CellValue`, `DateTimeValue`）、[`model/style.rs`](../model/style.md)（`ResolvedStyle`, `StyleSheet`, `StyleId`。PR #8 レビュー指摘を反映し本ファイルから移動）、[`error.rs`](../error.md)
+- 依存先: [`model/sheet.rs`](../model/sheet.md)（`Sheet::get_mut`）、[`model/cell.rs`](../model/cell.md)（`CellValue`, `DateTimeValue`）、[`model/style.rs`](../model/style.md)（`ResolvedStyle`, `StyleSheet`。PR #8 レビュー指摘を反映し本ファイルから移動）、[`error.rs`](../error.md)、[`parse::worksheet::PendingStyle`](../parse/worksheet.md)
 - 依存元: [`resolve/mod.rs`](mod.md)（`resolve_sheet` から呼び出される）
 
 `StyleSheet` / `ResolvedStyle` / `StyleId` を `resolve/style.rs` 自身ではなく [`model/style.rs`](../model/style.md) に定義したことで、`parse/styles.rs`（未設計。`StyleSheet` を構築する主体）と `resolve/style.rs`（適用する主体）がいずれも `model/` にのみ依存し、互いを直接知らない構造になる（PR #8 レビュー指摘を反映。詳細は[model/style.md](../model/style.md)参照）。
@@ -98,6 +94,6 @@ fn serial_to_date_time(serial: f64) -> Option<DateTimeValue> {
 ## 未決事項 / オープンクエスチョン
 
 1. ~~`ResolvedStyle` / `StyleSheet` / `StyleId` の最終的な配置場所~~ → **解決**: [`model/style.rs`](../model/style.md) を新設し、そちらに定義する。`parse/styles.rs`（構築主体）と `resolve/style.rs`（適用主体）の双方が `model/` にのみ依存する構造とすることで、レイヤー間の独立性を保つ（PR #8 レビュー指摘を反映）。
-2. **日付/時刻書式の判定ロジックの置き場所**: 本ファイルは `ResolvedStyle.is_date_time` を既に判定済みの値として受け取る設計としたが、OOXMLの numFmt判定（組み込みID 14〜22等の範囲判定、カスタムフォーマット文字列のパターンマッチ）を `parse/styles.rs` 側で行うか、`resolve/style.rs` 側に判定ロジックそのものを持ち込むか（`ResolvedStyle` が生のフォーマット文字列を保持し、本ファイルが解釈する）は未決定。前者はarchitecture.md 設計方針2（`resolve/` はI/O非依存だが判定ロジック自体はドメイン知識でありどちらに置いても矛盾しない）を踏まえるとどちらでも成立するため、`parse/styles.rs` の設計時にあわせて確定させる。
+2. ~~日付/時刻書式の判定ロジックの置き場所~~ → **解決**: [`parse/styles.rs`](../parse/styles.md) 側で判定する（OOXMLの numFmt判定を含む）。本ファイルは引き続き `ResolvedStyle.is_date_time` を既に判定済みの値として受け取るのみで、判定ロジックそのものは持たない。判定ヒューリスティックの精度自体は [parse/styles.md オープンクエスチョン2](../parse/styles.md) として引き続き未解決。
 3. ~~`serial_to_date_time` の実装~~ → **一部解決**: 変換不能な値に対しては `Error` を返さず `None` を返し、呼び出し側（本ファイルの `resolve`）が `CellValue::Number` を維持するフォールバックとする方針を確定した（PR #8 レビュー指摘を反映）。ただし変換式そのもの（1900年うるう年バグの扱いを含む）は [model/cell.md オープンクエスチョン4](../model/cell.md) の `DateTimeValue` 型確定と合わせて未確定のまま。
 4. **フォント/塗りつぶし/罫線などの具体的なスタイル要素**: [model/style.md オープンクエスチョン1](../model/style.md) と同一の論点（未解決）。要求仕様書がセルスタイルとしてどこまでの要素をJSON出力に含める必要があるかは `json.rs` の設計、または要求仕様書自体の詳細化と合わせて確定させる。

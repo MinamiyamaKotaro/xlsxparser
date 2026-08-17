@@ -58,4 +58,4 @@ Not applicable. Since this file contains only type definitions, it has no unit t
 ## Open Questions
 
 1. **Concrete style elements such as font/fill/border**: the same point as [resolve/style.md Open Question 4](../resolve/style.en.md). `ResolvedStyle` currently only tentatively defines `is_date_time`; how far the requirements spec expects cell styling (font color, background color, borders, bold/italic, etc.) to be included in JSON output will be finalized alongside `json.rs`'s design, or as the requirements spec itself is elaborated.
-2. **Where the date/time format determination logic lives**: the same point as [resolve/style.md Open Question 2](../resolve/style.en.md) (undecided). Will be finalized alongside `parse/styles.rs`'s design.
+2. ~~Where the date/time format determination logic lives~~ → **Resolved**: [`parse/styles.rs`](../parse/styles.en.md) owns classifying `ResolvedStyle::is_date_time` from `numFmtId`/`formatCode` (the same point as [resolve/style.md Open Question 2](../resolve/style.en.md)). The heuristic's precision itself remains open — see [parse/styles.md Open Question 2](../parse/styles.en.md).

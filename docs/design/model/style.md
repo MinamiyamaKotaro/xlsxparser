@@ -57,4 +57,4 @@ pub type StyleSheet = HashMap<StyleId, Arc<ResolvedStyle>>;
 ## 未決事項 / オープンクエスチョン
 
 1. **フォント/塗りつぶし/罫線などの具体的なスタイル要素**: [resolve/style.md オープンクエスチョン4](../resolve/style.md) と同一の論点。`ResolvedStyle` は現状 `is_date_time` のみを仮定義しているが、要求仕様書がセルスタイルとしてどこまでの要素（フォント色、背景色、罫線、太字/斜体等）をJSON出力に含める必要があるかは `json.rs` の設計、または要求仕様書自体の詳細化と合わせて確定させる。
-2. **日付/時刻書式の判定ロジックの置き場所**: [resolve/style.md オープンクエスチョン2](../resolve/style.md) と同一の論点（未解決）。`parse/styles.rs` の設計時にあわせて確定させる。
+2. ~~日付/時刻書式の判定ロジックの置き場所~~ → **解決**: [`parse/styles.rs`](../parse/styles.md) が `numFmtId`/`formatCode` から `ResolvedStyle::is_date_time` を判定するロジックを持つ（[resolve/style.md オープンクエスチョン2](../resolve/style.md) と同一の論点）。判定ヒューリスティックの精度自体は [parse/styles.md オープンクエスチョン2](../parse/styles.md) として引き続き未解決。

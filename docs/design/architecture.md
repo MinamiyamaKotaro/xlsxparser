@@ -78,6 +78,8 @@ ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブ�
 
 `parse/worksheet.rs` は行/セルデータと `<mergeCells>` 情報をストリームで順次送出する。
 
+- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [mod.md](parse/mod.md) / [relationships.md](parse/relationships.md) / [workbook.md](parse/workbook.md) / [shared_strings.md](parse/shared_strings.md) / [styles.md](parse/styles.md) / [worksheet.md](parse/worksheet.md)
+
 ### `model/`
 
 `Cell` / `Sheet` / `Workbook` などの純粋なRustデータ構造を定義する。XMLパースや解決ロジックへの依存を持たない。疎行列（`HashMap<(row, col), Cell>`）によりメモリを最適化する。

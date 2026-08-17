@@ -15,20 +15,11 @@ Design doc for `src/resolve/shared_strings.rs`. This handles the "shared string 
 ```rust
 use crate::error::Error;
 use crate::model::cell::CellValue;
-use crate::model::sheet::{CellRef, Sheet};
-use crate::parse::shared_strings::SharedStringTable; // parse/shared_strings.rs not yet designed (see Open Question 1)
-
-/// A pending entry recorded when Phase 3 detects a `t="s"` cell.
-/// `model::CellValue` only allows the resolved `Text(Arc<str>)` variant and
-/// has no variant that holds a raw index (see [model/cell.md](../model/cell.en.md)),
-/// so at parse time the cell itself is inserted into `Sheet` with
-/// `value: None` (other fields such as style are set as usual), and the
-/// index is kept outside the sheet in this struct instead.
-#[derive(Debug, Clone, Copy)]
-pub struct PendingSharedString {
-    pub cell_ref: CellRef,
-    pub index: usize,
-}
+use crate::model::sheet::Sheet;
+use crate::parse::shared_strings::SharedStringTable;
+// PendingSharedString is Phase 3's own output data, so parse/worksheet.rs
+// defines it (reflects the PR #9 review — see Dependencies).
+use crate::parse::worksheet::PendingSharedString;
 
 /// For each entry in `pending`, looks up the actual string in `table` and
 /// writes it back into the corresponding cell in `sheet` as `CellValue::Text`.
@@ -55,7 +46,7 @@ pub(crate) fn resolve(
 
 ## Dependencies
 
-- Depends on: [`model/sheet.rs`](../model/sheet.en.md) (`Sheet::get_mut`, `CellRef`), [`model/cell.rs`](../model/cell.en.md) (`CellValue::Text`), [`error.rs`](../error.en.md), `parse::shared_strings::SharedStringTable` (not yet designed — see Open Question 1)
+- Depends on: [`model/sheet.rs`](../model/sheet.en.md) (`Sheet::get_mut`), [`model/cell.rs`](../model/cell.en.md) (`CellValue::Text`), [`error.rs`](../error.en.md), [`parse::shared_strings::SharedStringTable`](../parse/shared_strings.en.md), [`parse::worksheet::PendingSharedString`](../parse/worksheet.en.md)
 - Depended on by: [`resolve/mod.rs`](mod.en.md) (called from `resolve_sheet`)
 
 Using `expect` rather than propagating an `Option`/`Result` from `get_mut` might appear to contradict [model/sheet.md](../model/sheet.en.md)'s policy that "`get`/`get_mut` represent a missing cell as `Option`, treating it as a normal case." The difference is that here, "the cell doesn't exist" does not originate from user input (the XLSX file) — it can only occur if `parse/worksheet.rs` recorded a `PendingSharedString` but forgot to call the matching `insert_cell`, i.e. an internal crate programming error (see Error Handling Policy for details).
@@ -74,6 +65,6 @@ Using `expect` rather than propagating an `Option`/`Result` from `get_mut` might
 
 ## Open Questions
 
-1. **Type and location of `SharedStringTable`**: Since `parse/shared_strings.rs` (out of scope for this Issue) is not yet designed, this file is designed only assuming an API roughly equivalent to `get(index) -> Option<&Arc<str>>`. The concrete type definition (e.g. a wrapper around `Vec<Arc<str>>`) will be finalized when that module is designed.
-2. **Formalizing the invariant shared with `parse/worksheet.rs`**: The contract "whenever a `t="s"` cell is detected, recording a `PendingSharedString` and calling `insert_cell` with an empty `Cell` (`value: None`) must always happen together" currently exists only as a comment in this file. Which document should hold this contract as the source of truth will be decided when `parse/worksheet.rs` is designed.
-3. **Validity of the resolution timing for formula cells (`t="str"`) and inline strings (`t="inlineStr"`)**: Whether the assumption stated in Responsibility/Scope — that "`parse/worksheet.rs` inserts `CellValue::Text` directly while streaming" — actually holds (e.g. whether the cost of wrapping in `Arc<str>` burdens stream processing) will be re-examined when `parse/worksheet.rs` is designed and implemented.
+1. ~~Type and location of `SharedStringTable`~~ → **Resolved**: [`parse/shared_strings.rs`](../parse/shared_strings.en.md) defines it as a wrapper around `Vec<Arc<str>>`, exposing `get(index) -> Option<&Arc<str>>` and `len()`.
+2. ~~Formalizing the invariant shared with `parse/worksheet.rs`~~ → **Resolved**: the contract "whenever a `t="s"` cell is detected, recording a `PendingSharedString` and calling `insert_cell` with an empty `Cell` (`value: None`) must always happen together" is recorded as the source of truth in [`parse/worksheet.rs`](../parse/worksheet.en.md)'s own documentation.
+3. ~~Validity of the resolution timing for formula cells (`t="str"`) and inline strings (`t="inlineStr"`)~~ → **Confirmed**: [`parse/worksheet.rs`](../parse/worksheet.en.md)'s design settled on resolving these directly to `CellValue::Text` during the stream, as assumed. The actual cost of wrapping in `Arc<str>` is left to implementation-time profiling.

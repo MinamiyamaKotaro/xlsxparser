@@ -16,16 +16,11 @@ Design doc for `src/resolve/style.rs`. This handles the "cell style application"
 ```rust
 use crate::error::Error;
 use crate::model::cell::{CellValue, DateTimeValue};
-use crate::model::sheet::{CellRef, Sheet};
-use crate::model::style::{ResolvedStyle, StyleId, StyleSheet};
-
-/// A pending entry recorded when Phase 3 detects a cell with an `s` (style
-/// index) attribute.
-#[derive(Debug, Clone, Copy)]
-pub struct PendingStyle {
-    pub cell_ref: CellRef,
-    pub style_id: StyleId,
-}
+use crate::model::sheet::Sheet;
+use crate::model::style::{ResolvedStyle, StyleSheet};
+// PendingStyle is Phase 3's own output data, so parse/worksheet.rs defines
+// it (reflects the PR #9 review — see Dependencies).
+use crate::parse::worksheet::PendingStyle;
 
 /// For each entry in `pending`, looks up `ResolvedStyle` in `stylesheet` and
 /// sets it on the corresponding cell in `sheet`. Also converts
@@ -72,7 +67,7 @@ fn serial_to_date_time(serial: f64) -> Option<DateTimeValue> {
 
 ## Dependencies
 
-- Depends on: [`model/sheet.rs`](../model/sheet.en.md) (`Sheet::get_mut`, `CellRef`), [`model/cell.rs`](../model/cell.en.md) (`CellValue`, `DateTimeValue`), [`model/style.rs`](../model/style.en.md) (`ResolvedStyle`, `StyleSheet`, `StyleId` — moved out of this file, addressing PR #8 review feedback), [`error.rs`](../error.en.md)
+- Depends on: [`model/sheet.rs`](../model/sheet.en.md) (`Sheet::get_mut`), [`model/cell.rs`](../model/cell.en.md) (`CellValue`, `DateTimeValue`), [`model/style.rs`](../model/style.en.md) (`ResolvedStyle`, `StyleSheet` — moved out of this file, addressing PR #8 review feedback), [`error.rs`](../error.en.md), [`parse::worksheet::PendingStyle`](../parse/worksheet.en.md)
 - Depended on by: [`resolve/mod.rs`](mod.en.md) (called from `resolve_sheet`)
 
 Defining `StyleSheet` / `ResolvedStyle` / `StyleId` in [`model/style.rs`](../model/style.en.md) rather than in `resolve/style.rs` itself means `parse/styles.rs` (not yet designed — the entity that builds `StyleSheet`) and `resolve/style.rs` (the entity that applies it) both depend only on `model/` and never know about each other directly (addresses PR #8 review feedback — see [model/style.md](../model/style.en.md) for details).
@@ -101,6 +96,6 @@ Why the `CellValue::Number` → `CellValue::DateTime` conversion happens inside 
 ## Open Questions
 
 1. ~~Final location of `ResolvedStyle` / `StyleSheet` / `StyleId`~~ → **Resolved**: newly added [`model/style.rs`](../model/style.en.md) and defined them there. Having both `parse/styles.rs` (the builder) and `resolve/style.rs` (the applier) depend only on `model/` preserves independence between layers (addresses PR #8 review feedback).
-2. **Where the date/time format determination logic lives**: this file assumes `ResolvedStyle.is_date_time` arrives as an already-determined value, but whether OOXML numFmt determination (range checks for built-in IDs 14–22 etc., pattern matching on custom format strings) happens on the `parse/styles.rs` side, or whether `resolve/style.rs` itself should carry the determination logic (with `ResolvedStyle` holding the raw format string and this file interpreting it), is undecided. Given architecture.md design principle 2 (`resolve/` is I/O-independent, but the determination logic itself is domain knowledge that is consistent either way), either placement is viable, so this will be finalized alongside `parse/styles.rs`'s design.
+2. ~~Where the date/time format determination logic lives~~ → **Resolved**: it lives on the [`parse/styles.rs`](../parse/styles.en.md) side (including OOXML numFmt determination). This file continues to receive `ResolvedStyle.is_date_time` as an already-determined value and holds none of the determination logic itself. The heuristic's precision remains open — see [parse/styles.md Open Question 2](../parse/styles.en.md).
 3. ~~Implementation of `serial_to_date_time`~~ → **Partially resolved**: settled on a policy where values that cannot be converted return `None` rather than an `Error`, with the caller (this file's `resolve`) falling back to leaving `CellValue::Number` unchanged (addresses PR #8 review feedback). The conversion formula itself (including handling of the 1900 leap-year bug) remains undecided, tied to [model/cell.md Open Question 4](../model/cell.en.md)'s finalization of the `DateTimeValue` type.
 4. **Concrete style elements such as font/fill/border**: the same point as [model/style.md Open Question 1](../model/style.en.md) (undecided). How far the requirements spec expects cell styling to be included in JSON output will be finalized alongside `json.rs`'s design, or as the requirements spec itself is elaborated.
