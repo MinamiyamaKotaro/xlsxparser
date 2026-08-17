@@ -67,7 +67,7 @@ Owns the `ZipContainer` and controls the execution order of each phase (borrowin
 
 The entry point for ZIP (OPC) extraction. Responsible for detecting and blocking Zip Bomb / Zip Slip. Does not interpret (parse) the contents of the XML.
 
-- Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [sanitize.md](container/sanitize.en.md) (`mod.md` not yet written)
+- Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [mod.md](container/mod.en.md) / [sanitize.md](container/sanitize.en.md)
 
 ### `parse/`
 

@@ -67,7 +67,7 @@ src/
 
 ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブロックを担う。XMLの中身の解釈（パース）は行わない。
 
-- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [sanitize.md](container/sanitize.md)（`mod.md` は未作成）
+- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [mod.md](container/mod.md) / [sanitize.md](container/sanitize.md)
 
 ### `parse/`
 
