@@ -4,7 +4,7 @@
 //! (shared strings, styles, merged ranges).
 
 use crate::error::Error;
-use crate::model::{Cell, CellRef, CellValue, MergedRegion, Sheet, StyleId};
+use crate::model::{Cell, CellRef, CellValue, ColWidthRange, MergedRegion, Sheet, StyleId};
 use crate::parse::{
     concat_rich_text, create_secure_reader, optional_attr, push_general_ref, read_event,
     required_attr,
@@ -42,6 +42,8 @@ pub(crate) struct PendingStyle {
 pub(crate) struct WorksheetParseOutput {
     pub pending_shared_strings: Vec<PendingSharedString>,
     pub pending_styles: Vec<PendingStyle>,
+    pub col_width_ranges: Vec<ColWidthRange>,
+    pub default_col_width: Option<f64>,
     pub merge_regions: Vec<MergedRegion>,
 }
 
@@ -70,6 +72,8 @@ pub(crate) fn parse_worksheet(
     let mut buf = Vec::new();
     let mut pending_shared_strings = Vec::new();
     let mut pending_styles = Vec::new();
+    let mut col_width_ranges = Vec::new();
+    let mut default_col_width = None;
     let mut merge_regions = Vec::new();
 
     // State for the `<c>` currently being read (between its start and end
@@ -140,6 +144,19 @@ pub(crate) fn parse_worksheet(
                 let cell_range = required_attr(e, path, "ref")?;
                 merge_regions.push(parse_merge_ref(&cell_range)?);
             }
+            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"sheetFormatPr" => {
+                if let Some(w) = optional_attr(e, path, "defaultColWidth")? {
+                    default_col_width = Some(parse_f64_attr(&w, "defaultColWidth", path)?);
+                }
+            }
+            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"col" => {
+                if let Some(width_str) = optional_attr(e, path, "width")? {
+                    let min = parse_u32_attr(&required_attr(e, path, "min")?, "min", path)?;
+                    let max = parse_u32_attr(&required_attr(e, path, "max")?, "max", path)?;
+                    let width = parse_f64_attr(&width_str, "width", path)?;
+                    col_width_ranges.push(ColWidthRange { min, max, width });
+                }
+            }
             Event::Eof => break,
             _ => {}
         }
@@ -149,8 +166,26 @@ pub(crate) fn parse_worksheet(
     Ok(WorksheetParseOutput {
         pending_shared_strings,
         pending_styles,
+        col_width_ranges,
+        default_col_width,
         merge_regions,
     })
+}
+
+/// Parses a `<col>`/`<sheetFormatPr>` numeric attribute value as `u32`,
+/// wrapping a malformed value as `Error::InvalidPackage` (same convention
+/// as `read_leaf_text`'s numeric cell value parsing below).
+fn parse_u32_attr(value: &str, attr_name: &str, path: &str) -> Result<u32, Error> {
+    value
+        .parse()
+        .map_err(|_| Error::InvalidPackage(format!("invalid {attr_name} {value:?} in {path}")))
+}
+
+/// Same as [`parse_u32_attr`], but for `f64` (column width).
+fn parse_f64_attr(value: &str, attr_name: &str, path: &str) -> Result<f64, Error> {
+    value
+        .parse()
+        .map_err(|_| Error::InvalidPackage(format!("invalid {attr_name} {value:?} in {path}")))
 }
 
 /// Finalizes one `<c>`: decides whether it carries enough information to be
@@ -435,6 +470,74 @@ mod tests {
         assert_eq!(output.merge_regions.len(), 1);
         assert_eq!(output.merge_regions[0].start, CellRef { row: 3, col: 3 });
         assert_eq!(output.merge_regions[0].end, CellRef { row: 1, col: 1 });
+    }
+
+    #[test]
+    fn cols_are_collected_with_min_max_width() {
+        let xml = br#"<worksheet><cols>
+<col min="1" max="3" width="12.5" customWidth="1"/>
+<col min="5" max="5" width="8.43"/>
+</cols><sheetData></sheetData></worksheet>"#;
+        let (_sheet, output) = parse(xml);
+        assert_eq!(
+            output.col_width_ranges,
+            vec![
+                ColWidthRange {
+                    min: 1,
+                    max: 3,
+                    width: 12.5
+                },
+                ColWidthRange {
+                    min: 5,
+                    max: 5,
+                    width: 8.43
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn col_without_width_attribute_is_ignored() {
+        // A <col> that only sets e.g. `hidden`/`bestFit` without an
+        // explicit width carries nothing this library tracks.
+        let xml = br#"<worksheet><cols><col min="1" max="1" hidden="1"/></cols><sheetData></sheetData></worksheet>"#;
+        let (_sheet, output) = parse(xml);
+        assert_eq!(output.col_width_ranges, vec![]);
+    }
+
+    #[test]
+    fn a_single_full_width_col_does_not_expand_into_16384_ranges() {
+        // The realistic-worst-case shape: one <col> spanning the entire
+        // column range. Must be collected as exactly one ColWidthRange
+        // (Issue #39's performance requirement), proven here at the
+        // parse-output level.
+        let xml = br#"<worksheet><cols><col min="1" max="16384" width="8.43"/></cols><sheetData></sheetData></worksheet>"#;
+        let (_sheet, output) = parse(xml);
+        assert_eq!(output.col_width_ranges.len(), 1);
+        assert_eq!(output.col_width_ranges[0].min, 1);
+        assert_eq!(output.col_width_ranges[0].max, 16_384);
+    }
+
+    #[test]
+    fn sheet_format_pr_default_col_width_is_collected() {
+        let xml = br#"<worksheet><sheetFormatPr defaultColWidth="9.1" defaultRowHeight="15"/><sheetData></sheetData></worksheet>"#;
+        let (_sheet, output) = parse(xml);
+        assert_eq!(output.default_col_width, Some(9.1));
+    }
+
+    #[test]
+    fn missing_sheet_format_pr_leaves_default_col_width_none() {
+        let xml = br#"<worksheet><sheetData></sheetData></worksheet>"#;
+        let (_sheet, output) = parse(xml);
+        assert_eq!(output.default_col_width, None);
+    }
+
+    #[test]
+    fn malformed_col_width_is_invalid_package() {
+        let xml = br#"<worksheet><cols><col min="1" max="1" width="not-a-number"/></cols><sheetData></sheetData></worksheet>"#;
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err = parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet).unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
     }
 
     #[test]

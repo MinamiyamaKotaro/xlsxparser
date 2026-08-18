@@ -2,12 +2,13 @@
 //! purely on in-memory data (`model::Sheet` and the pending lists Phase 3
 //! built), per `docs/design/architecture.en.md` design principle 2.
 
+mod column_width;
 mod merge;
 mod shared_strings;
 mod style;
 
 use crate::error::Error;
-use crate::model::{MergedRegion, Sheet, StyleSheet};
+use crate::model::{ColWidthRange, MergedRegion, Sheet, StyleSheet};
 use crate::parse::{PendingSharedString, PendingStyle, SharedStringTable};
 
 /// Runs Phase 4 resolution over one sheet's worth of unresolved data.
@@ -18,19 +19,24 @@ use crate::parse::{PendingSharedString, PendingStyle, SharedStringTable};
 /// still inserted with `value: None`, and cells referencing styles with
 /// `style: None`.
 ///
-/// Runs shared-string resolution, then style application, then merge
-/// resolution; if any step fails, the remaining steps do not run, so a
-/// partially-resolved sheet is never returned to the caller (fail closed).
+/// Runs shared-string resolution, then style application, then column
+/// width, then merge resolution; if any step fails, the remaining steps do
+/// not run, so a partially-resolved sheet is never returned to the caller
+/// (fail closed).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_sheet(
     sheet: &mut Sheet,
     pending_shared_strings: &[PendingSharedString],
     shared_string_table: &SharedStringTable,
     pending_styles: &[PendingStyle],
     stylesheet: &StyleSheet,
+    col_width_ranges: Vec<ColWidthRange>,
+    default_col_width: Option<f64>,
     merge_regions: Vec<MergedRegion>,
 ) -> Result<(), Error> {
     shared_strings::resolve(sheet, pending_shared_strings, shared_string_table)?;
     style::resolve(sheet, pending_styles, stylesheet)?;
+    column_width::resolve(sheet, col_width_ranges, default_col_width)?;
     merge::resolve(sheet, merge_regions)?;
     Ok(())
 }
@@ -90,6 +96,12 @@ mod tests {
                 style_id: 0,
             }],
             &stylesheet,
+            vec![ColWidthRange {
+                min: 1,
+                max: 5,
+                width: 12.0,
+            }],
+            None,
             merge_regions,
         )
         .unwrap();
@@ -103,6 +115,7 @@ mod tests {
             sheet.get(CellRef { row: 3, col: 2 }),
             sheet.get(CellRef { row: 3, col: 1 })
         );
+        assert_eq!(sheet.column_width(1), Some(12.0));
     }
 
     #[test]
@@ -133,6 +146,8 @@ mod tests {
             &empty_table,
             &[],
             &stylesheet,
+            vec![],
+            None,
             bad_merge_regions,
         )
         .unwrap_err();
@@ -147,6 +162,16 @@ mod tests {
         let table = crate::parse::parse_shared_strings(&b"<sst></sst>"[..], "xl/sharedStrings.xml")
             .unwrap();
         let stylesheet = StyleSheet::new();
-        resolve_sheet(&mut sheet, &[], &table, &[], &stylesheet, vec![]).unwrap();
+        resolve_sheet(
+            &mut sheet,
+            &[],
+            &table,
+            &[],
+            &stylesheet,
+            vec![],
+            None,
+            vec![],
+        )
+        .unwrap();
     }
 }

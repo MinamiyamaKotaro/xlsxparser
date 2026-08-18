@@ -85,11 +85,17 @@ struct JsonSheet<'a> {
 
 impl<'a> Serialize for JsonSheet<'a> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("Sheet", 5)?;
+        let mut state = serializer.serialize_struct("Sheet", 7)?;
         state.serialize_field("name", &self.sheet.name)?;
         state.serialize_field("visibility", visibility_tag(self.sheet.visibility))?;
         state.serialize_field("maxRow", &self.sheet.max_row)?;
         state.serialize_field("maxCol", &self.sheet.max_col)?;
+        // `defaultColumnWidth`/`columns` (Issue #39): a sheet-level array,
+        // not one `columnWidth` value duplicated onto every cell in that
+        // column — see model/sheet.en.md's "Feature: column width" note
+        // for why (raised during Issue #36's review discussion).
+        state.serialize_field("defaultColumnWidth", &self.sheet.default_col_width())?;
+        state.serialize_field("columns", &ColumnSeq { sheet: self.sheet })?;
         state.serialize_field("cells", &CellSeq { sheet: self.sheet })?;
         state.end()
     }
@@ -232,6 +238,7 @@ fn visibility_tag(v: SheetVisibility) -> &'static str {
 - Verify that a `Workbook` with zero sheets serializes correctly as `{"sheets": []}`
 - **A regression test verifying that calling `to_json_writer` on a sheet with many cells does not cause additional heap allocation to grow significantly beyond `Sheet`'s own memory footprint (i.e. `JsonCell`s are never collected into a `Vec`)** (a test substantiating the peak-memory design intent raised by the PR #10 review; the concrete verification method is to be settled at implementation time, together with the choice of memory-profiling tooling)
 - Verify that `Error::JsonSerialize` propagates when `to_json_writer` is given a `Write` implementation (a test mock) that fails partway through writing
+- **Verify that `Sheet::col_width_ranges`/`default_col_width` serialize as a sheet-level `columns` array / `defaultColumnWidth` field, and are never duplicated onto individual cell objects** (Issue #39; the "sheet-level array, not per-cell" design decision is the thing under test here — see model/sheet.en.md)
 
 ## Open Questions
 

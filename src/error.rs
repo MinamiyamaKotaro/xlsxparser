@@ -103,6 +103,25 @@ pub enum Error {
     #[error("too many merged cell ranges in one sheet: {count} exceeds limit {limit}")]
     TooManyMergedRanges { count: usize, limit: usize },
 
+    /// A `<col>` range is invalid (overlaps another column-width range).
+    /// Mirrors `InvalidMergedRange`'s shape (Issue #39).
+    #[error("invalid column width range {min}:{max}: {reason}")]
+    InvalidColumnWidthRange { min: u32, max: u32, reason: String },
+
+    /// The number of `<col>` range entries in a single sheet exceeded
+    /// `resolve::column_width::MAX_COLUMN_WIDTH_RANGES`. The Zip Bomb
+    /// byte-size cap (512 MiB by default) alone permits well over ten
+    /// million minimal `<col min="1" max="1" width=".."/>` entries, which
+    /// would still cost real CPU time (the O(R log R) sort in
+    /// `resolve::column_width::resolve`) and memory (a `Vec` entry per
+    /// range) even though that resolution has no O(R^2)/O(R^3) risk of its
+    /// own. This cap keeps R itself bounded independently of byte size —
+    /// the same reasoning as `TooManyMergedRanges` — while leaving ample
+    /// headroom over the handful of ranges a real-world sheet typically has
+    /// (Issue #39).
+    #[error("too many column width ranges in one sheet: {count} exceeds limit {limit}")]
+    TooManyColumnWidthRanges { count: usize, limit: usize },
+
     // --- Phase 5: JSON generation ---
     /// JSON serialization failed (wraps the error `serde_json` returns).
     /// `source` is type-erased for the same reason as `XmlParse::source`. In
@@ -264,6 +283,25 @@ mod tests {
             }
             .to_string(),
             "too many merged cell ranges in one sheet: 20001 exceeds limit 20000"
+        );
+
+        assert_eq!(
+            Error::InvalidColumnWidthRange {
+                min: 1,
+                max: 5,
+                reason: "overlaps another column width range".into(),
+            }
+            .to_string(),
+            "invalid column width range 1:5: overlaps another column width range"
+        );
+
+        assert_eq!(
+            Error::TooManyColumnWidthRanges {
+                count: 2_001,
+                limit: 2_000,
+            }
+            .to_string(),
+            "too many column width ranges in one sheet: 2001 exceeds limit 2000"
         );
 
         assert_eq!(

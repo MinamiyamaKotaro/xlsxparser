@@ -29,6 +29,19 @@ impl MergedRegion {
     }
 }
 
+/// A `<col min=".." max=".." width=".."/>` range: column width applies to
+/// every column index in `[min, max]` inclusive. Kept as a range rather
+/// than expanded per-column, for the same reason `MergedRegion` isn't
+/// expanded into per-cell aliases — a single `<col min="1" max="16384"
+/// .../>` (common in real files) would otherwise force one entry per
+/// column (Issue #39).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColWidthRange {
+    pub min: u32,
+    pub max: u32,
+    pub width: f64,
+}
+
 /// A sheet's visibility (`workbook.xml`'s `<sheet state="...">`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SheetVisibility {
@@ -70,6 +83,17 @@ pub struct Sheet {
     /// `<dimension>` element's value.
     pub max_row: u32,
     pub max_col: u32,
+    /// Column-width ranges from `<cols>`, sorted by `min` and mutually
+    /// non-overlapping (`resolve::column_width::resolve` guarantees both
+    /// before calling `set_col_widths`). Kept as a sorted `Vec` rather
+    /// than a `HashMap<u32, f64>` so `column_width` can binary-search in
+    /// O(log R) instead of holding one entry per column (Issue #39).
+    col_widths: Vec<ColWidthRange>,
+    /// `<sheetFormatPr defaultColWidth="..">`, the width for any column not
+    /// covered by `col_widths`. `None` when the attribute is absent (Excel
+    /// itself falls back to a font-metric-derived default in that case,
+    /// which this library does not compute — see `column_width`'s doc).
+    default_col_width: Option<f64>,
 }
 
 impl Sheet {
@@ -84,6 +108,8 @@ impl Sheet {
             merge_bounds: None,
             max_row: 0,
             max_col: 0,
+            col_widths: Vec::new(),
+            default_col_width: None,
         }
     }
 
@@ -298,6 +324,53 @@ impl Sheet {
     /// `resolve_origin`'s per-cell cost (Issue #43).
     pub fn iter_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
         self.cells.iter().map(|(&r, c)| (r, c))
+    }
+
+    /// Registers this sheet's column-width ranges. Called once by
+    /// `resolve::column_width::resolve`, which guarantees `ranges` is
+    /// already sorted by `min` and mutually non-overlapping — this method
+    /// trusts that precondition rather than re-validating it (Issue #39).
+    pub(crate) fn set_col_widths(&mut self, ranges: Vec<ColWidthRange>, default: Option<f64>) {
+        self.col_widths = ranges;
+        self.default_col_width = default;
+    }
+
+    /// The width of column `col`, or `None` if it falls in no `<col>`
+    /// range and no `<sheetFormatPr defaultColWidth>` was set. Binary
+    /// search over `col_widths` (sorted, non-overlapping by construction —
+    /// see `set_col_widths`): find the last range with `min <= col`, then
+    /// check whether it actually reaches `col` — O(log R) for R ranges,
+    /// never O(R) regardless of how a file arranges them (Issue #39;
+    /// same class of concern as `resolve_origin`'s Issue #43 fix).
+    ///
+    /// Returns `None` rather than a guessed fallback (e.g. Excel's common
+    /// "Calibri 11" default of ~8.43 characters) when nothing covers
+    /// `col`: that default depends on the workbook's font metrics, which
+    /// this library does not compute — a wrong guess would be worse than
+    /// an explicit absence for a caller to fill in its own default.
+    pub fn column_width(&self, col: u32) -> Option<f64> {
+        let idx = self.col_widths.partition_point(|r| r.min <= col);
+        if idx > 0 {
+            let candidate = &self.col_widths[idx - 1];
+            if col <= candidate.max {
+                return Some(candidate.width);
+            }
+        }
+        self.default_col_width
+    }
+
+    /// The raw column-width ranges, for JSON output as a sheet-level
+    /// `columns` array rather than duplicated onto every cell (Issue #36
+    /// review discussion: embedding a column-level value per cell would
+    /// multiply output size by the number of populated cells in each
+    /// column, undermining the sparse-output design this library exists
+    /// for).
+    pub fn col_width_ranges(&self) -> &[ColWidthRange] {
+        &self.col_widths
+    }
+
+    pub fn default_col_width(&self) -> Option<f64> {
+        self.default_col_width
     }
 }
 
@@ -699,5 +772,73 @@ mod tests {
                 style: None,
             })
         );
+    }
+
+    #[test]
+    fn column_width_with_no_ranges_and_no_default_is_none() {
+        let sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        assert_eq!(sheet.column_width(1), None);
+    }
+
+    #[test]
+    fn column_width_falls_back_to_default_col_width_outside_every_range() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.set_col_widths(
+            vec![ColWidthRange {
+                min: 1,
+                max: 3,
+                width: 12.0,
+            }],
+            Some(8.43),
+        );
+        assert_eq!(sheet.column_width(2), Some(12.0));
+        assert_eq!(sheet.column_width(10), Some(8.43));
+    }
+
+    #[test]
+    fn column_width_binary_search_across_multiple_ranges() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.set_col_widths(
+            vec![
+                ColWidthRange {
+                    min: 1,
+                    max: 5,
+                    width: 10.0,
+                },
+                ColWidthRange {
+                    min: 10,
+                    max: 20,
+                    width: 20.0,
+                },
+                ColWidthRange {
+                    min: 100,
+                    max: 16_384,
+                    width: 5.0,
+                },
+            ],
+            None,
+        );
+
+        assert_eq!(sheet.column_width(1), Some(10.0));
+        assert_eq!(sheet.column_width(5), Some(10.0));
+        assert_eq!(sheet.column_width(7), None); // gap between ranges
+        assert_eq!(sheet.column_width(10), Some(20.0));
+        assert_eq!(sheet.column_width(20), Some(20.0));
+        assert_eq!(sheet.column_width(21), None); // gap
+        assert_eq!(sheet.column_width(100), Some(5.0));
+        assert_eq!(sheet.column_width(16_384), Some(5.0));
+    }
+
+    #[test]
+    fn col_width_ranges_exposes_the_raw_ranges_for_json_output() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let ranges = vec![ColWidthRange {
+            min: 1,
+            max: 16_384,
+            width: 8.43,
+        }];
+        sheet.set_col_widths(ranges.clone(), None);
+        assert_eq!(sheet.col_width_ranges(), ranges.as_slice());
+        assert_eq!(sheet.default_col_width(), None);
     }
 }

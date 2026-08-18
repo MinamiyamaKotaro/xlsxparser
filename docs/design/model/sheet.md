@@ -264,10 +264,14 @@ impl Sheet {
 
 最終的に有効だったのが `Sheet::finalize_merges` である。シートの全結合セルが `insert_merge` で登録された直後に `resolve::merge::resolve` から一度だけ呼ばれる。現時点で挿入済みの全セルキーを、行方向の単一スイープラインパスで起点へ解決する——各結合範囲の行範囲からStart/Endイベントを生成し、セルキーごとのQueryイベントと合わせて1回だけソートし(C個のセル・M個の結合範囲に対してO((C + M) log (C + M)))、その行で現在アクティブな結合セル集合(`resolve::merge` の検証により重複しないことが構成上保証されている、列でソートされた集合)を維持しながら1回だけ走査する——その上で、自分自身が起点でないセルを全て削除する。これは観測可能なデータを一切失わない: 自分自身が起点でない座標はもともと `get`/`iter_cells` からは到達不能だった(`resolve_origin` が常に先に起点へリダイレクトするため)ので、削除されるエントリは元々死んでいたものであり、これは既存の回帰テスト `iter_cells_excludes_cells_pre_inserted_at_alias_coordinates` が既に確認している事実そのものである。変わるのは、`iter_cells` がその後 `resolve_origin` を一切呼ばなくて済むようになる点だけである——残っている全てのキーが既に自分自身の起点と等しいため——これにより、結合セルが空間的にどう配置されていてもコスト経路が塞がれる。`get`/`get_mut` 自身の汎用フォールバック(パース完了後に外部呼び出し元が任意の座標を問い合わせる用途)は変更しない。攻撃者が実際に制御できる、内部駆動でファイルサイズに比例する `iter_cells` の経路だけがこの対応を必要としていた。
 
+**機能: 列幅(Issue #39)。** `Sheet` は `col_widths: Vec<ColWidthRange>`（`min` でソート済み・相互に非重複）と `default_col_width: Option<f64>` も保持し、`resolve::column_width::resolve` が `Sheet::set_col_widths` を通じて一度だけ登録する——`resolve::merge`/`insert_merge` と同じ「検証してから登録し、事前条件を信頼する」という分担。`ColWidthRange { min, max, width }` は `MergedRegion` の「範囲のまま保持し展開しない」という原則を踏襲しており、実データに頻出する単一の `<col min="1" max="16384" .../>` は16,384件ではなく1件として登録されなければならない(`resolve::column_width` の回帰テスト `a_full_width_single_range_does_not_expand_into_per_column_entries` 参照)。
+
+`column_width(col) -> Option<f64>` は `col_widths` を二分探索する——`partition_point` で `min <= col` を満たす最後の範囲を求め、その範囲の `max` が実際に `col` まで届くか確認する——ファイルが範囲をどう配置してもO(log R)になる(RはRの上限 `resolve::column_width::MAX_COLUMN_WIDTH_RANGES` = 2,000でキャップ)。`col` を覆う範囲も `defaultColWidth` も無い場合はExcelの一般的な既定値(「Calibri 11 ≈ 8.43文字」など)を推測で埋めるのではなく `None` を返す: そのフォールバックはこのライブラリが計算していないフォントメトリクスに依存するため、誤った数値より明示的な不在の方が望ましい。`col_width_ranges()` は生のソート済み `Vec` を公開し、`json.rs` がシート単位の `columns` 配列としてシリアライズする——意図的に**セルごとに引いてセルのJSONオブジェクトへ埋め込まない**: 列単位の値をその列の全ての実在セルに繰り返すと、このライブラリの存在意義である疎な出力設計に何の利益も無く反する(列幅専用のサブIssueができる前、Issue #36のレビュー議論で提起された)。
+
 ## 依存関係
 
 - 依存先: [`model/cell.rs`](cell.md)（`Cell`, `CellRef`）
-- 依存元: `model::Workbook`（複数シートを保持）、[`pipeline.rs`](../pipeline.md)（`Sheet::new` でシートを構築する）、`resolve/merge.rs`（`insert_merge` を呼び出して結合セルを登録し、全件登録後に `finalize_merges` を呼ぶ）、`resolve/shared_strings.rs` / `resolve/style.rs`（`get_mut` を通じてセルの値・スタイルを解決済みデータへ書き換える）、[`json.rs`](../json.md)（`iter_cells` と `merged_region_at` からJSONを組み立てる）、`parse/worksheet.rs`（`insert_cell` でパース結果を挿入する）
+- 依存元: `model::Workbook`（複数シートを保持）、[`pipeline.rs`](../pipeline.md)（`Sheet::new` でシートを構築する）、`resolve/merge.rs`（`insert_merge` を呼び出して結合セルを登録し、全件登録後に `finalize_merges` を呼ぶ）、`resolve/shared_strings.rs` / `resolve/style.rs`（`get_mut` を通じてセルの値・スタイルを解決済みデータへ書き換える）、`resolve/column_width.rs`（検証後に `set_col_widths` を呼ぶ）、[`json.rs`](../json.md)（`iter_cells`・`merged_region_at`・`col_width_ranges`・`default_col_width` からJSONを組み立てる）、`parse/worksheet.rs`（`insert_cell` でパース結果を挿入する）
 
 `cells` / `merged_regions` フィールド自体は `pub(crate)` にも公開せず完全に非公開のままとし、これらの内部データ構造への書き込みは `insert_cell` / `insert_merge` / `get_mut` / `finalize_merges` に限定する。フィールドを直接 `pub(crate)` にする案（初回レビューでの提案）も検討したが、その場合 `max_row`/`max_col` の更新漏れや結合起点セルの補完漏れを各呼び出し元（`resolve/` 配下の複数モジュール）が個別に守る必要があり、不変条件がクレート全体に分散してしまう。メソッド経由に限定することで不変条件を `Sheet` 自身に閉じ込め、呼び出し側は正しさを気にせず利用できる。
 
@@ -294,6 +298,7 @@ impl Sheet {
 - **`finalize_merges` が、仮想（非起点）座標に事前挿入されたセルを削除しつつ、結合の起点セルと無関係な独立セルは保持することの確認**（Issue #43。これにより `iter_cells` 自身がフィルタを持つ必要がなくなる）
 - **`finalize_merges` が、行範囲の重ならない複数の結合範囲にまたがって正しく解決できることの確認**（単一範囲だけでなく、どの範囲にも属さないセルも含めてスイープラインのStart/End管理を検証する）
 - **エンドツーエンド回帰テスト: `MAX_MERGE_REGIONS` 件の結合セルを`merge_bounds`が最大化するよう配置(対角に2個配置)し、さらに無関係なセルを数十万件加えたファイルが、修正前に実測した数秒単位の停止なしにJSON生成を完了できることの確認**（`tests/security.rs` の `sparse_merge_bounding_box_does_not_amplify_json_generation_cost`、`sparse_merge_bounding_box_amplification` フィクスチャを使用。意図的な配置によるDoS懸念であるため、`zip_bomb`/`zip_slip`/`xxe_attack` と同じくCategory 4（負荷）ではなくCategory 5（セキュリティ）に分類）
+- **`column_width` が範囲なし・`defaultColWidth` なしで `None` を返すことの確認**、**複数範囲にまたがる二分探索の正当性の確認**（範囲内・範囲間の隙間・`defaultColWidth`へのフォールバックの境界値を含む）、**`col_width_ranges`/`default_col_width` がJSON出力用に生の値を公開することの確認**（Issue #39。詳細な検証は `resolve::column_width` のテスト群が担う）
 
 ## 未決事項 / オープンクエスチョン
 

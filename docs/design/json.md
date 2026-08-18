@@ -84,11 +84,17 @@ struct JsonSheet<'a> {
 
 impl<'a> Serialize for JsonSheet<'a> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("Sheet", 5)?;
+        let mut state = serializer.serialize_struct("Sheet", 7)?;
         state.serialize_field("name", &self.sheet.name)?;
         state.serialize_field("visibility", visibility_tag(self.sheet.visibility))?;
         state.serialize_field("maxRow", &self.sheet.max_row)?;
         state.serialize_field("maxCol", &self.sheet.max_col)?;
+        // `defaultColumnWidth`/`columns`（Issue #39）: 列単位の値を
+        // その列の全セルへ複製するのではなく、シート単位の配列として
+        // 出力する——理由は model/sheet.md「機能: 列幅」の注記参照
+        // （Issue #36のレビュー議論で提起）。
+        state.serialize_field("defaultColumnWidth", &self.sheet.default_col_width())?;
+        state.serialize_field("columns", &ColumnSeq { sheet: self.sheet })?;
         state.serialize_field("cells", &CellSeq { sheet: self.sheet })?;
         state.end()
     }
@@ -227,6 +233,7 @@ fn visibility_tag(v: SheetVisibility) -> &'static str {
 - 0シートの `Workbook` が `{"sheets": []}` として正しくシリアライズされることの確認
 - **多数のセルを持つシートに対し `to_json_writer` を呼び出した際、`Sheet` 自体のメモリ使用量に対して追加のヒープ確保が有意に増加しない（`JsonCell` のVec化が行われていない）ことを検証する回帰テスト**（PR #10 レビューで指摘されたピークメモリ抑制の設計意図を裏付けるテスト。具体的な検証手法はメモリプロファイリングツールの選定と合わせて実装時に確定させる）
 - `to_json_writer` に書き込み途中で失敗する `Write` 実装（テスト用のモック）を渡した場合に `Error::JsonSerialize` が伝播することの確認
+- **`Sheet::col_width_ranges`/`default_col_width` がシート単位の `columns` 配列/`defaultColumnWidth` フィールドとしてシリアライズされ、個々のセルオブジェクトに複製されないことの確認**（Issue #39。「セルごとではなくシート単位の配列」という設計判断そのものを検証する。model/sheet.md参照）
 
 ## 未決事項 / オープンクエスチョン
 

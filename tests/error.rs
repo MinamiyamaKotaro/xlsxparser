@@ -51,3 +51,12 @@ fn invalid_merge_ref_is_reported_as_invalid_merged_range() {
         "expected Error::InvalidMergedRange, got {err:?}"
     );
 }
+
+#[test]
+fn overlapping_col_widths_is_reported_as_invalid_column_width_range() {
+    let err = parse_workbook_reader(Cursor::new(error::overlapping_col_widths())).unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidColumnWidthRange { .. }),
+        "expected Error::InvalidColumnWidthRange, got {err:?}"
+    );
+}

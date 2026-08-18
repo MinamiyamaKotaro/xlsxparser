@@ -2,7 +2,7 @@
 //! streaming cell-by-cell rather than buffering a whole sheet in memory.
 
 use crate::error::Error;
-use crate::model::{Cell, CellRef, CellValue, Sheet, SheetVisibility, Workbook};
+use crate::model::{Cell, CellRef, CellValue, ColWidthRange, Sheet, SheetVisibility, Workbook};
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Serialize, Serializer};
 use std::io::Write;
@@ -76,12 +76,47 @@ struct JsonSheet<'a> {
 
 impl Serialize for JsonSheet<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("Sheet", 5)?;
+        let mut state = serializer.serialize_struct("Sheet", 7)?;
         state.serialize_field("name", &self.sheet.name)?;
         state.serialize_field("visibility", visibility_tag(self.sheet.visibility))?;
         state.serialize_field("maxRow", &self.sheet.max_row)?;
         state.serialize_field("maxCol", &self.sheet.max_col)?;
+        state.serialize_field("defaultColumnWidth", &self.sheet.default_col_width())?;
+        state.serialize_field("columns", &ColumnSeq { sheet: self.sheet })?;
         state.serialize_field("cells", &CellSeq { sheet: self.sheet })?;
+        state.end()
+    }
+}
+
+/// Emits `Sheet::col_width_ranges` as a sheet-level array
+/// (`[{"min":1,"max":5,"width":10.0}, ...]`) rather than duplicating a
+/// `columnWidth` value onto every cell: a column-level property repeated
+/// once per populated cell in that column would multiply output size for
+/// no benefit, undermining the sparse-output design this library exists
+/// for (Issue #36 review discussion).
+struct ColumnSeq<'a> {
+    sheet: &'a Sheet,
+}
+
+impl Serialize for ColumnSeq<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let ranges = self.sheet.col_width_ranges();
+        let mut seq = serializer.serialize_seq(Some(ranges.len()))?;
+        for range in ranges {
+            seq.serialize_element(&JsonColumn(range))?;
+        }
+        seq.end()
+    }
+}
+
+struct JsonColumn<'a>(&'a ColWidthRange);
+
+impl Serialize for JsonColumn<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("Column", 3)?;
+        state.serialize_field("min", &self.0.min)?;
+        state.serialize_field("max", &self.0.max)?;
+        state.serialize_field("width", &self.0.width)?;
         state.end()
     }
 }
@@ -224,12 +259,50 @@ mod tests {
                     "visibility": "visible",
                     "maxRow": 1,
                     "maxCol": 1,
+                    "defaultColumnWidth": null,
+                    "columns": [],
                     "cells": [
                         {"row": 1, "col": 1, "value": {"type": "number", "value": 42.0}}
                     ]
                 }]
             })
         );
+    }
+
+    #[test]
+    fn column_widths_serialize_as_a_sheet_level_array_not_per_cell() {
+        let mut sheet = sheet_with_one_cell("Sheet1", Some(CellValue::Number(1.0)));
+        sheet.set_col_widths(
+            vec![
+                ColWidthRange {
+                    min: 1,
+                    max: 5,
+                    width: 12.0,
+                },
+                ColWidthRange {
+                    min: 10,
+                    max: 20,
+                    width: 20.0,
+                },
+            ],
+            Some(8.43),
+        );
+        let workbook = Workbook::new(vec![sheet]);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let sheet_json = &parsed["sheets"][0];
+
+        assert_eq!(sheet_json["defaultColumnWidth"], serde_json::json!(8.43));
+        assert_eq!(
+            sheet_json["columns"],
+            serde_json::json!([
+                {"min": 1, "max": 5, "width": 12.0},
+                {"min": 10, "max": 20, "width": 20.0}
+            ])
+        );
+        // The columns array is sheet-level, not duplicated onto the cell.
+        assert!(sheet_json["cells"][0].get("columnWidth").is_none());
     }
 
     #[test]

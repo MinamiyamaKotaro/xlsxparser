@@ -7,7 +7,35 @@ mod fixtures;
 use fixtures::normal;
 use std::io::Cursor;
 use std::sync::Arc;
-use xlsxparser::{parse_workbook_reader, CellRef, CellValue, DateTimeValue};
+use xlsxparser::{parse_workbook_reader, to_json_string, CellRef, CellValue, DateTimeValue};
+
+#[test]
+fn column_widths_resolve_per_column_and_serialize_as_a_sheet_level_array() {
+    let workbook = parse_workbook_reader(Cursor::new(normal::column_widths())).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    assert_eq!(sheet.column_width(1), Some(12.5)); // in the A-C range
+    assert_eq!(sheet.column_width(3), Some(12.5));
+    assert_eq!(sheet.column_width(4), Some(9.1)); // gap -> defaultColWidth
+    assert_eq!(sheet.column_width(5), Some(30.0)); // the E-only range
+    assert_eq!(sheet.column_width(6), Some(9.1)); // beyond every range -> default
+
+    let json = to_json_string(&workbook).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let sheet_json = &parsed["sheets"][0];
+    assert_eq!(sheet_json["defaultColumnWidth"], serde_json::json!(9.1));
+    assert_eq!(
+        sheet_json["columns"],
+        serde_json::json!([
+            {"min": 1, "max": 3, "width": 12.5},
+            {"min": 5, "max": 5, "width": 30.0}
+        ])
+    );
+    // Not duplicated onto individual cells.
+    for cell in sheet_json["cells"].as_array().unwrap() {
+        assert!(cell.get("columnWidth").is_none());
+    }
+}
 
 #[test]
 fn basic_types_maps_each_cell_to_the_right_json_type() {

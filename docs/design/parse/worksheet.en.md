@@ -12,7 +12,8 @@ Design doc for `src/parse/worksheet.rs`. Per [architecture.md](../architecture.e
 - When a cell carries an `s` (`cellXfs` index — style ID reference) attribute, records a corresponding `PendingStyle` (defined by this file; consumed by [`resolve/style.rs`](../resolve/style.en.md))
 - `t="str"` (formula-computed string result) and `t="inlineStr"` (inline string) cells need no deferred resolution, so they are resolved directly to `CellValue::Text` during the stream and inserted via `insert_cell` (the division of labor already assumed by [resolve/shared_strings.md Responsibility/Scope](../resolve/shared_strings.en.md))
 - Collects `<mergeCells><mergeCell ref="A1:C3"/>...</mergeCells>`, which appears after the stream completes (after `</sheetData>`), converting each `ref` into `start`/`end` via [`CellRef::from_a1`](../model/cell.en.md) and gathering them into `Vec<MergedRegion>` (the stage that feeds into [`resolve/merge.rs`](../resolve/merge.en.md)'s validation and registration)
-- **Not responsible for**: actually resolving shared-string indices or style IDs ([`resolve/shared_strings.rs`](../resolve/shared_strings.en.md) / [`resolve/style.rs`](../resolve/style.en.md)), validating merge ranges or registering them into `Sheet` ([`resolve/merge.rs`](../resolve/merge.en.md) — this file only collects the `MergedRegion` list; it never calls `insert_merge`), parsing or retaining formulas (`<f>` elements — see Open Question 2)
+- Collects `<cols><col min=".." max=".." width=".."/>...</cols>`, which appears *before* `<sheetData>` (per the OOXML schema's fixed element order), into `Vec<ColWidthRange>` — one entry per `<col>` that actually carries a `width` attribute (a `<col>` that only sets e.g. `hidden`/`bestFit` is skipped, since this file tracks nothing else about columns yet). Also collects `<sheetFormatPr defaultColWidth="..">` if present. Both feed into [`resolve/column_width.rs`](../resolve/column_width.en.md)'s validation and registration (Issue #39), the same two-phase split `<mergeCells>` already established
+- **Not responsible for**: actually resolving shared-string indices or style IDs ([`resolve/shared_strings.rs`](../resolve/shared_strings.en.md) / [`resolve/style.rs`](../resolve/style.en.md)), validating merge ranges or column-width ranges or registering either into `Sheet` ([`resolve/merge.rs`](../resolve/merge.en.md) / [`resolve/column_width.rs`](../resolve/column_width.en.md) — this file only collects the raw lists; it never calls `insert_merge`/`set_col_widths`), parsing or retaining formulas (`<f>` elements — see Open Question 2)
 
 ## Key Types / Functions (draft)
 
@@ -159,6 +160,7 @@ The structure now fully matches the spirit of architecture.md design policy 2: n
 - If `r`'s value is not well-formed A1 notation (`CellRef::from_a1` returns `Err`), that `Error::InvalidCellRef` propagates unchanged
 - If `<v>`'s numeric text cannot be parsed as `f64`, this returns `Error::InvalidPackage` (provisional; whether a more specific variant is warranted is left to a future revision of [error.md](../error.en.md))
 - If a `<mergeCell ref="...">`'s `ref` value is not in the `"A1:C3"` shape (two `:`-separated coordinates), or either coordinate is not well-formed A1 notation, `Error::InvalidCellRef` propagates. This file does not validate the range's soundness itself (start/end ordering, overlap with other ranges) — it simply appends to `merge_regions` and leaves validation to [`resolve/merge.rs`](../resolve/merge.en.md)
+- If a `<col>`'s `width`/`defaultColWidth` cannot be parsed as `f64`, or its `min`/`max` cannot be parsed as `u32`, returns `Error::InvalidPackage` (same provisional convention as the numeric `<v>` case above). This file does not validate range soundness (overlap, count) — that is [`resolve/column_width.rs`](../resolve/column_width.en.md)'s responsibility, same division of labor as `<mergeCells>`
 - `<f>` (formula) element content is neither parsed nor retained — it is skipped (outside the requirements' scope; see Open Question 2)
 - **Never panics**: since this file handles untrusted external input, any unexpected structure must always propagate as some `Error` variant
 
@@ -175,6 +177,9 @@ The structure now fully matches the spirit of architecture.md design policy 2: n
 - Verify that a `<c>` missing `r` returns `Error::MissingRequiredElement`
 - Verify that a malformed A1-notation `r` attribute or `mergeCell ref` attribute returns `Error::InvalidCellRef`
 - Verify that for a cell containing an `<f>` element (a formula cell), the `<f>` content is ignored and only `<v>` (the cached computed value) is used as the `Cell`'s value
+- Verify that `<cols>` entries with a `width` attribute are collected into `ColWidthRange`s with correct `min`/`max`/`width`, that a `<col>` without `width` is skipped, and that a single `<col min="1" max="16384" .../>` (the realistic worst case) is collected as exactly one range rather than expanded
+- Verify that `<sheetFormatPr defaultColWidth="..">` is collected, and that its absence leaves `default_col_width: None`
+- Verify that a malformed `<col>`/`<sheetFormatPr>` numeric attribute returns `Error::InvalidPackage`
 
 ## Implementation Notes
 

@@ -40,6 +40,44 @@ pub fn basic_types() -> Vec<u8> {
     ])
 }
 
+/// A sheet with `<cols>` declaring two width ranges (one covering columns
+/// A-C, one covering just E) plus `<sheetFormatPr defaultColWidth="..">`
+/// for every other column, alongside a couple of populated cells. Verifies
+/// `<cols>`/`<sheetFormatPr>` parsing and the sheet-level `columns` JSON
+/// output end to end (Issue #39).
+pub fn column_widths() -> Vec<u8> {
+    let worksheet = r#"<worksheet>
+<sheetFormatPr defaultColWidth="9.1" defaultRowHeight="15"/>
+<cols>
+<col min="1" max="3" width="12.5" customWidth="1"/>
+<col min="5" max="5" width="30"/>
+</cols>
+<sheetData>
+<row r="1">
+  <c r="A1"><v>1</v></c>
+  <c r="E1"><v>2</v></c>
+</row>
+</sheetData>
+</worksheet>"#;
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "styles", "styles.xml"),
+            ])
+            .as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        ("xl/styles.xml", DEFAULT_STYLES_XML),
+        ("xl/worksheets/sheet1.xml", worksheet.as_bytes()),
+    ])
+}
+
 /// The same string ("Apple") is referenced by two different cells via the
 /// Shared String Table, alongside one cell referencing a different string
 /// ("Banana"). Verifies `<v>` shared-string indices resolve to the correct

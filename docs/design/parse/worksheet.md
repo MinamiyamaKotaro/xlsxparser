@@ -12,7 +12,8 @@
 - `s`（`cellXfs` インデックス。スタイルID参照）属性を持つセルを検出した場合、対応する `PendingStyle`（本ファイルが定義。[`resolve/style.rs`](../resolve/style.md) が消費する）を記録する
 - `t="str"`（数式の計算結果文字列）・`t="inlineStr"`（インラインストリング）セルは遅延解決を必要としないため、ストリーム中に直接 `CellValue::Text` として解決し `insert_cell` で挿入する（[resolve/shared_strings.md 責務・スコープ](../resolve/shared_strings.md) が既に前提としていた分担）
 - ストリーム完了後（`</sheetData>` の後）に出現する `<mergeCells><mergeCell ref="A1:C3"/>...</mergeCells>` を [`CellRef::from_a1`](../model/cell.md) で `start`/`end` に変換し、`Vec<MergedRegion>` として収集する（[`resolve/merge.rs`](../resolve/merge.md) が検証・登録する前段）
-- **含まない責務**: 共有文字列インデックス・スタイルIDの実際の解決（[`resolve/shared_strings.rs`](../resolve/shared_strings.md) / [`resolve/style.rs`](../resolve/style.md)）、結合範囲の妥当性検証・`Sheet` への登録そのもの（[`resolve/merge.rs`](../resolve/merge.md)。本ファイルは `MergedRegion` のリストを収集するのみで `insert_merge` は呼ばない）、数式（`<f>` 要素）の解析・保持（オープンクエスチョン2参照）
+- `<sheetData>` より**前**（OOXMLスキーマ上固定の要素順）に出現する `<cols><col min=".." max=".." width=".."/>...</cols>` を `Vec<ColWidthRange>` として収集する——`width` 属性を実際に持つ `<col>` のみが対象(`hidden`/`bestFit` などしか持たない `<col>` は本ファイルがまだ何も追跡していないためスキップする)。`<sheetFormatPr defaultColWidth="..">` があれば併せて収集する。いずれも [`resolve/column_width.rs`](../resolve/column_width.md) が検証・登録する前段(Issue #39。`<mergeCells>` と同じ2段階の分担)
+- **含まない責務**: 共有文字列インデックス・スタイルIDの実際の解決（[`resolve/shared_strings.rs`](../resolve/shared_strings.md) / [`resolve/style.rs`](../resolve/style.md)）、結合範囲・列幅範囲の妥当性検証・`Sheet` への登録そのもの（[`resolve/merge.rs`](../resolve/merge.md) / [`resolve/column_width.rs`](../resolve/column_width.md)。本ファイルは生のリストを収集するのみで `insert_merge`/`set_col_widths` は呼ばない）、数式（`<f>` 要素）の解析・保持（オープンクエスチョン2参照）
 
 ## 主要な型・関数（案）
 
@@ -155,6 +156,7 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 - `r` 属性の値が不正なA1形式（`CellRef::from_a1` が `Err` を返す）の場合はそのまま `Error::InvalidCellRef` を伝播する
 - `<v>` の数値テキストが `f64` としてパースできない場合は `Error::InvalidPackage`（暫定。より専用のバリアントを設けるかは [error.md](../error.md) 側の見直しに委ねる）とする
 - `<mergeCell ref="...">` の `ref` 属性値が `"A1:C3"` の形式（`:` 区切りの2座標）でない場合、または各座標が不正なA1形式の場合は `Error::InvalidCellRef` を伝播する。結合範囲としての妥当性（開始・終了の大小関係、他範囲との重複）そのものの検証は行わず、そのまま `merge_regions` へ積んで [`resolve/merge.rs`](../resolve/merge.md) の検証に委ねる
+- `<col>` の `width`/`defaultColWidth` が `f64` として、または `min`/`max` が `u32` としてパースできない場合は `Error::InvalidPackage`（上記の数値 `<v>` と同じ暫定方針）を返す。範囲としての妥当性（重複・件数）そのものの検証は行わず、[`resolve/column_width.rs`](../resolve/column_width.md) に委ねる(`<mergeCells>` と同じ分担)
 - `<f>`（数式）要素の内容はパース・保存せず読み飛ばす（要求仕様書のスコープ外。オープンクエスチョン2参照）
 - **`panic` しない**: 本ファイルが扱う入力は信頼できない外部ファイルであるため、想定外の構造は必ず `Error` のいずれかのバリアントとして伝播させる
 
@@ -170,6 +172,9 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 - `<mergeCells>` 内の複数 `<mergeCell ref="...">` から、`start`/`end` が正しい `MergedRegion` のリストが得られることの確認（妥当性検証自体は行わないため、開始・終了が逆転した不正な範囲もそのまま `Vec` へ含まれることの確認を含む。検証は [resolve/merge.md テスト方針](../resolve/merge.md) 側の責務）
 - `r` 属性を欠く `<c>` に対し `Error::MissingRequiredElement` を返すことの確認
 - 不正なA1形式の `r` 属性・`mergeCell ref` 属性に対し `Error::InvalidCellRef` を返すことの確認
+- `width` 属性を持つ `<cols>` の各エントリが、正しい `min`/`max`/`width` の `ColWidthRange` として収集されることの確認。`width` を持たない `<col>` はスキップされることの確認。単一の `<col min="1" max="16384" .../>`（実データの最悪ケース）が展開されず1件として収集されることの確認
+- `<sheetFormatPr defaultColWidth="..">` が収集されること、および欠落時に `default_col_width: None` のままであることの確認
+- `<col>`/`<sheetFormatPr>` の不正な数値属性に対し `Error::InvalidPackage` を返すことの確認
 - `<f>` 要素を含むセル（数式セル）について、`<f>` の内容が無視され `<v>`（計算済みキャッシュ値）のみが `Cell` の値として採用されることの確認
 
 ## 実装メモ

@@ -112,6 +112,8 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
             &shared_string_table,
             &output.pending_styles,
             &stylesheet,
+            output.col_width_ranges,
+            output.default_col_width,
             output.merge_regions,
         )?;
         sheets.push(sheet);
@@ -279,6 +281,63 @@ mod tests {
         ]);
         let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
         assert!(matches!(err, Error::TooManyMergedRanges { .. }));
+    }
+
+    #[test]
+    fn excessive_col_width_range_count_is_too_many_column_width_ranges() {
+        // Issue #39, same reasoning as the merge-count cap above: an
+        // unbounded number of tiny <col> entries fits comfortably within
+        // the Zip Bomb byte cap, so the range count itself must be bounded
+        // independently. 2,001 (one over
+        // resolve::column_width::MAX_COLUMN_WIDTH_RANGES) is used here
+        // rather than importing the private constant, to keep this an
+        // end-to-end, XML-driven check.
+        let mut cols = String::from("<cols>");
+        for i in 1..=2_001u32 {
+            cols.push_str(&format!("<col min=\"{i}\" max=\"{i}\" width=\"10\"/>"));
+        }
+        cols.push_str("</cols>");
+        let sheet_with_excessive_col_widths =
+            format!("<worksheet>{cols}<sheetData></sheetData></worksheet>");
+
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            (
+                "xl/worksheets/sheet1.xml",
+                sheet_with_excessive_col_widths.as_bytes(),
+            ),
+        ]);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::TooManyColumnWidthRanges { .. }));
+    }
+
+    #[test]
+    fn full_width_single_col_range_registers_without_hanging() {
+        // Mirrors model::sheet::tests::insert_merge_on_huge_region_does_not_hang
+        // for column widths: a single <col min="1" max="16384" .../> must
+        // register as one range, not expand into 16,384 entries.
+        let sheet_with_full_width_col = r#"<worksheet>
+<cols><col min="1" max="16384" width="8.43"/></cols>
+<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+</worksheet>"#;
+
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            (
+                "xl/worksheets/sheet1.xml",
+                sheet_with_full_width_col.as_bytes(),
+            ),
+        ]);
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+        let sheet = &workbook.sheets()[0];
+        assert_eq!(sheet.column_width(1), Some(8.43));
+        assert_eq!(sheet.column_width(16_384), Some(8.43));
     }
 
     #[test]
