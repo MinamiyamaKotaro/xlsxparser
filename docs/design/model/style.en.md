@@ -55,6 +55,15 @@ pub struct ResolvedStyle {
     /// — the downstream grid-paper detector gates its overflow heuristic
     /// on this: a wrapped cell is never flagged as overflowing.
     pub wrap_text: bool,
+    /// The `numFmtId` referenced by `<xf>`, resolved to its format-code
+    /// string (Issue #41) — built-in (ECMA-376 Part 1 §18.8.30) or custom
+    /// (`<numFmts>`). `None` for `numFmtId=0` ("General"), an absent
+    /// `numFmtId`, or an ID resolving to neither table — "General" carries
+    /// no information beyond "nothing special", so it gets the same
+    /// treatment as "not found" rather than `Some("General")`. `Arc<str>`
+    /// for the same reason `CellValue::Text` uses it: the same format code
+    /// is frequently shared across many `StyleId`s.
+    pub number_format: Option<Arc<str>>,
     // Concrete fields for fill/border/other alignment properties etc. will
     // be added as their own sub-issues land (see Open Question 1).
 }
@@ -83,5 +92,5 @@ Not applicable. Since this file contains only type definitions, it has no unit t
 
 ## Open Questions
 
-1. **Concrete style elements such as fill/border/wrap/alignment**: further resolved — `font: Font { size_pt, bold }` (Issue #38) and `wrap_text: bool` (Issue #37, the overflow-heuristic gate) are both implemented. Still open for the remaining sub-issues under [Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36): a `number_format` string (#41) and `alignment` (#42). Font color, fill, border, italic, underline, and any other `CT_Font`/`CT_Fill`/`CT_Border` properties, plus every other `CT_CellAlignment` attribute besides `wrapText` (horizontal/vertical alignment, indent, text rotation, ...), remain out of scope until a concrete downstream use case names them — the same "not a full transcription" policy `Font` already follows.
+1. **Concrete style elements such as fill/border/wrap/alignment**: further resolved — `font: Font { size_pt, bold }` (Issue #38), `wrap_text: bool` (Issue #37, the overflow-heuristic gate), and `number_format: Option<Arc<str>>` (Issue #41) are all implemented. Still open for the remaining sub-issue under [Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36): `alignment` (#42). Font color, fill, border, italic, underline, and any other `CT_Font`/`CT_Fill`/`CT_Border` properties, plus every other `CT_CellAlignment` attribute besides `wrapText` (horizontal/vertical alignment, indent, text rotation, ...), remain out of scope until a concrete downstream use case names them — the same "not a full transcription" policy `Font` already follows.
 2. ~~Where the date/time format determination logic lives~~ → **Resolved**: [`parse/styles.rs`](../parse/styles.en.md) owns classifying `ResolvedStyle::is_date_time` from `numFmtId`/`formatCode` (the same point as [resolve/style.md Open Question 2](../resolve/style.en.md)). The heuristic's precision itself remains open — see [parse/styles.md Open Question 2](../parse/styles.en.md).

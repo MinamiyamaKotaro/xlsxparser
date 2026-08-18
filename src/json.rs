@@ -179,7 +179,13 @@ struct JsonStyle {
     /// `numberFormat`, "general" is a real, meaningful alignment mode, not
     /// "nothing to report" (Issue #42).
     alignment: &'static str,
-    // numberFormat joins this struct as its own sub-issue lands (Issue #36).
+    /// Omitted when `None` ("General" — no special format; see
+    /// `model/style.rs`'s `ResolvedStyle::number_format` doc comment for why
+    /// this is skipped rather than emitted as `"General"`) — unlike `font`/
+    /// `wrap_text`/`alignment`, which always carry a meaningful value once a
+    /// `style` object exists at all (Issue #41).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    number_format: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -227,6 +233,7 @@ fn cell_to_json(sheet: &Sheet, cell_ref: CellRef, cell: &Cell) -> JsonCell {
             },
             wrap_text: s.wrap_text,
             alignment: alignment_tag(s.horizontal_alignment),
+            number_format: s.number_format.as_deref().map(str::to_string),
         }),
     }
 }
@@ -351,6 +358,47 @@ mod tests {
                 "alignment": "general"
             })
         );
+    }
+
+    #[test]
+    fn styled_cell_with_number_format_reports_it_nested_under_style() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.insert_cell(
+            CellRef { row: 1, col: 1 },
+            Cell {
+                value: Some(CellValue::Number(0.5)),
+                style: Some(Arc::new(ResolvedStyle {
+                    number_format: Some(Arc::from("0%")),
+                    ..Default::default()
+                })),
+            },
+        );
+        let workbook = Workbook::new(vec![sheet]);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cell_json = &parsed["sheets"][0]["cells"][0];
+
+        assert_eq!(cell_json["style"]["numberFormat"], "0%");
+    }
+
+    #[test]
+    fn styled_cell_without_number_format_omits_the_field_entirely() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.insert_cell(
+            CellRef { row: 1, col: 1 },
+            Cell {
+                value: Some(CellValue::Number(1.0)),
+                style: Some(Arc::new(ResolvedStyle::default())),
+            },
+        );
+        let workbook = Workbook::new(vec![sheet]);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cell_json = &parsed["sheets"][0]["cells"][0];
+
+        assert!(cell_json["style"].get("numberFormat").is_none());
     }
 
     #[test]

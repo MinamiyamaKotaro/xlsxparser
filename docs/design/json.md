@@ -151,8 +151,14 @@ fn is_one(n: &u32) -> bool {
 struct JsonStyle {
     font: JsonFont,
     wrap_text: bool,
-    // numberFormat/alignment は各サブIssueの実装が進むにつれてこの構造体へ
-    // 加わる(Issue #36)。
+    /// `None`(「General」——特別な書式なし。`model/style.rs` の
+    /// `ResolvedStyle::number_format` ドキュメントコメント参照)の場合は
+    /// フィールド自体を省略する——`style` オブジェクトが存在する限り常に
+    /// 意味のある値を持つ `font`/`wrap_text` とは異なる(Issue #41)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    number_format: Option<String>,
+    // alignment は自身のサブIssueの実装が進み次第この構造体へ加わる
+    // (Issue #36)。
 }
 
 #[derive(Debug, Serialize)]
@@ -195,6 +201,7 @@ fn cell_to_json(sheet: &Sheet, cell_ref: CellRef, cell: &Cell) -> JsonCell {
         style: cell.style.as_ref().map(|s| JsonStyle {
             font: JsonFont { size_pt: s.font.size_pt, bold: s.font.bold },
             wrap_text: s.wrap_text,
+            number_format: s.number_format.as_deref().map(str::to_string),
         }),
     }
 }
@@ -266,12 +273,13 @@ fn visibility_tag(v: SheetVisibility) -> &'static str {
 - **スタイルを持つセルの `font`(`size_pt`/`bold`)がセル単位の `style` オブジェクトの下にネストしてシリアライズされ、スタイルを持たないセル(`Cell.style: None`)では `style` フィールド自体が省略されることの確認**（Issue #38。フォントは同じ列内でもセルごとに本当に変わりうるため、`columns` とは逆の疎性判断になる）
 - **`style.wrapText` が `style.font` と同じセル単位の `style` オブジェクトの下に、`true`/`false` いずれの場合もシリアライズされることの確認**（Issue #37。`JsonStyle` が常に両フィールドを一緒に持つようになったため、`font` で確立済みの「スタイルあり/なし」の疎性配線をそのまま再利用する）
 - **`CellValue::DateTime` を持つセルが `{"type": "dateTime", "value": "..."}` としてISO 8601文字列でシリアライズされ、一桁の暦フィールドがゼロ埋めされることの確認**(例: `2024-01-05T03:05:09` であって `2024-1-5T3:5:9` ではない——Issue #40)
+- **解決済みの `number_format` を持つスタイル付きセルが `style.numberFormat` をその文字列としてシリアライズすること、および `number_format: None`(「General」)のスタイル付きセルは `style` 自体は存在するのに `numberFormat` フィールドだけが省略されることの確認**(Issue #41。同じ既存の `style` オブジェクト内で `font`/`wrap_text` とは逆の疎性判断になる——「General」は下流にとって不要な情報のため)
 
 ## 未決事項 / オープンクエスチョン
 
 1. ~~JSON構造における値の種別タグ付けの是非~~ → **解決**: `{"type": "number", "value": 42}` のようなタグ付き表現を維持する（[PR #10 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/10#pullrequestreview-4949223332)を反映）。タグを外してネイティブなJSON型のみで出力すると、`dateTime` と単なる文字列（`Text`）をフロントエンド側が区別できず日付ピッカー等の適用に文字列解析が必要になること、`error`（数式エラー値）を通常の文字列と区別してグリッド上で警告表示するといった制御ができなくなること、TypeScript側でタグ付きユニオン型（Discriminated Union）による型安全なクライアント実装ができなくなることが理由。
 2. ~~非有限浮動小数点数（`NaN`/`Infinity`）のフォールバック値~~ → **解決**: `0.0` ではなく `JsonCellValue::Empty`（`null` 相当）へフォールバックする（[PR #10 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/10#pullrequestreview-4949223332)を反映）。詳細はエラー処理方針参照。
 3. ~~`DateTime` の文字列表現形式~~ → **解決**(Issue #40): タイムゾーン指定子・ミリ秒なしのISO 8601形式、例: `"2024-01-01T13:45:30"`。日付のみのセルも時刻00:00:00(`T00:00:00`)としてシリアライズする——省略するのではなく。Excel自体が日付のみ/日付+時刻を型として区別しないため元々それ以上の情報が存在せず、セルごとに形式が変わるフォーマットより、常に一定の形状の方が下流の消費側にとってパースしやすい。`format_date_time` は現在 `DateTimeValue` の実フィールド `year`/`month`/`day`/`hour`/`minute`/`second`([model/cell.md オープンクエスチョン4](model/cell.md)、同じくIssue #40で解決)をこの形式へ直接読み込む。
-4. **スタイル情報のJSON出力**: さらに解決が進んだ——`JsonCell.style.font`(Issue #38)と `JsonCell.style.wrapText`(Issue #37)をいずれも上記の通り実装した。`number_format`/`alignment` は各サブIssueの実装が進むにつれて未解決のまま残り、いずれも同じ `JsonStyle` 構造体に加わる見込み([model/style.md オープンクエスチョン1](model/style.md))。
+4. **スタイル情報のJSON出力**: さらに解決が進んだ——`JsonCell.style.font`(Issue #38)、`JsonCell.style.wrapText`(Issue #37)、`JsonCell.style.numberFormat`(Issue #41)をいずれも上記の通り実装した。`alignment` は未解決のまま残り、同じ `JsonStyle` 構造体に加わる見込み([model/style.md オープンクエスチョン1](model/style.md))。
 5. ~~一括構築によるピークメモリの抑制~~ → **解決**: `Vec<JsonCell>` を事前構築せず、`Sheet::iter_cells` から得たイテレータを `CellSeq::serialize` 内で直接 `serde::ser::SerializeSeq` へ流し込むストリーミング設計に変更した（[PR #10 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/10#pullrequestreview-4949223332)を反映）。ただし `to_json_string`（内部で `Vec<u8>` バッファを使う簡易版）自体は出力サイズに比例したO(n)のメモリを要する点は変わらない。真にO(1)の追加メモリで完結させたい呼び出し元は `to_json_writer` に `BufWriter<File>` 等の実際のI/O先を渡す必要がある。また `Sheet::iter_cells` が `ExactSizeIterator` を保証しないため `serialize_seq` の要素数ヒントを `None` としている点（JSON出力自体の正しさには影響しないが、一部のシリアライザ実装で軽微な最適化機会を逃す）は、[model/sheet.md](model/sheet.md) 側で `ExactSizeIterator` を公開APIとして約束するかどうかの検討課題として残る。
 6. **`to_json_writer`/`to_json_string` と `lib.rs` の公開APIとの関係**: `Workbook` を返す `parse_workbook` とは別に、本関数群を `lib.rs` がどう公開するかは [pipeline.md オープンクエスチョン1](pipeline.md) と連動し、`lib.rs` の設計時に確定させる。
