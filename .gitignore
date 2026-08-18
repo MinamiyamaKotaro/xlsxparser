@@ -16,5 +16,5 @@
 .DS_Store
 Thumbs.db
 
-# TEST files (added 2026-08-18 13:37 JST)
+# TEST files: contains personal information, do not commit (added 2026-08-18 13:37 JST)
 tests/fixtures/other
