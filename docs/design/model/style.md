@@ -54,6 +54,15 @@ pub struct ResolvedStyle {
     /// ——下流の方眼紙判定ツールがはみ出し判定のゲート条件として使う:
     /// 折返し設定のセルは決してはみ出し扱いにならない。
     pub wrap_text: bool,
+    /// `<xf>` が参照する `numFmtId` を書式コード文字列へ解決したもの
+    /// (Issue #41)——組み込み(ECMA-376 Part 1 §18.8.30)・カスタム
+    /// (`<numFmts>`)いずれも対象。`None` は `numFmtId=0`(「General」)、
+    /// `numFmtId` 属性の欠落、いずれの表にも見つからないIDのいずれかを
+    /// 表す——「General」は「特別な書式なし」以上の情報を持たないため、
+    /// `Some("General")` ではなく「見つからない」場合と同じ扱いとする。
+    /// `Arc<str>` を採用する理由は `CellValue::Text` と同じ: 同一の
+    /// 書式コードが多数の `StyleId` 間で共有されることが多いため。
+    pub number_format: Option<Arc<str>>,
     // fill/border等その他のalignmentプロパティは、各サブIssueの
     // 実装が進むにつれて追加する(オープンクエスチョン1参照)。
 }
@@ -82,5 +91,5 @@ pub type StyleSheet = HashMap<StyleId, Arc<ResolvedStyle>>;
 
 ## 未決事項 / オープンクエスチョン
 
-1. **塗りつぶし/罫線/折返し/配置などの具体的なスタイル要素**: さらに解決が進んだ——`font: Font { size_pt, bold }`(Issue #38)と `wrap_text: bool`(Issue #37、はみ出し判定のゲート条件)をいずれも実装済み。[Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36) 配下の残りのサブIssue: `number_format` 文字列(#41)、`alignment`(#42)は引き続き未解決。フォント色・塗りつぶし・罫線・斜体・下線などその他の `CT_Font`/`CT_Fill`/`CT_Border` プロパティ、および `wrapText` 以外の `CT_CellAlignment` の属性(水平/垂直配置、インデント、テキスト回転等)は、具体的な下流ユースケースが現れるまでスコープ外のまま(`Font` が既に採用している「完全な転写はしない」方針と同じ)。
+1. **塗りつぶし/罫線/折返し/配置などの具体的なスタイル要素**: さらに解決が進んだ——`font: Font { size_pt, bold }`(Issue #38)、`wrap_text: bool`(Issue #37、はみ出し判定のゲート条件)、`number_format: Option<Arc<str>>`(Issue #41)をいずれも実装済み。[Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36) 配下の残りのサブIssueは `alignment`(#42)のみ。フォント色・塗りつぶし・罫線・斜体・下線などその他の `CT_Font`/`CT_Fill`/`CT_Border` プロパティ、および `wrapText` 以外の `CT_CellAlignment` の属性(水平/垂直配置、インデント、テキスト回転等)は、具体的な下流ユースケースが現れるまでスコープ外のまま(`Font` が既に採用している「完全な転写はしない」方針と同じ)。
 2. ~~日付/時刻書式の判定ロジックの置き場所~~ → **解決**: [`parse/styles.rs`](../parse/styles.md) が `numFmtId`/`formatCode` から `ResolvedStyle::is_date_time` を判定するロジックを持つ（[resolve/style.md オープンクエスチョン2](../resolve/style.md) と同一の論点）。判定ヒューリスティックの精度自体は [parse/styles.md オープンクエスチョン2](../parse/styles.md) として引き続き未解決。

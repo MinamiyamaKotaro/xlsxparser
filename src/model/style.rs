@@ -48,6 +48,17 @@ pub struct ResolvedStyle {
     /// — the downstream grid-paper detector's overflow-detection heuristic
     /// uses this as a gate: a wrapped cell is never flagged as overflowing.
     pub wrap_text: bool,
+    /// The `numFmtId` referenced by `<xf>`, resolved to its format-code
+    /// string (Issue #41) — built-in (ECMA-376 Part 1 §18.8.30) or custom
+    /// (`<numFmts>`). `None` represents `numFmtId=0` ("General"), an
+    /// absent `numFmtId` attribute, or a reference to neither a known
+    /// built-in nor a defined custom format — "General" carries no
+    /// information a downstream consumer needs beyond "no special format",
+    /// so it is treated the same as "nothing to report" rather than
+    /// `Some("General")`. `Arc<str>` avoids duplicating the format-code
+    /// string across every `StyleId` that shares the same `numFmtId`, the
+    /// same reasoning `CellValue::Text` already applies.
+    pub number_format: Option<Arc<str>>,
     // Concrete fields for fill/border/other alignment properties etc. are
     // added as their own sub-issues land (see
     // docs/design/model/style.en.md Open Question 1).
