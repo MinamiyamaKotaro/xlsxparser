@@ -96,6 +96,24 @@ pub enum Error {
         reason: String,
     },
 
+    /// 1シート内の`<mergeCell>`件数が `resolve::merge::MAX_MERGE_REGIONS`
+    /// を超えた（実装時に追加。[セキュリティコードレビュー Finding 1](security/code-review.md)
+    /// を受けて。[resolve/merge.md オープンクエスチョン2の追記](resolve/merge.md)参照）。
+    #[error("too many merged cell ranges in one sheet: {count} exceeds limit {limit}")]
+    TooManyMergedRanges { count: usize, limit: usize },
+
+    /// `<col>` の列幅範囲が不正（他の範囲と重複している）。`InvalidMergedRange`
+    /// と同じ形（Issue #39。[resolve/column_width.md](resolve/column_width.md)参照）。
+    #[error("invalid column width range {min}:{max}: {reason}")]
+    InvalidColumnWidthRange { min: u32, max: u32, reason: String },
+
+    /// 1シート内の`<col>`範囲件数が `resolve::column_width::MAX_COLUMN_WIDTH_RANGES`
+    /// を超えた。`TooManyMergedRanges` と同じ理由(Zip Bombのバイト数上限だけでは
+    /// 範囲件数を抑えられない)によるもので、O(N²)のリスクを防ぐためではない
+    /// ([resolve/column_width.md](resolve/column_width.md)参照)。
+    #[error("too many column width ranges in one sheet: {count} exceeds limit {limit}")]
+    TooManyColumnWidthRanges { count: usize, limit: usize },
+
     // --- フェーズ5: JSON生成 ---
     /// JSONへのシリアライズに失敗した（`serde_json` が返すエラーを包む）。
     /// `source` は `XmlParse::source` と同じ理由で `Box<dyn Error>` として

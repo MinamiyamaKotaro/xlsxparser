@@ -108,6 +108,27 @@ pub enum Error {
         reason: String,
     },
 
+    /// The number of `<mergeCell>` entries in a single sheet exceeded
+    /// `resolve::merge::MAX_MERGE_REGIONS` (added after implementation,
+    /// following [security code-review.en.md Finding 1](security/code-review.en.md);
+    /// see [resolve/merge.en.md Open Question 2's addendum](resolve/merge.en.md)).
+    #[error("too many merged cell ranges in one sheet: {count} exceeds limit {limit}")]
+    TooManyMergedRanges { count: usize, limit: usize },
+
+    /// A `<col>` width range is invalid (overlaps another range). Mirrors
+    /// `InvalidMergedRange`'s shape (Issue #39; see
+    /// [resolve/column_width.en.md](resolve/column_width.en.md)).
+    #[error("invalid column width range {min}:{max}: {reason}")]
+    InvalidColumnWidthRange { min: u32, max: u32, reason: String },
+
+    /// The number of `<col>` range entries in a single sheet exceeded
+    /// `resolve::column_width::MAX_COLUMN_WIDTH_RANGES`. Mirrors
+    /// `TooManyMergedRanges`'s reasoning (the Zip Bomb byte cap alone does
+    /// not bound the range count) rather than an O(N^2) risk of its own —
+    /// see [resolve/column_width.en.md](resolve/column_width.en.md).
+    #[error("too many column width ranges in one sheet: {count} exceeds limit {limit}")]
+    TooManyColumnWidthRanges { count: usize, limit: usize },
+
     // --- Phase 5: JSON generation ---
     /// JSON serialization failed (wraps the error `serde_json` returns).
     /// `source` is type-erased as `Box<dyn Error>` for the same reason as

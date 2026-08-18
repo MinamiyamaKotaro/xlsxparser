@@ -6,9 +6,9 @@
 
 ## 責務・スコープ
 
-- サブモジュールの宣言（`mod shared_strings; mod merge; mod style;`）と公開型の再エクスポート
-- 1シート分の未解決データ（フェーズ3が構築した `model::Sheet` と、共有文字列インデックス・スタイルIDの保留リスト、`<mergeCells>` の範囲リスト）を受け取り、[shared_strings.md](shared_strings.md) → [style.md](style.md) → [merge.md](merge.md) の順で解決処理を呼び出すエントリ関数 `resolve_sheet` を提供する
-- **含まない責務**: 各解決処理そのもののロジック（共有文字列のインデックス引き当て、スタイルの適用、結合範囲の検証・登録は各サブモジュールの責務）、XMLパースそのもの（`parse/worksheet.rs` 等）、`SharedStringTable` / `StyleSheet` の構築（`parse/shared_strings.rs` / `parse/styles.rs`。未設計、オープンクエスチョン1参照）
+- サブモジュールの宣言（`mod shared_strings; mod merge; mod style; mod column_width;`）と公開型の再エクスポート
+- 1シート分の未解決データ（フェーズ3が構築した `model::Sheet` と、共有文字列インデックス・スタイルIDの保留リスト、`<cols>` の範囲リストと `defaultColWidth`、`<mergeCells>` の範囲リスト）を受け取り、[shared_strings.md](shared_strings.md) → [style.md](style.md) → [column_width.md](column_width.md) → [merge.md](merge.md) の順で解決処理を呼び出すエントリ関数 `resolve_sheet` を提供する
+- **含まない責務**: 各解決処理そのもののロジック（共有文字列のインデックス引き当て、スタイルの適用、列幅範囲・結合範囲の検証・登録は各サブモジュールの責務）、XMLパースそのもの（`parse/worksheet.rs` 等）、`SharedStringTable` / `StyleSheet` の構築（`parse/shared_strings.rs` / `parse/styles.rs`）
 
 ## 主要な型・関数（案）
 
@@ -16,9 +16,10 @@
 mod shared_strings;
 mod merge;
 mod style;
+mod column_width;
 
 use crate::error::Error;
-use crate::model::sheet::{MergedRegion, Sheet};
+use crate::model::sheet::{ColWidthRange, MergedRegion, Sheet};
 use crate::model::style::StyleSheet;
 // PendingSharedString/PendingStyleはフェーズ3の出力データそのものであるため
 // parse/worksheet.rsが定義する（PR #9レビューを反映。依存関係セクション参照）。
@@ -37,10 +38,13 @@ pub fn resolve_sheet(
     shared_string_table: &crate::parse::shared_strings::SharedStringTable,
     pending_styles: &[PendingStyle],
     stylesheet: &StyleSheet,
+    col_width_ranges: Vec<ColWidthRange>,
+    default_col_width: Option<f64>,
     merge_regions: Vec<MergedRegion>,
 ) -> Result<(), Error> {
     shared_strings::resolve(sheet, pending_shared_strings, shared_string_table)?;
     style::resolve(sheet, pending_styles, stylesheet)?;
+    column_width::resolve(sheet, col_width_ranges, default_col_width)?;
     merge::resolve(sheet, merge_regions)?;
     Ok(())
 }
@@ -48,10 +52,10 @@ pub fn resolve_sheet(
 
 ## 依存関係
 
-- 依存先: [`resolve/shared_strings.rs`](shared_strings.md), [`resolve/merge.rs`](merge.md), [`resolve/style.rs`](style.md)（すべて `mod` 宣言として）、[`model/sheet.rs`](../model/sheet.md)（`Sheet`, `MergedRegion`）、[`error.rs`](../error.md)。[`parse::shared_strings::SharedStringTable`](../parse/shared_strings.md)、[`parse::worksheet::{PendingSharedString, PendingStyle}`](../parse/worksheet.md) にも依存するが、これは architecture.md 設計方針2が禁じる「I/Oへの依存」ではなく「フェーズ3が既に構築済みの、メモリ上の構造化データへの依存」であるため、`resolve/` の I/O非依存方針とは矛盾しない（quick-xml や `std::fs` など実際のI/O・XML構造への依存は持たない）。
+- 依存先: [`resolve/shared_strings.rs`](shared_strings.md), [`resolve/merge.rs`](merge.md), [`resolve/style.rs`](style.md), [`resolve/column_width.rs`](column_width.md)（すべて `mod` 宣言として）、[`model/sheet.rs`](../model/sheet.md)（`Sheet`, `MergedRegion`, `ColWidthRange`）、[`error.rs`](../error.md)。[`parse::shared_strings::SharedStringTable`](../parse/shared_strings.md)、[`parse::worksheet::{PendingSharedString, PendingStyle}`](../parse/worksheet.md) にも依存するが、これは architecture.md 設計方針2が禁じる「I/Oへの依存」ではなく「フェーズ3が既に構築済みの、メモリ上の構造化データへの依存」であるため、`resolve/` の I/O非依存方針とは矛盾しない（quick-xml や `std::fs` など実際のI/O・XML構造への依存は持たない）。
 - 依存元: `pipeline.rs`（各シートのフェーズ3完了後に `resolve_sheet` を呼び出す）
 
-`resolve_sheet` 内の呼び出し順序（共有文字列解決 → スタイル適用 → 結合解決）に強い前後関係はない（各サブモジュールが読み書きするセルのフィールドが独立しているため）。結合解決を最後に置いているのは、[merge.md](merge.md) の `insert_merge` が呼び出し時点で起点セルが `cells` に存在することを前提とするための保険的な順序であり、共有文字列・スタイルの解決漏れがあった場合に問題を早期に検出しやすくする意図（詳細はオープンクエスチョン2参照）。
+共有文字列解決・スタイル適用・列幅解決の3つには強い前後関係はない（それぞれが読み書きする状態が独立しているため）。結合解決を最後に置いているのは保険的な順序である: [merge.md](merge.md) の `insert_merge` は呼び出し時点で起点セルが `cells` に存在することを前提としており、さらにIssue #43以降は `merge::resolve` の最終ステップとして呼ばれる `Sheet::finalize_merges` が `cells` から起点以外の全エントリを削除するため、仮想(非起点)座標にまだ触れる可能性のある他の全ステップが完了した後でなければならない。
 
 ## エラー処理方針
 
