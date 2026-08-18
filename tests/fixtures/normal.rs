@@ -40,6 +40,38 @@ pub fn basic_types() -> Vec<u8> {
     ])
 }
 
+/// Two cells, each styled via a distinct `<cellXfs>` entry that resolves
+/// (via `fontId`) to a different `<fonts>` entry: A1 uses the default
+/// 11pt/not-bold font (style id 0), B1 uses a 14pt/bold font (style id 1,
+/// a plausible "heading" style). Verifies `<fonts>`/`fontId` resolution and
+/// the per-cell `style.font` JSON output end to end (Issue #38).
+pub fn font_styles() -> Vec<u8> {
+    let rows = r#"<row r="1">
+  <c r="A1" s="0"><v>1</v></c>
+  <c r="B1" s="1"><v>2</v></c>
+</row>"#;
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "styles", "styles.xml"),
+            ])
+            .as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        ("xl/styles.xml", FONT_STYLES_XML),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(rows, "").as_bytes(),
+        ),
+    ])
+}
+
 /// A sheet with `<cols>` declaring two width ranges (one covering columns
 /// A-C, one covering just E) plus `<sheetFormatPr defaultColWidth="..">`
 /// for every other column, alongside a couple of populated cells. Verifies

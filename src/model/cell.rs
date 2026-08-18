@@ -207,6 +207,7 @@ mod tests {
     fn cell_with_formatting_only_has_no_value() {
         let style = Arc::new(ResolvedStyle {
             is_date_time: false,
+            ..Default::default()
         });
         let cell = Cell {
             value: None,
@@ -218,7 +219,10 @@ mod tests {
 
     #[test]
     fn arc_sharing_avoids_duplication() {
-        let style = Arc::new(ResolvedStyle { is_date_time: true });
+        let style = Arc::new(ResolvedStyle {
+            is_date_time: true,
+            ..Default::default()
+        });
         let a = Cell {
             value: None,
             style: Some(style.clone()),
