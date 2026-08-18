@@ -71,6 +71,8 @@ sheet with a single merged region, `A1:C3`, holding one text cell):
       "visibility": "visible",
       "maxRow": 3,
       "maxCol": 3,
+      "defaultColumnWidth": null,
+      "columns": [],
       "cells": [
         {
           "row": 1,
@@ -90,6 +92,16 @@ sheet with a single merged region, `A1:C3`, holding one text cell):
 - `maxRow`/`maxCol` are the sheet's bounding box (the highest populated or
   merged coordinate) — not the OOXML `<dimension>` value, which isn't read
   at all.
+- `columns` is the sheet's `<cols>` ranges (`{"min", "max", "width"}`,
+  1-based and inclusive), each entry covering every column in that range —
+  not one `columnWidth` value duplicated onto every cell, since that would
+  multiply output size for no benefit (see
+  [Sparse merged-cell arrangements](#sparse-merged-cell-arrangements)
+  below for the same principle applied to merged cells). `defaultColumnWidth`
+  is `<sheetFormatPr defaultColWidth="..">`'s value, or `null` if the
+  workbook doesn't set one; a column not covered by any `columns` entry
+  falls back to it. Neither fixture used in these two examples declares
+  `<cols>`, so both show the empty/absent case.
 - `cells` only contains populated coordinates: a blank cell in between is
   simply absent, never emitted as a `null`/`"empty"` entry (see
   [Motivation](#motivation)). Cell order is unspecified — the sheet is
@@ -117,6 +129,8 @@ for readability, since actual order is unspecified):
       "visibility": "visible",
       "maxRow": 1,
       "maxCol": 7,
+      "defaultColumnWidth": null,
+      "columns": [],
       "cells": [
         { "row": 1, "col": 1, "value": { "type": "text", "value": "日本語Text" } },
         { "row": 1, "col": 2, "value": { "type": "number", "value": 42.0 } },
@@ -133,6 +147,31 @@ for readability, since actual order is unspecified):
 
 (Column 4 is a date cell — it currently serializes as `"empty"` rather than
 `"dateTime"`, per the placeholder-`DateTimeValue` note above.)
+
+A third real example — a sheet that does declare `<cols>`
+(`tests/fixtures/normal.rs`'s `column_widths()`: `<col min="1" max="3"
+width="12.5"/>`, `<col min="5" max="5" width="30"/>`, and
+`<sheetFormatPr defaultColWidth="9.1"/>`):
+
+```json
+{
+  "maxRow": 1,
+  "maxCol": 5,
+  "defaultColumnWidth": 9.1,
+  "columns": [
+    { "min": 1, "max": 3, "width": 12.5 },
+    { "min": 5, "max": 5, "width": 30.0 }
+  ],
+  "cells": [
+    { "row": 1, "col": 1, "value": { "type": "number", "value": 1.0 } },
+    { "row": 1, "col": 5, "value": { "type": "number", "value": 2.0 } }
+  ]
+}
+```
+
+Column 4 falls in the gap between the two `columns` ranges, so a cell there
+(none exist in this example) would fall back to `defaultColumnWidth`
+(9.1) rather than either range's `width`.
 
 ## Architecture
 
