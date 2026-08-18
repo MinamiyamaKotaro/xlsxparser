@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Phase 1: parses a `_rels/*.rels` part (e.g.
 //! `xl/_rels/workbook.xml.rels`) into a routing map from `r:id` to the
 //! target part.

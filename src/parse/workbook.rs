@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Parses `xl/workbook.xml`'s `<sheets>` list into an ordered
 //! `Vec<WorkbookSheetEntry>`, preserving source definition order.
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Resolved cell style information: `StyleId`, `ResolvedStyle`, `StyleSheet`.
 //!
 //! Pure data structures shared as vocabulary between `parse/styles.rs`

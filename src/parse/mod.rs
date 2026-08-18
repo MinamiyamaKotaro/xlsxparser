@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! XML parsing layer: consolidates the `quick-xml` dependency. Secure
 //! `Reader` construction, XML error conversion, and helpers shared by every
 //! submodule live here; each submodule interprets one OOXML part's

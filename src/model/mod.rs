@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Pure domain data structures (`Cell`, `Sheet`, `Workbook`, ...). No
 //! dependency on XML parsing or resolution logic — see
 //! `docs/design/architecture.en.md`.

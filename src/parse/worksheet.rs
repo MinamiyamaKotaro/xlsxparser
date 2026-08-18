@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Phase 3: SAX-style streaming parse of `xl/worksheets/sheetX.xml`.
 //! Streams `<sheetData>` row by row, inserting cells into `Sheet` directly,
 //! while collecting the pieces that need Phase 4's deferred resolution

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Phase 4: validates the `<cols>` range list before registering it with
 //! `Sheet::set_col_widths`.
 

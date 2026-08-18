@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Crate-wide error type. See `docs/design/error.en.md` for the design
 //! rationale (in particular, why external-crate errors are type-erased as
 //! `Box<dyn std::error::Error + Send + Sync + 'static>` instead of being

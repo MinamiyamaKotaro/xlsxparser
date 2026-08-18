@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Parses `xl/styles.xml`'s `<numFmts>`/`<fonts>`/`<cellXfs>` into a
 //! `StyleSheet` (`cellXfs` index -> `ResolvedStyle`), classifying each
 //! format as date/time or not and resolving each `<xf>`'s font/wrap-text.

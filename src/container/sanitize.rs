@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Phase 2 sanitization: Zip Slip path validation and Zip Bomb
 //! uncompressed-size limiting.
 

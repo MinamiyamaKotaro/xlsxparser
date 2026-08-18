@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! `Workbook`: the final resolved data model, returned by `parse_workbook`.
 
 use crate::model::sheet::Sheet;

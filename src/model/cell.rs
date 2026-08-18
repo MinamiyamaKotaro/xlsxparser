@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Single-cell data: `CellRef` (A1 coordinate), `CellValue`, `Cell`.
 
 use crate::error::Error;

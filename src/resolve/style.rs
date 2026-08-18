@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Phase 4: applies resolved cell styles, converting `CellValue::Number` to
 //! `CellValue::DateTime` when the applied numFmt represents a date/time.
 
