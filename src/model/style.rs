@@ -44,9 +44,13 @@ pub struct ResolvedStyle {
     /// the determination result here ahead of time.
     pub is_date_time: bool,
     pub font: Font,
-    // Concrete fields for fill/border/wrap/alignment etc. are added as
-    // their own sub-issues land (see docs/design/model/style.en.md Open
-    // Question 1).
+    /// `<cellXfs><xf><alignment wrapText="1"/></xf></cellXfs>` (Issue #37)
+    /// — the downstream grid-paper detector's overflow-detection heuristic
+    /// uses this as a gate: a wrapped cell is never flagged as overflowing.
+    pub wrap_text: bool,
+    // Concrete fields for fill/border/other alignment properties etc. are
+    // added as their own sub-issues land (see
+    // docs/design/model/style.en.md Open Question 1).
 }
 
 /// A table looking up `ResolvedStyle` by `cellXfs` index. Built by

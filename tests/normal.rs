@@ -10,6 +10,39 @@ use std::sync::Arc;
 use xlsxparser::{parse_workbook_reader, to_json_string, CellRef, CellValue, DateTimeValue};
 
 #[test]
+fn wrap_text_resolves_per_cell_and_serializes_nested_under_style() {
+    let workbook = parse_workbook_reader(Cursor::new(normal::wrap_text_styles())).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    assert!(
+        sheet
+            .get(CellRef { row: 1, col: 1 })
+            .unwrap()
+            .style
+            .as_ref()
+            .unwrap()
+            .wrap_text
+    );
+    assert!(
+        !sheet
+            .get(CellRef { row: 1, col: 2 })
+            .unwrap()
+            .style
+            .as_ref()
+            .unwrap()
+            .wrap_text
+    );
+
+    let json = to_json_string(&workbook).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let cells = parsed["sheets"][0]["cells"].as_array().unwrap();
+    let a1 = cells.iter().find(|c| c["col"] == 1).unwrap();
+    let b1 = cells.iter().find(|c| c["col"] == 2).unwrap();
+    assert_eq!(a1["style"]["wrapText"], serde_json::json!(true));
+    assert_eq!(b1["style"]["wrapText"], serde_json::json!(false));
+}
+
+#[test]
 fn font_size_and_bold_resolve_per_cell_and_serialize_nested_under_style() {
     let workbook = parse_workbook_reader(Cursor::new(normal::font_styles())).unwrap();
     let sheet = &workbook.sheets()[0];
@@ -41,11 +74,17 @@ fn font_size_and_bold_resolve_per_cell_and_serialize_nested_under_style() {
     let b1 = cells.iter().find(|c| c["col"] == 2).unwrap();
     assert_eq!(
         a1["style"],
-        serde_json::json!({ "font": { "sizePt": 11.0, "bold": false } })
+        serde_json::json!({
+            "font": { "sizePt": 11.0, "bold": false },
+            "wrapText": false
+        })
     );
     assert_eq!(
         b1["style"],
-        serde_json::json!({ "font": { "sizePt": 14.0, "bold": true } })
+        serde_json::json!({
+            "font": { "sizePt": 14.0, "bold": true },
+            "wrapText": false
+        })
     );
 }
 

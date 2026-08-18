@@ -40,6 +40,45 @@ pub fn basic_types() -> Vec<u8> {
     ])
 }
 
+/// Two cells: A1's `<cellXfs>` entry (style id 0) carries an
+/// `<alignment wrapText="1"/>` child, B1's (style id 1) is a self-closing
+/// `<xf/>` with no alignment at all. Verifies `<alignment wrapText>`
+/// resolution — including that the `<xf>` Start/End restructuring needed
+/// to support a child element didn't regress the plain self-closing
+/// form — and the per-cell `style.wrapText` JSON output end to end (Issue
+/// #37).
+pub fn wrap_text_styles() -> Vec<u8> {
+    let rows = r#"<row r="1">
+  <c r="A1" s="0"><v>1</v></c>
+  <c r="B1" s="1"><v>2</v></c>
+</row>"#;
+
+    let styles = br#"<styleSheet><cellXfs>
+<xf numFmtId="0"><alignment wrapText="1"/></xf>
+<xf numFmtId="0"/>
+</cellXfs></styleSheet>"#;
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "styles", "styles.xml"),
+            ])
+            .as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        ("xl/styles.xml", styles),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(rows, "").as_bytes(),
+        ),
+    ])
+}
+
 /// Two cells, each styled via a distinct `<cellXfs>` entry that resolves
 /// (via `fontId`) to a different `<fonts>` entry: A1 uses the default
 /// 11pt/not-bold font (style id 0), B1 uses a 14pt/bold font (style id 1,

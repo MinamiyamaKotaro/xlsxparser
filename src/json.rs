@@ -168,10 +168,12 @@ fn is_one(n: &u32) -> bool {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct JsonStyle {
     font: JsonFont,
-    // wrapText/numberFormat/alignment join this struct as their own
-    // sub-issues land (Issue #36).
+    wrap_text: bool,
+    // numberFormat/alignment join this struct as their own sub-issues land
+    // (Issue #36).
 }
 
 #[derive(Debug, Serialize)]
@@ -224,6 +226,7 @@ fn cell_to_json(sheet: &Sheet, cell_ref: CellRef, cell: &Cell) -> JsonCell {
                 size_pt: s.font.size_pt,
                 bold: s.font.bold,
             },
+            wrap_text: s.wrap_text,
         }),
     }
 }
@@ -297,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn styled_cell_reports_font_nested_under_style() {
+    fn styled_cell_reports_font_and_wrap_text_nested_under_style() {
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
         sheet.insert_cell(
             CellRef { row: 1, col: 1 },
@@ -309,6 +312,7 @@ mod tests {
                         size_pt: 14.0,
                         bold: true,
                     },
+                    wrap_text: true,
                 })),
             },
         );
@@ -320,7 +324,10 @@ mod tests {
 
         assert_eq!(
             cell_json["style"],
-            serde_json::json!({ "font": { "sizePt": 14.0, "bold": true } })
+            serde_json::json!({
+                "font": { "sizePt": 14.0, "bold": true },
+                "wrapText": true
+            })
         );
     }
 

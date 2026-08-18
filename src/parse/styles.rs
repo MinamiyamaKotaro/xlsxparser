@@ -1,11 +1,11 @@
-//! Parses `xl/styles.xml`'s `<numFmts>`/`<cellXfs>` into a `StyleSheet`
-//! (`cellXfs` index -> `ResolvedStyle`), classifying each format as
-//! date/time or not.
+//! Parses `xl/styles.xml`'s `<numFmts>`/`<fonts>`/`<cellXfs>` into a
+//! `StyleSheet` (`cellXfs` index -> `ResolvedStyle`), classifying each
+//! format as date/time or not and resolving each `<xf>`'s font/wrap-text.
 
 use crate::error::Error;
 use crate::model::{Font, ResolvedStyle, StyleId, StyleSheet};
 use crate::parse::{create_secure_reader, optional_attr, read_event, required_attr};
-use quick_xml::events::Event;
+use quick_xml::events::{BytesStart, Event};
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::sync::Arc;
@@ -40,6 +40,8 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
     // State for the <font> currently being read (between its start and end
     // tag, mirroring parse/worksheet.rs's per-<c> state pattern).
     let mut cur_font: Option<Font> = None;
+    // Same pattern for the <xf> currently being read.
+    let mut cur_xf: Option<CurXf> = None;
 
     loop {
         let event = read_event(&mut xml_reader, &mut buf, path)?;
@@ -86,8 +88,11 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
                 if cur_font.is_some() && e.local_name().as_ref() == b"b" =>
             {
                 // <b/> (no val) means bold; <b val="0"/>/<b val="false"/>
-                // is the rarer explicit "not bold" form (ECMA-376
-                // ST_OnOff's boolean-like value space).
+                // is the rarer explicit "not bold" form. `val`'s type is
+                // plain `xsd:boolean` (ECMA-376 Part 1 CT_BooleanProperty),
+                // not ST_OnOff — "off"/"on" are not valid lexical forms
+                // here (PR #49 review discussion), so only "0"/"false" are
+                // treated as false.
                 let bold = !matches!(
                     optional_attr(e, path, "val")?.as_deref(),
                     Some("0" | "false")
@@ -103,30 +108,61 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
             Event::End(e) if e.local_name().as_ref() == b"cellXfs" => {
                 in_cell_xfs = false;
             }
-            Event::Start(e) | Event::Empty(e)
-                if in_cell_xfs && e.local_name().as_ref() == b"xf" =>
-            {
-                // numFmtId is optional; absent means 0 ("General", not a
-                // date). A present-but-unparseable value degrades the same
-                // way, per the graceful-degradation policy below.
-                let numfmt_id = optional_attr(e, path, "numFmtId")?
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .unwrap_or(0);
-                let is_date_time =
-                    is_date_time_format(numfmt_id, num_fmts.get(&numfmt_id).map(String::as_str));
-                // fontId absent, unparseable, or out of range (a malformed
-                // file referencing a <font> entry that was never defined)
-                // all degrade to Font::default() rather than erroring —
-                // the same graceful-degradation policy as numFmtId above.
-                let font_id = optional_attr(e, path, "fontId")?
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0);
-                let font = fonts.get(font_id).copied().unwrap_or_default();
-                stylesheet.insert(
-                    next_style_id,
-                    Arc::new(ResolvedStyle { is_date_time, font }),
+            // <xf> may be self-closing (no <alignment>/<protection>
+            // children) or a Start...End pair wrapping them. Either way,
+            // numFmtId/fontId live on the <xf> start tag itself, so they're
+            // read immediately; wrap_text (from a child <alignment>) is
+            // only known once that child — if any — has been seen, so the
+            // ResolvedStyle itself is only built at End (or immediately for
+            // the self-closing form, where no child could follow).
+            Event::Start(e) if in_cell_xfs && e.local_name().as_ref() == b"xf" => {
+                let (numfmt_id, font_id) = read_xf_ids(e, path)?;
+                cur_xf = Some(CurXf {
+                    numfmt_id,
+                    font_id,
+                    wrap_text: false,
+                });
+            }
+            Event::Empty(e) if in_cell_xfs && e.local_name().as_ref() == b"xf" => {
+                let (numfmt_id, font_id) = read_xf_ids(e, path)?;
+                push_resolved_style(
+                    &mut stylesheet,
+                    &mut next_style_id,
+                    &num_fmts,
+                    &fonts,
+                    numfmt_id,
+                    font_id,
+                    false,
                 );
-                next_style_id += 1;
+            }
+            Event::End(e) if in_cell_xfs && e.local_name().as_ref() == b"xf" => {
+                if let Some(xf) = cur_xf.take() {
+                    push_resolved_style(
+                        &mut stylesheet,
+                        &mut next_style_id,
+                        &num_fmts,
+                        &fonts,
+                        xf.numfmt_id,
+                        xf.font_id,
+                        xf.wrap_text,
+                    );
+                }
+            }
+            Event::Start(e) | Event::Empty(e)
+                if cur_xf.is_some() && e.local_name().as_ref() == b"alignment" =>
+            {
+                // wrapText is a plain attribute (not a <val>-wrapped
+                // CT_BooleanProperty like <b>), absent -> not wrapped;
+                // only "1"/"true" count as wrapped, matching xsd:boolean's
+                // true forms.
+                let wrap_text = matches!(
+                    optional_attr(e, path, "wrapText")?.as_deref(),
+                    Some("1" | "true")
+                );
+                cur_xf
+                    .as_mut()
+                    .expect("cur_xf.is_some() checked above")
+                    .wrap_text = wrap_text;
             }
             Event::Eof => break,
             _ => {}
@@ -135,6 +171,54 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
     }
 
     Ok(stylesheet)
+}
+
+/// The `<xf>` currently being read (between its start and end tag, when it
+/// isn't self-closing) — mirrors `cur_font`'s pattern.
+struct CurXf {
+    numfmt_id: u32,
+    font_id: usize,
+    wrap_text: bool,
+}
+
+/// Reads `numFmtId`/`fontId` off an `<xf>` start tag. Both are optional;
+/// absent, unparseable, or (for `fontId`) out of range against the parsed
+/// `<fonts>` list all degrade gracefully rather than erroring — resolved
+/// by `push_resolved_style`.
+fn read_xf_ids(e: &BytesStart<'_>, path: &str) -> Result<(u32, usize), Error> {
+    let numfmt_id = optional_attr(e, path, "numFmtId")?
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    let font_id = optional_attr(e, path, "fontId")?
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    Ok((numfmt_id, font_id))
+}
+
+/// Resolves one `<xf>`'s `ResolvedStyle` and inserts it at `next_style_id`
+/// (incrementing it), the same "resolve once, on the way out" step
+/// whether the `<xf>` was self-closing or had children.
+#[allow(clippy::too_many_arguments)]
+fn push_resolved_style(
+    stylesheet: &mut StyleSheet,
+    next_style_id: &mut StyleId,
+    num_fmts: &HashMap<u32, String>,
+    fonts: &[Font],
+    numfmt_id: u32,
+    font_id: usize,
+    wrap_text: bool,
+) {
+    let is_date_time = is_date_time_format(numfmt_id, num_fmts.get(&numfmt_id).map(String::as_str));
+    let font = fonts.get(font_id).copied().unwrap_or_default();
+    stylesheet.insert(
+        *next_style_id,
+        Arc::new(ResolvedStyle {
+            is_date_time,
+            font,
+            wrap_text,
+        }),
+    );
+    *next_style_id += 1;
 }
 
 /// Classifies whether the format identified by `numfmt_id` — and, for a
@@ -389,5 +473,83 @@ mod tests {
 </styleSheet>"#;
         let sheet = parse(xml);
         assert_eq!(sheet[&0].font, Font::default());
+    }
+
+    #[test]
+    fn xf_with_wrap_text_alignment_resolves_wrap_text_true() {
+        let xml = br#"<styleSheet>
+<cellXfs><xf numFmtId="0"><alignment wrapText="1"/></xf></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert!(sheet[&0].wrap_text);
+    }
+
+    #[test]
+    fn xf_with_alignment_but_no_wrap_text_attr_is_false() {
+        let xml = br#"<styleSheet>
+<cellXfs><xf numFmtId="0"><alignment horizontal="center"/></xf></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert!(!sheet[&0].wrap_text);
+    }
+
+    #[test]
+    fn xf_with_wrap_text_zero_is_false() {
+        let xml = br#"<styleSheet>
+<cellXfs><xf numFmtId="0"><alignment wrapText="0"/></xf></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert!(!sheet[&0].wrap_text);
+    }
+
+    #[test]
+    fn self_closing_xf_with_no_alignment_child_is_wrap_text_false() {
+        let xml = br#"<styleSheet><cellXfs><xf numFmtId="0"/></cellXfs></styleSheet>"#;
+        let sheet = parse(xml);
+        assert!(!sheet[&0].wrap_text);
+    }
+
+    #[test]
+    fn xf_with_alignment_still_resolves_font_and_num_fmt_correctly() {
+        // Proves the Start/End restructuring for <xf> (needed to support a
+        // child <alignment>) didn't regress font/numFmt resolution, which
+        // both read attributes off the <xf> start tag itself.
+        let xml = br#"<styleSheet>
+<numFmts><numFmt numFmtId="164" formatCode="yyyy/mm/dd"/></numFmts>
+<fonts count="2">
+<font><sz val="11"/></font>
+<font><b/><sz val="14"/></font>
+</fonts>
+<cellXfs><xf numFmtId="164" fontId="1"><alignment wrapText="1"/></xf></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert!(sheet[&0].is_date_time);
+        assert_eq!(
+            sheet[&0].font,
+            Font {
+                size_pt: 14.0,
+                bold: true
+            }
+        );
+        assert!(sheet[&0].wrap_text);
+    }
+
+    #[test]
+    fn multiple_xf_forms_mixed_self_closing_and_with_children() {
+        // A file mixing self-closing <xf/> entries with <xf>...</xf>
+        // entries that carry an <alignment> child must still assign
+        // StyleIds in cellXfs order.
+        let xml = br#"<styleSheet>
+<cellXfs>
+<xf numFmtId="0"/>
+<xf numFmtId="0"><alignment wrapText="1"/></xf>
+<xf numFmtId="0"/>
+</cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet.len(), 3);
+        assert!(!sheet[&0].wrap_text);
+        assert!(sheet[&1].wrap_text);
+        assert!(!sheet[&2].wrap_text);
     }
 }

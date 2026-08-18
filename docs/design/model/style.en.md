@@ -51,8 +51,12 @@ pub struct ResolvedStyle {
     /// [resolve/style.md Open Question 2](../resolve/style.en.md)).
     pub is_date_time: bool,
     pub font: Font,
-    // Concrete fields for fill/border/wrap/alignment etc. will be added as
-    // their own sub-issues land (see Open Question 1).
+    /// `<cellXfs><xf><alignment wrapText="1"/></xf></cellXfs>` (Issue #37)
+    /// — the downstream grid-paper detector gates its overflow heuristic
+    /// on this: a wrapped cell is never flagged as overflowing.
+    pub wrap_text: bool,
+    // Concrete fields for fill/border/other alignment properties etc. will
+    // be added as their own sub-issues land (see Open Question 1).
 }
 
 /// A table looking up `ResolvedStyle` by `cellXfs` index. Expected to be
@@ -79,5 +83,5 @@ Not applicable. Since this file contains only type definitions, it has no unit t
 
 ## Open Questions
 
-1. **Concrete style elements such as fill/border/wrap/alignment**: partially resolved — `font: Font { size_pt, bold }` was added for Issue #38 (the downstream grid-paper detector's overflow-width estimate and heading-block heuristic need exactly these two properties; see [parse/styles.en.md](../parse/styles.en.md)). Still open for the remaining sub-issues under [Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36): `wrap_text` (#37), a `number_format` string (#41), and `alignment` (#42). Font color, fill, border, italic, underline, and any other `CT_Font`/`CT_Fill`/`CT_Border` properties remain out of scope until a concrete downstream use case names them — the same "not a full transcription" policy `Font` already follows.
+1. **Concrete style elements such as fill/border/wrap/alignment**: further resolved — `font: Font { size_pt, bold }` (Issue #38) and `wrap_text: bool` (Issue #37, the overflow-heuristic gate) are both implemented. Still open for the remaining sub-issues under [Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36): a `number_format` string (#41) and `alignment` (#42). Font color, fill, border, italic, underline, and any other `CT_Font`/`CT_Fill`/`CT_Border` properties, plus every other `CT_CellAlignment` attribute besides `wrapText` (horizontal/vertical alignment, indent, text rotation, ...), remain out of scope until a concrete downstream use case names them — the same "not a full transcription" policy `Font` already follows.
 2. ~~Where the date/time format determination logic lives~~ → **Resolved**: [`parse/styles.rs`](../parse/styles.en.md) owns classifying `ResolvedStyle::is_date_time` from `numFmtId`/`formatCode` (the same point as [resolve/style.md Open Question 2](../resolve/style.en.md)). The heuristic's precision itself remains open — see [parse/styles.md Open Question 2](../parse/styles.en.md).

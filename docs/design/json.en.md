@@ -149,10 +149,12 @@ fn is_one(n: &u32) -> bool {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct JsonStyle {
     font: JsonFont,
-    // wrapText/numberFormat/alignment join this struct as their own
-    // sub-issues land (Issue #36).
+    wrap_text: bool,
+    // numberFormat/alignment join this struct as their own sub-issues land
+    // (Issue #36).
 }
 
 #[derive(Debug, Serialize)]
@@ -192,6 +194,7 @@ fn cell_to_json(sheet: &Sheet, cell_ref: CellRef, cell: &Cell) -> JsonCell {
         col_span,
         style: cell.style.as_ref().map(|s| JsonStyle {
             font: JsonFont { size_pt: s.font.size_pt, bold: s.font.bold },
+            wrap_text: s.wrap_text,
         }),
     }
 }
@@ -262,12 +265,13 @@ fn visibility_tag(v: SheetVisibility) -> &'static str {
 - Verify that `Error::JsonSerialize` propagates when `to_json_writer` is given a `Write` implementation (a test mock) that fails partway through writing
 - **Verify that `Sheet::col_width_ranges`/`default_col_width` serialize as a sheet-level `columns` array / `defaultColumnWidth` field, and are never duplicated onto individual cell objects** (Issue #39; the "sheet-level array, not per-cell" design decision is the thing under test here — see model/sheet.en.md)
 - **Verify a styled cell's `font` (`size_pt`/`bold`) serializes nested under a per-cell `style` object, and that an unstyled cell (`Cell.style: None`) omits the `style` field entirely** (Issue #38 — the opposite sparseness decision from `columns`, since font genuinely varies cell-to-cell)
+- **Verify `style.wrapText` serializes alongside `style.font` under the same per-cell `style` object, for both `true` and `false`** (Issue #37 — reuses the same styled/unstyled sparseness wiring `font` already established, since `JsonStyle` now always carries both fields together)
 
 ## Open Questions
 
 1. ~~Whether to tag value kinds in the JSON structure~~ → **Resolved**: keep the tagged representation, `{"type": "number", "value": 42}` (reflects the [PR #10 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/10#pullrequestreview-4949223332)). Dropping the tag in favor of native JSON types alone would leave the frontend unable to distinguish `dateTime` from a plain string (`Text`), forcing string parsing wherever a date picker or formatting needs to apply; it would also remove the ability to distinguish `error` (a formula error value) from an ordinary string for grid warning styling; and it would prevent a type-safe TypeScript client built on a Discriminated Union keyed by `type`.
 2. ~~Fallback value for non-finite floating-point numbers (`NaN`/`Infinity`)~~ → **Resolved**: falls back to `JsonCellValue::Empty` (equivalent to `null`) rather than `0.0` (reflects the [PR #10 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/10#pullrequestreview-4949223332)). See Error Handling Policy for details.
 3. **`DateTime`'s string representation format**: undecided, tied to [model/cell.md Open Question 4](model/cell.en.md)'s finalization of the `DateTimeValue` type. ISO 8601 (e.g. `"2024-01-01T00:00:00"`) is the leading candidate, but how to handle date-only or time-only cells (Excel does not distinguish date/time precision as a type) needs consideration. **Interim decision at implementation time**: since `DateTimeValue` is still the data-less placeholder unit struct from [model/cell.md](model/cell.en.md), `format_date_time` (in the draft above) could never produce a real value, and leaving it as `unimplemented!()` would make `to_json_writer` panic on any resolved date/time cell — unacceptable given the crate-wide "never panic on data reachable from untrusted input" policy, since `resolve/style.rs`'s `serial_to_date_time` already returns a real (if empty) `DateTimeValue` for in-range numeric cells today. `format_date_time` was therefore dropped, and `cell_value_to_json`'s `CellValue::DateTime(_)` arm falls back to `JsonCellValue::Empty` — the same treatment as an unrepresentable `Number` — rather than fabricating a string not derived from any actual data. The `JsonCellValue::DateTime(String)` variant itself is kept (unconstructed by the conversion path, but its serialized shape is pinned down by a dedicated test, `date_time_value_currently_serializes_as_empty`) so the wiring is ready the moment `DateTimeValue` gains real fields.
-4. **JSON output of style information**: partially resolved — `JsonCell.style.font` (Issue #38) is implemented as described above, once `ResolvedStyle` gained `font: Font`. Still open for `wrap_text`/`number_format`/`alignment` as their own sub-issues land ([model/style.md Open Question 1](model/style.en.md)), each expected to join the same `JsonStyle` struct.
+4. **JSON output of style information**: further resolved — `JsonCell.style.font` (Issue #38) and `JsonCell.style.wrapText` (Issue #37) are both implemented as described above. Still open for `number_format`/`alignment` as their own sub-issues land ([model/style.md Open Question 1](model/style.en.md)), each expected to join the same `JsonStyle` struct.
 5. ~~Peak memory from batch construction~~ → **Resolved**: switched to a streaming design that never pre-builds a `Vec<JsonCell>` — the iterator from `Sheet::iter_cells` is fed directly into `serde::ser::SerializeSeq` inside `CellSeq::serialize` (reflects the [PR #10 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/10#pullrequestreview-4949223332)). Note that `to_json_string` (the convenience version backed internally by a `Vec<u8>` buffer) still requires O(n) memory proportional to the output size; a caller that truly wants O(1) additional memory needs to pass `to_json_writer` a real I/O destination such as a `BufWriter<File>`. Also, since `Sheet::iter_cells` makes no `ExactSizeIterator` guarantee, `serialize_seq`'s element-count hint is passed as `None` (this doesn't affect the JSON output's correctness, but forgoes a minor optimization opportunity some serializer implementations could otherwise take) — whether [model/sheet.md](model/sheet.en.md) should commit to `ExactSizeIterator` as part of its public API remains an open consideration there.
 6. **Relationship between `to_json_writer`/`to_json_string` and `lib.rs`'s public API**: how `lib.rs` exposes these functions separately from `parse_workbook` (which returns `Workbook`) is tied to [pipeline.md Open Question 1](pipeline.en.md) and is to be settled when `lib.rs` is designed.
