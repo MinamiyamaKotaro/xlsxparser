@@ -245,16 +245,17 @@ pass, independent of how the merges are arranged in space (see
 `finalize_merges`" section for the full story).
 
 Measured the same way as above (`hyperfine`, `--warmup 1`, same machine), on
-a generated 836 KB file with 300,000 populated cells and 20,000 merges
-(`resolve::merge::MAX_MERGE_REGIONS`, the current cap) arranged to maximize
-the bounding box:
+a generated 838 KB file with 300,000 distinct populated cells and 20,000
+merges (`resolve::merge::MAX_MERGE_REGIONS`, the current cap) arranged to
+maximize the bounding box (`tests/fixtures/security.rs`'s
+`sparse_merge_bounding_box_amplification`):
 
 ```bash
-before (pre-#43 fix)
-  Time (mean ± σ):     2.016 s  ±  22 ms      5 runs
+before (pre-#43 fix, v0.10.0)
+  Time (mean ± σ):     14.918 s ±  0.242 s    3 runs
 
-after (this fix)
-  Time (mean ± σ):     511.8 ms ±  48.9 ms    5 runs
+after (this fix, v0.10.1)
+  Time (mean ± σ):     600.6 ms ±   7.9 ms    4 runs
 ```
 
 ## Security notes

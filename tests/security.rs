@@ -25,6 +25,16 @@ fn sparse_merge_bounding_box_does_not_amplify_json_generation_cost() {
         security::sparse_merge_bounding_box_amplification(),
     ))
     .unwrap();
+
+    // Pins down the fixture's actual cell count: 300,000 distinct data
+    // cells plus 20,000 merge origins (each of the 19,999 filler merges
+    // backfills its own blank origin cell, plus the far-corner one). Catches
+    // the fixture silently collapsing distinct cells into fewer unique
+    // `CellRef`s (a coordinate-collision bug once shipped here — a fixed
+    // row for every data cell wrapped every 16,384 columns, so only 16,384
+    // of the intended 300,000 cells were ever actually distinct).
+    assert_eq!(workbook.sheets()[0].iter_cells().count(), 320_000);
+
     let json = to_json_string(&workbook).unwrap();
     assert!(json.contains("\"maxRow\":1048576"));
 }
