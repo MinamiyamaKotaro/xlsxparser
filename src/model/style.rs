@@ -36,6 +36,26 @@ impl Default for Font {
     }
 }
 
+/// `<xf><alignment horizontal=".."/></xf>`'s horizontal alignment (ECMA-376
+/// `ST_HorizontalAlignmentValues`), Issue #42. An `enum` rather than a
+/// string so it stays a cheap `Copy` value (Issue #42's stated performance
+/// requirement) — vertical alignment and every other `CT_CellAlignment`
+/// attribute besides `wrapText`/`horizontal` stay out of scope until a
+/// concrete downstream use case needs them, the same "not a full
+/// transcription" policy `Font` already follows.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Alignment {
+    #[default]
+    General,
+    Left,
+    Center,
+    Right,
+    Fill,
+    Justify,
+    CenterContinuous,
+    Distributed,
+}
+
 /// Format information once a style ID has been resolved.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResolvedStyle {
@@ -48,6 +68,11 @@ pub struct ResolvedStyle {
     /// — the downstream grid-paper detector's overflow-detection heuristic
     /// uses this as a gate: a wrapped cell is never flagged as overflowing.
     pub wrap_text: bool,
+    /// `<cellXfs><xf><alignment horizontal=".."/></xf></cellXfs>` (Issue
+    /// #42). Named `horizontal_` (rather than plain `alignment`) so a
+    /// future `vertical_alignment` field doesn't collide with it or need a
+    /// rename.
+    pub horizontal_alignment: Alignment,
     /// The `numFmtId` referenced by `<xf>`, resolved to its format-code
     /// string (Issue #41) — built-in (ECMA-376 Part 1 §18.8.30) or custom
     /// (`<numFmts>`). `None` represents `numFmtId=0` ("General"), an
@@ -59,9 +84,8 @@ pub struct ResolvedStyle {
     /// string across every `StyleId` that shares the same `numFmtId`, the
     /// same reasoning `CellValue::Text` already applies.
     pub number_format: Option<Arc<str>>,
-    // Concrete fields for fill/border/other alignment properties etc. are
-    // added as their own sub-issues land (see
-    // docs/design/model/style.en.md Open Question 1).
+    // Concrete fields for fill/border etc. are added as their own
+    // sub-issues land (see docs/design/model/style.en.md Open Question 1).
 }
 
 /// A table looking up `ResolvedStyle` by `cellXfs` index. Built by

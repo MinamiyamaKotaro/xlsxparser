@@ -42,6 +42,26 @@ impl Default for Font {
     }
 }
 
+/// `<xf><alignment horizontal=".."/></xf>`'s horizontal alignment (ECMA-376
+/// `ST_HorizontalAlignmentValues`), Issue #42. An `enum` rather than a
+/// string so it stays a cheap `Copy` value (Issue #42's stated performance
+/// requirement) — vertical alignment and every other `CT_CellAlignment`
+/// attribute besides `wrapText`/`horizontal` stay out of scope until a
+/// concrete downstream use case needs them, the same "not a full
+/// transcription" policy `Font` already follows.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Alignment {
+    #[default]
+    General,
+    Left,
+    Center,
+    Right,
+    Fill,
+    Justify,
+    CenterContinuous,
+    Distributed,
+}
+
 /// Format information once a style ID has been resolved.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResolvedStyle {
@@ -55,6 +75,11 @@ pub struct ResolvedStyle {
     /// — the downstream grid-paper detector gates its overflow heuristic
     /// on this: a wrapped cell is never flagged as overflowing.
     pub wrap_text: bool,
+    /// `<cellXfs><xf><alignment horizontal=".."/></xf></cellXfs>` (Issue
+    /// #42). Named `horizontal_` (rather than plain `alignment`) so a
+    /// future `vertical_alignment` field doesn't collide with it or need a
+    /// rename.
+    pub horizontal_alignment: Alignment,
     /// The `numFmtId` referenced by `<xf>`, resolved to its format-code
     /// string (Issue #41) — built-in (ECMA-376 Part 1 §18.8.30) or custom
     /// (`<numFmts>`). `None` for `numFmtId=0` ("General"), an absent
@@ -64,8 +89,8 @@ pub struct ResolvedStyle {
     /// for the same reason `CellValue::Text` uses it: the same format code
     /// is frequently shared across many `StyleId`s.
     pub number_format: Option<Arc<str>>,
-    // Concrete fields for fill/border/other alignment properties etc. will
-    // be added as their own sub-issues land (see Open Question 1).
+    // Concrete fields for fill/border etc. will be added as their own
+    // sub-issues land (see Open Question 1).
 }
 
 /// A table looking up `ResolvedStyle` by `cellXfs` index. Expected to be
@@ -92,5 +117,5 @@ Not applicable. Since this file contains only type definitions, it has no unit t
 
 ## Open Questions
 
-1. **Concrete style elements such as fill/border/wrap/alignment**: further resolved — `font: Font { size_pt, bold }` (Issue #38), `wrap_text: bool` (Issue #37, the overflow-heuristic gate), and `number_format: Option<Arc<str>>` (Issue #41) are all implemented. Still open for the remaining sub-issue under [Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36): `alignment` (#42). Font color, fill, border, italic, underline, and any other `CT_Font`/`CT_Fill`/`CT_Border` properties, plus every other `CT_CellAlignment` attribute besides `wrapText` (horizontal/vertical alignment, indent, text rotation, ...), remain out of scope until a concrete downstream use case names them — the same "not a full transcription" policy `Font` already follows.
+1. **Concrete style elements such as fill/border/wrap/alignment**: further resolved — `font: Font { size_pt, bold }` (Issue #38), `wrap_text: bool` (Issue #37, the overflow-heuristic gate), `number_format: Option<Arc<str>>` (Issue #41), and `horizontal_alignment: Alignment` (Issue #42) are all implemented. Every sub-issue under [Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36) is now resolved. Font color, fill, border, italic, underline, and any other `CT_Font`/`CT_Fill`/`CT_Border` properties, plus every other `CT_CellAlignment` attribute besides `wrapText`/`horizontal` (vertical alignment, indent, text rotation, ...), remain out of scope until a concrete downstream use case names them — the same "not a full transcription" policy `Font` already follows.
 2. ~~Where the date/time format determination logic lives~~ → **Resolved**: [`parse/styles.rs`](../parse/styles.en.md) owns classifying `ResolvedStyle::is_date_time` from `numFmtId`/`formatCode` (the same point as [resolve/style.md Open Question 2](../resolve/style.en.md)). The heuristic's precision itself remains open — see [parse/styles.md Open Question 2](../parse/styles.en.md).

@@ -3,7 +3,8 @@
 
 use crate::error::Error;
 use crate::model::{
-    Cell, CellRef, CellValue, ColWidthRange, DateTimeValue, Sheet, SheetVisibility, Workbook,
+    Alignment, Cell, CellRef, CellValue, ColWidthRange, DateTimeValue, Sheet, SheetVisibility,
+    Workbook,
 };
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Serialize, Serializer};
@@ -174,14 +175,17 @@ fn is_one(n: &u32) -> bool {
 struct JsonStyle {
     font: JsonFont,
     wrap_text: bool,
+    /// Always present, like `font`/`wrap_text` (never `Option`) — unlike
+    /// `numberFormat`, "general" is a real, meaningful alignment mode, not
+    /// "nothing to report" (Issue #42).
+    alignment: &'static str,
     /// Omitted when `None` ("General" — no special format; see
     /// `model/style.rs`'s `ResolvedStyle::number_format` doc comment for why
     /// this is skipped rather than emitted as `"General"`) — unlike `font`/
-    /// `wrap_text`, which always carry a meaningful value once a `style`
-    /// object exists at all (Issue #41).
+    /// `wrap_text`/`alignment`, which always carry a meaningful value once a
+    /// `style` object exists at all (Issue #41).
     #[serde(skip_serializing_if = "Option::is_none")]
     number_format: Option<String>,
-    // alignment joins this struct as its own sub-issue lands (Issue #36).
 }
 
 #[derive(Debug, Serialize)]
@@ -228,6 +232,7 @@ fn cell_to_json(sheet: &Sheet, cell_ref: CellRef, cell: &Cell) -> JsonCell {
                 bold: s.font.bold,
             },
             wrap_text: s.wrap_text,
+            alignment: alignment_tag(s.horizontal_alignment),
             number_format: s.number_format.as_deref().map(str::to_string),
         }),
     }
@@ -258,6 +263,22 @@ fn format_date_time(dt: &DateTimeValue) -> String {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
         dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
     )
+}
+
+/// `model::style::Alignment` doesn't derive `Serialize` directly (keeping
+/// `serde` out of `model/`'s dependency surface — see this file's
+/// Dependencies doc), so this mirrors `visibility_tag`'s pattern instead.
+fn alignment_tag(a: Alignment) -> &'static str {
+    match a {
+        Alignment::General => "general",
+        Alignment::Left => "left",
+        Alignment::Center => "center",
+        Alignment::Right => "right",
+        Alignment::Fill => "fill",
+        Alignment::Justify => "justify",
+        Alignment::CenterContinuous => "centerContinuous",
+        Alignment::Distributed => "distributed",
+    }
 }
 
 fn visibility_tag(v: SheetVisibility) -> &'static str {
@@ -319,7 +340,7 @@ mod tests {
                         bold: true,
                     },
                     wrap_text: true,
-                    number_format: None,
+                    ..Default::default()
                 })),
             },
         );
@@ -333,7 +354,8 @@ mod tests {
             cell_json["style"],
             serde_json::json!({
                 "font": { "sizePt": 14.0, "bold": true },
-                "wrapText": true
+                "wrapText": true,
+                "alignment": "general"
             })
         );
     }
@@ -346,10 +368,8 @@ mod tests {
             Cell {
                 value: Some(CellValue::Number(0.5)),
                 style: Some(Arc::new(ResolvedStyle {
-                    is_date_time: false,
-                    font: Font::default(),
-                    wrap_text: false,
                     number_format: Some(Arc::from("0%")),
+                    ..Default::default()
                 })),
             },
         );
@@ -369,12 +389,7 @@ mod tests {
             CellRef { row: 1, col: 1 },
             Cell {
                 value: Some(CellValue::Number(1.0)),
-                style: Some(Arc::new(ResolvedStyle {
-                    is_date_time: false,
-                    font: Font::default(),
-                    wrap_text: false,
-                    number_format: None,
-                })),
+                style: Some(Arc::new(ResolvedStyle::default())),
             },
         );
         let workbook = Workbook::new(vec![sheet]);
@@ -384,6 +399,21 @@ mod tests {
         let cell_json = &parsed["sheets"][0]["cells"][0];
 
         assert!(cell_json["style"].get("numberFormat").is_none());
+    }
+
+    #[test]
+    fn alignment_tag_covers_every_variant() {
+        assert_eq!(alignment_tag(Alignment::General), "general");
+        assert_eq!(alignment_tag(Alignment::Left), "left");
+        assert_eq!(alignment_tag(Alignment::Center), "center");
+        assert_eq!(alignment_tag(Alignment::Right), "right");
+        assert_eq!(alignment_tag(Alignment::Fill), "fill");
+        assert_eq!(alignment_tag(Alignment::Justify), "justify");
+        assert_eq!(
+            alignment_tag(Alignment::CenterContinuous),
+            "centerContinuous"
+        );
+        assert_eq!(alignment_tag(Alignment::Distributed), "distributed");
     }
 
     #[test]

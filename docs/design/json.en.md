@@ -18,6 +18,7 @@ Design doc for `src/json.rs`. This implements Phase 5, "JSON generation (return)
 use crate::error::Error;
 use crate::model::cell::{Cell, CellRef, CellValue};
 use crate::model::sheet::{Sheet, SheetVisibility};
+use crate::model::style::Alignment;
 use crate::model::workbook::Workbook;
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Serialize, Serializer};
@@ -153,14 +154,17 @@ fn is_one(n: &u32) -> bool {
 struct JsonStyle {
     font: JsonFont,
     wrap_text: bool,
+    /// Always present, like `font`/`wrap_text` (never `Option`) — unlike
+    /// `numberFormat`, "general" is a real, meaningful alignment mode, not
+    /// "nothing to report" (Issue #42).
+    alignment: &'static str,
     /// Omitted when `None` ("General" — no special format; see
     /// `model/style.rs`'s `ResolvedStyle::number_format` doc comment for why
     /// this is skipped rather than emitted as `"General"`) — unlike `font`/
-    /// `wrap_text`, which always carry a meaningful value once a `style`
-    /// object exists at all (Issue #41).
+    /// `wrap_text`/`alignment`, which always carry a meaningful value once a
+    /// `style` object exists at all (Issue #41).
     #[serde(skip_serializing_if = "Option::is_none")]
     number_format: Option<String>,
-    // alignment joins this struct as its own sub-issue lands (Issue #36).
 }
 
 #[derive(Debug, Serialize)]
@@ -204,6 +208,7 @@ fn cell_to_json(sheet: &Sheet, cell_ref: CellRef, cell: &Cell) -> JsonCell {
         style: cell.style.as_ref().map(|s| JsonStyle {
             font: JsonFont { size_pt: s.font.size_pt, bold: s.font.bold },
             wrap_text: s.wrap_text,
+            alignment: alignment_tag(s.horizontal_alignment),
             number_format: s.number_format.as_deref().map(str::to_string),
         }),
     }
@@ -237,6 +242,22 @@ fn format_date_time(dt: &crate::model::cell::DateTimeValue) -> String {
     )
 }
 
+/// `model::style::Alignment` doesn't derive `Serialize` directly (keeping
+/// `serde` out of `model/`'s dependency surface — see Dependencies below),
+/// so this mirrors `visibility_tag`'s pattern instead (Issue #42).
+fn alignment_tag(a: Alignment) -> &'static str {
+    match a {
+        Alignment::General => "general",
+        Alignment::Left => "left",
+        Alignment::Center => "center",
+        Alignment::Right => "right",
+        Alignment::Fill => "fill",
+        Alignment::Justify => "justify",
+        Alignment::CenterContinuous => "centerContinuous",
+        Alignment::Distributed => "distributed",
+    }
+}
+
 fn visibility_tag(v: SheetVisibility) -> &'static str {
     match v {
         SheetVisibility::Visible => "visible",
@@ -248,7 +269,7 @@ fn visibility_tag(v: SheetVisibility) -> &'static str {
 
 ## Dependencies
 
-- Depends on: [`model/workbook.rs`](model/workbook.en.md) (`Workbook`), [`model/sheet.rs`](model/sheet.en.md) (`Sheet::iter_cells`, `Sheet::merged_region_at`, `SheetVisibility`), [`model/cell.rs`](model/cell.en.md) (`Cell`, `CellRef`, `CellValue`, `DateTimeValue`), [`error.rs`](error.en.md) (`Error::JsonSerialize` — newly added to represent I/O or serialization failure during streaming writes; added as part of the redesign following the [PR #10 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/10#pullrequestreview-4949223332)), the external `serde` crate (manual and derived `Serialize` impls) and `serde_json` (streaming serialization via `to_writer`). `serde` needs its `rc` feature enabled: `CellValue::Text`'s `Arc<str>` field only gets a `Serialize` impl with that feature on (found at implementation time — without it, `Arc<str>` doesn't implement `Serialize` at all, since serde gates `Rc`/`Arc` support behind `rc` to avoid the footgun of silently duplicating shared data across independent serializations).
+- Depends on: [`model/workbook.rs`](model/workbook.en.md) (`Workbook`), [`model/sheet.rs`](model/sheet.en.md) (`Sheet::iter_cells`, `Sheet::merged_region_at`, `SheetVisibility`), [`model/cell.rs`](model/cell.en.md) (`Cell`, `CellRef`, `CellValue`, `DateTimeValue`), [`model/style.rs`](model/style.en.md) (`Alignment` — read via `s.horizontal_alignment` in `cell_to_json`, converted through `alignment_tag` rather than deriving `Serialize` directly, per this file's own no-`serde`-in-`model/` policy below), [`error.rs`](error.en.md) (`Error::JsonSerialize` — newly added to represent I/O or serialization failure during streaming writes; added as part of the redesign following the [PR #10 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/10#pullrequestreview-4949223332)), the external `serde` crate (manual and derived `Serialize` impls) and `serde_json` (streaming serialization via `to_writer`). `serde` needs its `rc` feature enabled: `CellValue::Text`'s `Arc<str>` field only gets a `Serialize` impl with that feature on (found at implementation time — without it, `Arc<str>` doesn't implement `Serialize` at all, since serde gates `Rc`/`Arc` support behind `rc` to avoid the footgun of silently duplicating shared data across independent serializations).
 - Depended on by: `lib.rs` (calls it explicitly on a `Workbook` — see [pipeline.md Open Question 1](pipeline.en.md); `pipeline.rs`'s `run` itself never calls it)
 
 `JsonWorkbook` / `SheetSeq` / `JsonSheet` / `CellSeq` each hold only a borrow of the model (`&'a Workbook` / `&'a Sheet`), never owning a value. Their `Serialize` impls only walk the model once actually invoked, which naturally lines up with the sequential calls `serde_json::to_writer` makes internally — no intermediate data structure representing a whole sheet or the whole book is ever built on the heap.
@@ -278,12 +299,13 @@ fn visibility_tag(v: SheetVisibility) -> &'static str {
 - **Verify `style.wrapText` serializes alongside `style.font` under the same per-cell `style` object, for both `true` and `false`** (Issue #37 — reuses the same styled/unstyled sparseness wiring `font` already established, since `JsonStyle` now always carries both fields together)
 - **Verify a `CellValue::DateTime` cell serializes as `{"type": "dateTime", "value": "..."}` with an ISO 8601 string, and that single-digit calendar fields are zero-padded** (e.g. `2024-01-05T03:05:09`, not `2024-1-5T3:5:9` — Issue #40)
 - **Verify a styled cell with a resolved `number_format` serializes `style.numberFormat` as that string, and that a styled cell with `number_format: None` ("General") omits the field entirely even though `style` itself is present** (Issue #41 — the opposite sparseness decision from `font`/`wrap_text` within the same already-present `style` object, since "General" carries no information a downstream consumer needs)
+- **Verify `style.alignment` is always present (never omitted) and serializes each `Alignment` variant as the matching camelCase string, including `"general"` for the default** (Issue #42 — the same "always present" sparseness decision as `font`/`wrap_text`, not `numberFormat`)
 
 ## Open Questions
 
 1. ~~Whether to tag value kinds in the JSON structure~~ → **Resolved**: keep the tagged representation, `{"type": "number", "value": 42}` (reflects the [PR #10 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/10#pullrequestreview-4949223332)). Dropping the tag in favor of native JSON types alone would leave the frontend unable to distinguish `dateTime` from a plain string (`Text`), forcing string parsing wherever a date picker or formatting needs to apply; it would also remove the ability to distinguish `error` (a formula error value) from an ordinary string for grid warning styling; and it would prevent a type-safe TypeScript client built on a Discriminated Union keyed by `type`.
 2. ~~Fallback value for non-finite floating-point numbers (`NaN`/`Infinity`)~~ → **Resolved**: falls back to `JsonCellValue::Empty` (equivalent to `null`) rather than `0.0` (reflects the [PR #10 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/10#pullrequestreview-4949223332)). See Error Handling Policy for details.
 3. ~~`DateTime`'s string representation format~~ → **Resolved** (Issue #40): ISO 8601 without a timezone designator or fractional seconds, e.g. `"2024-01-01T13:45:30"`. A date-only cell serializes with a midnight time component (`T00:00:00`) rather than omitting the time — Excel itself doesn't distinguish date-only from date+time as a type, so there is no extra information to report either way, and a uniform shape is simpler for a downstream consumer to parse than a format that varies cell-to-cell. `format_date_time` now reads `DateTimeValue`'s real `year`/`month`/`day`/`hour`/`minute`/`second` fields (see [model/cell.md Open Question 4](model/cell.en.md), also resolved by Issue #40) directly into this format.
-4. **JSON output of style information**: further resolved — `JsonCell.style.font` (Issue #38), `JsonCell.style.wrapText` (Issue #37), and `JsonCell.style.numberFormat` (Issue #41) are all implemented as described above. Still open for `alignment` ([model/style.md Open Question 1](model/style.en.md)), expected to join the same `JsonStyle` struct.
+4. **JSON output of style information**: further resolved — `JsonCell.style.font` (Issue #38), `JsonCell.style.wrapText` (Issue #37), `JsonCell.style.numberFormat` (Issue #41), and `JsonCell.style.alignment` (Issue #42) are all implemented as described above. Every sub-issue tracked at [model/style.md Open Question 1](model/style.en.md) is now resolved.
 5. ~~Peak memory from batch construction~~ → **Resolved**: switched to a streaming design that never pre-builds a `Vec<JsonCell>` — the iterator from `Sheet::iter_cells` is fed directly into `serde::ser::SerializeSeq` inside `CellSeq::serialize` (reflects the [PR #10 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/10#pullrequestreview-4949223332)). Note that `to_json_string` (the convenience version backed internally by a `Vec<u8>` buffer) still requires O(n) memory proportional to the output size; a caller that truly wants O(1) additional memory needs to pass `to_json_writer` a real I/O destination such as a `BufWriter<File>`. Also, since `Sheet::iter_cells` makes no `ExactSizeIterator` guarantee, `serialize_seq`'s element-count hint is passed as `None` (this doesn't affect the JSON output's correctness, but forgoes a minor optimization opportunity some serializer implementations could otherwise take) — whether [model/sheet.md](model/sheet.en.md) should commit to `ExactSizeIterator` as part of its public API remains an open consideration there.
 6. **Relationship between `to_json_writer`/`to_json_string` and `lib.rs`'s public API**: how `lib.rs` exposes these functions separately from `parse_workbook` (which returns `Workbook`) is tied to [pipeline.md Open Question 1](pipeline.en.md) and is to be settled when `lib.rs` is designed.
