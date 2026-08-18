@@ -149,6 +149,43 @@ pub fn column_widths() -> Vec<u8> {
     ])
 }
 
+/// A single date cell (serial 1, styled with a built-in date numFmt) in a
+/// workbook whose `<workbookPr date1904="1"/>` selects the 1904 date
+/// system. Verifies `date1904` is threaded end to end from
+/// `parse/workbook.rs` through `pipeline.rs` into `resolve/style.rs`'s
+/// epoch selection (Issue #40) — serial 1 resolves to 1904-01-02 here,
+/// versus 1900-01-01 under the (unset, default) 1900 system exercised by
+/// `basic_types()`.
+pub fn date1904_styles() -> Vec<u8> {
+    let workbook_xml = br#"<?xml version="1.0"?>
+<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <workbookPr date1904="1"/>
+  <sheets>
+    <sheet name="Sheet1" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>"#;
+    let rows = r#"<row r="1">
+  <c r="A1" s="1"><v>1</v></c>
+</row>"#;
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "styles", "styles.xml"),
+            ])
+            .as_bytes(),
+        ),
+        ("xl/workbook.xml", workbook_xml),
+        ("xl/styles.xml", DATE_STYLES_XML),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(rows, "").as_bytes(),
+        ),
+    ])
+}
+
 /// The same string ("Apple") is referenced by two different cells via the
 /// Shared String Table, alongside one cell referencing a different string
 /// ("Banana"). Verifies `<v>` shared-string indices resolve to the correct

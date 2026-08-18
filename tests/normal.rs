@@ -89,6 +89,31 @@ fn font_size_and_bold_resolve_per_cell_and_serialize_nested_under_style() {
 }
 
 #[test]
+fn date1904_workbook_pr_selects_the_1904_epoch_end_to_end() {
+    let workbook = parse_workbook_reader(Cursor::new(normal::date1904_styles())).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    assert_eq!(
+        sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
+        Some(CellValue::DateTime(DateTimeValue {
+            year: 1904,
+            month: 1,
+            day: 2,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        }))
+    );
+
+    let json = to_json_string(&workbook).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        parsed["sheets"][0]["cells"][0]["value"],
+        serde_json::json!({"type": "dateTime", "value": "1904-01-02T00:00:00"})
+    );
+}
+
+#[test]
 fn column_widths_resolve_per_column_and_serialize_as_a_sheet_level_array() {
     let workbook = parse_workbook_reader(Cursor::new(normal::column_widths())).unwrap();
     let sheet = &workbook.sheets()[0];
@@ -133,9 +158,17 @@ fn basic_types_maps_each_cell_to_the_right_json_type() {
         sheet.get(CellRef { row: 1, col: 3 }).unwrap().value,
         Some(CellValue::Number(19.99))
     );
+    // D1's serial value (45000, 1900 date system) is 2023-03-15.
     assert_eq!(
         sheet.get(CellRef { row: 1, col: 4 }).unwrap().value,
-        Some(CellValue::DateTime(DateTimeValue))
+        Some(CellValue::DateTime(DateTimeValue {
+            year: 2023,
+            month: 3,
+            day: 15,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        }))
     );
     assert_eq!(
         sheet.get(CellRef { row: 1, col: 5 }).unwrap().value,
@@ -163,13 +196,9 @@ fn basic_types_maps_each_cell_to_the_right_json_type() {
         .collect();
     types.sort_unstable();
     // Sheet::iter_cells (HashMap-backed) makes no order guarantee, so this
-    // compares the type multiset rather than positional order. The date
-    // cell (D1) is present here as "empty", not "dateTime": `DateTimeValue`
-    // is currently a data-less placeholder, so `json.rs::cell_value_to_json`
-    // always falls back to `Empty` for it (see that module's doc comment) —
-    // this is today's documented behavior, not a fixture bug.
+    // compares the type multiset rather than positional order.
     let mut expected = vec![
-        "text", "number", "number", "empty", "boolean", "boolean", "error",
+        "text", "number", "number", "dateTime", "boolean", "boolean", "error",
     ];
     expected.sort_unstable();
     assert_eq!(types, expected);

@@ -8,8 +8,9 @@
 
 - フェーズ3（`parse/worksheet.rs`）が記録した「スタイルID参照セルの保留リスト」を受け取り、[`model::style::StyleSheet`](../model/style.md) を引いて解決済みスタイル（`ResolvedStyle`）を各セルの `style: Option<Arc<ResolvedStyle>>` へ設定する
 - 適用したスタイルの数値書式（numFmt）が日付/時刻書式であると判定した場合、対象セルの `CellValue::Number` を `CellValue::DateTime` へ変換する。変換できない値（負値・`NaN`・`Infinity`・Excelの表現範囲外など）の場合は変換をスキップし、`CellValue::Number` を維持したまま処理を継続する（フォールバック。PR #8 レビュー指摘を反映してオープンクエスチョン3を解決。詳細はエラー処理方針参照）
+- `serial_to_date_time` によるシリアル値→暦への実際の分解を行う(Issue #40)。`[parse/workbook.rs](../parse/workbook.md)` が読み取った `date1904: bool`(`<workbookPr date1904="1"/>`)を `resolve()` の引数として受け取り、1900日付システムと1904日付システムいずれのエポックを使うかを選択する
 - スタイルIDがスタイル定義の範囲外の場合に `Error::InvalidStyleId` を返す
-- **含まない責務**: `styles.xml` のXMLパースおよび `ResolvedStyle` を構築するロジックそのもの（`parse/styles.rs`、未設計。本ファイルは構築済みの `StyleSheet` を受け取る前提とする）、`ResolvedStyle` / `StyleSheet` / `StyleId` の型定義そのもの（[`model/style.rs`](../model/style.md) へ移動。PR #8 レビュー指摘を反映してオープンクエスチョン1を解決）、日付/時刻書式かどうかの具体的な numFmt コード判定ルール自体の実装（本ファイルは判定結果を `ResolvedStyle` が既に保持している前提とする。オープンクエスチョン2参照）
+- **含まない責務**: `styles.xml` のXMLパースおよび `ResolvedStyle` を構築するロジックそのもの（`parse/styles.rs`。本ファイルは構築済みの `StyleSheet` を受け取る前提とする）、`ResolvedStyle` / `StyleSheet` / `StyleId` の型定義そのもの（[`model/style.rs`](../model/style.md) へ移動。PR #8 レビュー指摘を反映してオープンクエスチョン1を解決）、日付/時刻書式かどうかの具体的な numFmt コード判定ルール自体の実装（本ファイルは判定結果を `ResolvedStyle` が既に保持している前提とする。オープンクエスチョン2参照）、`date1904` フラグそのものの読み取り([`parse/workbook.rs`](../parse/workbook.md)——本ファイルは受け取った値を使うのみ)
 
 ## 主要な型・関数（案）
 
@@ -25,10 +26,14 @@ use crate::parse::worksheet::PendingStyle;
 /// `pending` の各エントリについて `stylesheet` から `ResolvedStyle` を引き、
 /// `sheet` の対応セルへ設定する。あわせて `is_date_time` な書式が
 /// `CellValue::Number` に適用された場合、`CellValue::DateTime` へ変換する。
+/// `date1904`(`<workbookPr date1904="1"/>`。フェーズ1で一度だけ読み取り済み)
+/// は、Excelの2つのシリアル値エポックのどちらを使うかを選択する
+/// (Issue #40。`serial_to_date_time` 参照)。
 pub(crate) fn resolve(
     sheet: &mut Sheet,
     pending: &[PendingStyle],
     stylesheet: &StyleSheet,
+    date1904: bool,
 ) -> Result<(), Error> {
     for entry in pending {
         let resolved = stylesheet
@@ -42,7 +47,7 @@ pub(crate) fn resolve(
             if let Some(CellValue::Number(serial)) = cell.value {
                 // 変換できない場合は CellValue::Number のまま維持する
                 // （フォールバック。エラー処理方針参照）。
-                if let Some(dt) = serial_to_date_time(serial) {
+                if let Some(dt) = serial_to_date_time(serial, date1904) {
                     cell.value = Some(CellValue::DateTime(dt));
                 }
             }
@@ -52,13 +57,28 @@ pub(crate) fn resolve(
     Ok(())
 }
 
-/// Excelのシリアル値（1900年うるう年バグを含む日付エポック）を
-/// `DateTimeValue` へ変換する。負値・`NaN`・`Infinity`・Excelの表現範囲
+/// Excelのシリアル値を `DateTimeValue` へ変換する。`date1904` に応じて
+/// 1900日付システム(エポック相当 1899-12-30)・1904日付システム(エポック
+/// 1904-01-01)いずれかを使う。負値・`NaN`・`Infinity`・Excelの表現範囲
 /// （最大 9999年12月31日相当）を超える値など、変換不能な値に対しては
-/// `None` を返す（エラーにはしない。エラー処理方針参照）。具体的な変換式
-/// は [model/cell.md オープンクエスチョン4](../model/cell.md) と連動して未確定。
-fn serial_to_date_time(serial: f64) -> Option<DateTimeValue> {
-    let _ = serial;
+/// `None` を返す（エラーにはしない。エラー処理方針参照）。
+///
+/// **1900年うるう年バグ**: 1900日付システムでは、単純なエポックオフセット
+/// 演算だけでは正しい結果にならない——検証の結果判明したことだが、
+/// シリアル値1〜59に対しては素朴なグレゴリオ暦演算は実際のExcel挙動より
+/// 1日早い日付を返し（例: シリアル1は本来1900-01-01だが素朴な演算では
+/// 1899-12-31になる）、シリアル60（Excel自身が「1900年2月29日」と文書化
+/// している架空の日、Microsoft KB214326）に対応する実在の暦日は
+/// 存在しない（1900年は実際には閏年ではない）。そのため、シリアル値
+/// 1〜59は+1日シフトしてから変換し（この技法はopenpyxl等多くの
+/// Excel互換リーダーが採用するものと同じ）、シリアル60自体は変換不能
+/// として直接ハードコードする。日付部分の変換は Howard Hinnant の
+/// `civil_from_days` アルゴリズム(パブリックドメイン、整数演算のみ、
+/// `chrono` 等の外部日付クレートに依存しない——Issue #40が要求する
+/// パフォーマンス面の考慮)で行う。1904日付システムには閏年バグは
+/// 存在しない(1904年は実在の閏年のため)。
+fn serial_to_date_time(serial: f64, date1904: bool) -> Option<DateTimeValue> {
+    let _ = (serial, date1904);
     unimplemented!()
 }
 ```
@@ -66,7 +86,7 @@ fn serial_to_date_time(serial: f64) -> Option<DateTimeValue> {
 ## 依存関係
 
 - 依存先: [`model/sheet.rs`](../model/sheet.md)（`Sheet::get_mut`）、[`model/cell.rs`](../model/cell.md)（`CellValue`, `DateTimeValue`）、[`model/style.rs`](../model/style.md)（`ResolvedStyle`, `StyleSheet`。PR #8 レビュー指摘を反映し本ファイルから移動）、[`error.rs`](../error.md)、[`parse::worksheet::PendingStyle`](../parse/worksheet.md)
-- 依存元: [`resolve/mod.rs`](mod.md)（`resolve_sheet` から呼び出される）
+- 依存元: [`resolve/mod.rs`](mod.md)（`resolve_sheet` から呼び出される。`date1904` は [`pipeline.rs`](../pipeline.md) がフェーズ1で `[parse/workbook.rs](../parse/workbook.md)` から一度だけ読み取り、`model::Workbook` 自体には保持せず `resolve_sheet` 呼び出しへそのまま引き渡す——[model/style.md](../model/style.md) の `StyleSheet` と同じ「フェーズ間の一時値」扱い）
 
 `StyleSheet` / `ResolvedStyle` / `StyleId` を `resolve/style.rs` 自身ではなく [`model/style.rs`](../model/style.md) に定義したことで、`parse/styles.rs`（未設計。`StyleSheet` を構築する主体）と `resolve/style.rs`（適用する主体）がいずれも `model/` にのみ依存し、互いを直接知らない構造になる（PR #8 レビュー指摘を反映。詳細は[model/style.md](../model/style.md)参照）。
 
@@ -90,10 +110,14 @@ fn serial_to_date_time(serial: f64) -> Option<DateTimeValue> {
 - `is_date_time: false` な通常のスタイルが適用された場合、`value` が変換されず `style` のみ設定されることの確認
 - 同一の `ResolvedStyle` を複数セルへ適用した際、`Cell.style` の `Arc` が `Arc::ptr_eq` で同一（アロケーション重複がない）ことの確認（[model/cell.md](../model/cell.md) の `Arc` 設計方針との結線確認）
 - `pending` が空リストの場合に何もせず `Ok(())` を返すことの確認
+- **シリアル値1が1900日付システムで「1900-01-01」に解決されることの確認**——素朴なエポックオフセット演算のみだと「1899-12-31」になってしまう回帰テスト(Issue #40)
+- **シリアル値59・61がそれぞれ「1900-02-28」「1900-03-01」に解決され、シリアル値60が架空の「1900-02-29」(Microsoft KB214326)に解決されることの確認**——1900年うるう年バグの境界値テスト
+- **1904日付システム(`date1904: true`)ではシリアル値60が通常の(架空でない)日付に解決されることの確認**——1904年は実在の閏年のため、うるう年バグが存在しないことの確認
+- **小数部から時刻(時/分/秒)が正しく分解されることの確認**、および小数部の丸めがちょうど86,400秒(1日全体)になった場合に次の日へ繰り上がることの確認(浮動小数点丸め誤差の境界値テスト)
 
 ## 未決事項 / オープンクエスチョン
 
 1. ~~`ResolvedStyle` / `StyleSheet` / `StyleId` の最終的な配置場所~~ → **解決**: [`model/style.rs`](../model/style.md) を新設し、そちらに定義する。`parse/styles.rs`（構築主体）と `resolve/style.rs`（適用主体）の双方が `model/` にのみ依存する構造とすることで、レイヤー間の独立性を保つ（PR #8 レビュー指摘を反映）。
 2. ~~日付/時刻書式の判定ロジックの置き場所~~ → **解決**: [`parse/styles.rs`](../parse/styles.md) 側で判定する（OOXMLの numFmt判定を含む）。本ファイルは引き続き `ResolvedStyle.is_date_time` を既に判定済みの値として受け取るのみで、判定ロジックそのものは持たない。判定ヒューリスティックの精度自体は [parse/styles.md オープンクエスチョン2](../parse/styles.md) として引き続き未解決。
-3. ~~`serial_to_date_time` の実装~~ → **一部解決**: 変換不能な値に対しては `Error` を返さず `None` を返し、呼び出し側（本ファイルの `resolve`）が `CellValue::Number` を維持するフォールバックとする方針を確定した（PR #8 レビュー指摘を反映）。ただし変換式そのもの（1900年うるう年バグの扱いを含む）は [model/cell.md オープンクエスチョン4](../model/cell.md) の `DateTimeValue` 型確定と合わせて未確定のまま。
+3. ~~`serial_to_date_time` の実装~~ → **解決**(Issue #40): 変換不能な値に対しては `Error` を返さず `None` を返し、呼び出し側（本ファイルの `resolve`）が `CellValue::Number` を維持するフォールバックとする方針(PR #8 レビュー指摘を反映)に加え、変換式自体(1900年うるう年バグ・1904日付システムの扱いを含む)も上記の通り実装済み。設計時に「エポックオフセットだけでうるう年バグを自動的に吸収できる」と想定していたが、実装時の検証(具体的な日付での逆算)でこれが誤りだと判明し、シリアル値1〜59への+1日シフトとシリアル60のハードコードという明示的な補正が必要だと分かった——「測定・検証してから確定する」という本プロジェクトの一貫した方針([Issue #43](https://github.com/MinamiyamaKotaro/xlsxparser/issues/43)のパフォーマンス調査時と同じ姿勢)を、日付変換の正しさの検証にも適用した結果。
 4. **フォント/塗りつぶし/罫線などの具体的なスタイル要素**: [model/style.md オープンクエスチョン1](../model/style.md) と同一の論点（未解決）。要求仕様書がセルスタイルとしてどこまでの要素をJSON出力に含める必要があるかは `json.rs` の設計、または要求仕様書自体の詳細化と合わせて確定させる。

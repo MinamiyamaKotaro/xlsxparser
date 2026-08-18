@@ -15,11 +15,21 @@ Design doc for `src/model/cell.rs`. Per the [architecture.md](../architecture.en
 ```rust
 use std::sync::Arc;
 
-/// Placeholder type for a resolved date/time value. The concrete type (e.g.
-/// `chrono::NaiveDateTime` vs. a lightweight custom type) is undecided (see Open
-/// Question 4). Until it is finalized, a stand-in definition such as the one below
-/// is assumed: `pub struct DateTimeValue;`
-pub struct DateTimeValue; // TODO: replace with the concrete type at implementation time
+/// A resolved date/time value, decomposed into its calendar fields by
+/// `resolve/style.rs::serial_to_date_time` from an Excel date serial number
+/// (Issue #40; see Open Question 4). A plain `Copy` value type — no
+/// sub-second precision, since Excel serial values (`f64`) can't reliably
+/// represent it beyond float rounding noise, and no downstream use case has
+/// asked for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DateTimeValue {
+    pub year: i32,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
 
 /// Cell coordinates. 1-based, matching Excel (A1 = row:1, col:1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -66,7 +76,7 @@ pub struct Cell {
 }
 ```
 
-`ResolvedStyle` is a type defined by [`model/style.rs`](style.en.md) (its location was settled per PR #8 review feedback); this file only assumes the type exists and uses it, without defining it. `DateTimeValue` is a placeholder defined within this file, whose concrete type is undecided (see Open Question 4).
+`ResolvedStyle` is a type defined by [`model/style.rs`](style.en.md) (its location was settled per PR #8 review feedback); this file only assumes the type exists and uses it, without defining it. `DateTimeValue` is defined within this file (see Open Question 4).
 
 ## Dependencies
 
@@ -93,4 +103,4 @@ pub struct Cell {
 1. ~~Representation of the `style` field~~ → **Resolved**: adopt `Option<Arc<ResolvedStyle>>` (finalized following the [PR #5 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948235239)). `Arc` avoids duplicating the actual data while still allowing the `StyleSheet` container itself to be dropped once Phase 4 completes.
 2. ~~Representation of shared strings~~ → **Resolved**: adopt `CellValue::Text(Arc<str>)`, for the same reason as above.
 3. **Upper bound of rows/columns**: `u32` is sufficient for Excel's maximum column count (16,384 columns = XFD) and maximum row count (1,048,576 rows), but whether to treat `col` as a plain number or split it into a separate `ColumnRef` type in the future is undecided.
-4. **Concrete type of `DateTimeValue`**: It has now been decided that dates/times get their own variant (converted from `Number` by `resolve/style.rs` based on the numFmt), but whether to depend on an external crate such as `chrono::NaiveDateTime`, or use a lightweight custom type to avoid adding a dependency, is undecided. Handling of Excel's date epoch (including the 1900 leap-year bug) is also to be finalized at implementation time.
+4. ~~Concrete type of `DateTimeValue`~~ → **Resolved** (Issue #40): a lightweight `Copy` struct with plain `year`/`month`/`day`/`hour`/`minute`/`second` fields, deliberately not depending on `chrono` or any other date/time crate — [`resolve/style.rs`](../resolve/style.en.md) decomposes an Excel serial value into it directly via a self-contained integer algorithm (Howard Hinnant's `civil_from_days`, public domain), keeping compile time and binary size unaffected. Excel's 1900 leap-year bug (serial 60 = the fictitious "1900-02-29") and the `<workbookPr date1904="1"/>` alternate epoch are both handled there — see [resolve/style.md](../resolve/style.en.md) for the conversion detail.

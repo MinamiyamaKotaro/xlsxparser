@@ -8,7 +8,7 @@
 
 - [`container::ZipContainer`](container/mod.md) を所有し、フェーズ1〜4を通じて `get_entry` を逐次呼び出す（1エントリを読み切ってから次のエントリを取得する。[container/mod.md](container/mod.md) が `get_entry` の型シグネチャで既に強制している逐次アクセスパターンに従う）
 - 呼び出し元（`lib.rs`）から受け取った `SizeLimits`（[lib.md](lib.md)）を `ZipContainer::open_reader` 直後に `with_max_entry_size` / `with_max_total_size`（[container/mod.md](container/mod.md)）へ橋渡しし、Zip Bombサイズ上限を呼び出し側が上書きできるようにする（セキュリティレビュー Finding 2、Issue [#14](https://github.com/MinamiyamaKotaro/xlsxparser/issues/14)）
-- **フェーズ1**: `xl/_rels/workbook.xml.rels` と `xl/workbook.xml` を取得・パースし、シート名・可視性・実体ファイルパスの「ルーティングプラン」を構築する。あわせて `xl/_rels/workbook.xml.rels` 内から `sharedStrings.xml` / `styles.xml` への関係を関係タイプ（`Relationship.rel_type`）で識別する（[relationships.md 含まない責務](parse/relationships.md) が「どの r:id がどのパーツ種別に対応するかの意味づけは呼び出し元の責務」としていた分担を実装する）
+- **フェーズ1**: `xl/_rels/workbook.xml.rels` と `xl/workbook.xml` を取得・パースし、シート名・可視性・実体ファイルパスの「ルーティングプラン」を構築する。あわせて `xl/_rels/workbook.xml.rels` 内から `sharedStrings.xml` / `styles.xml` への関係を関係タイプ（`Relationship.rel_type`）で識別する（[relationships.md 含まない責務](parse/relationships.md) が「どの r:id がどのパーツ種別に対応するかの意味づけは呼び出し元の責務」としていた分担を実装する）。本フェーズでは `ParsedWorkbookXml::date1904`(Issue #40)も読み取り、ローカル変数として保持する——`Workbook` のフィールドには決してならず、`StyleSheet`(後述)と同じ「フェーズ間の一時値」として扱う
 - ルーティングプラン構築後、rels読み込みに使ったリーダーと [`parse::RelationshipMap`](parse/relationships.md) をスコープアウトさせ破棄する（architecture.md「フェーズ1完了時にルーティングマップ構築後、`_rels` の一時バッファを破棄する」の実装）
 - ルーティングプラン確定後、シートループに入る前に [`SharedStringTable`](parse/shared_strings.md) と [`StyleSheet`](model/style.md) を一度だけ構築する
 - シートごとに [`model::Sheet::new`](model/sheet.md) で空シートを構築し、対応するエントリを [`parse::parse_worksheet`](parse/worksheet.md) に渡してストリームでセルを挿入させ（フェーズ3）、その出力を [`resolve::resolve_sheet`](resolve/mod.md) へ渡して解決する（フェーズ4）
@@ -63,10 +63,11 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
     let workbook_reader = container
         .get_entry(WORKBOOK_PATH)?
         .ok_or_else(|| Error::InvalidPackage(WORKBOOK_PATH.to_string()))?;
-    let sheet_entries = parse::parse_workbook_xml(workbook_reader, WORKBOOK_PATH)?;
+    let parsed_workbook = parse::parse_workbook_xml(workbook_reader, WORKBOOK_PATH)?;
+    let date1904 = parsed_workbook.date1904;
 
-    let mut routes = Vec::with_capacity(sheet_entries.len());
-    for entry in sheet_entries {
+    let mut routes = Vec::with_capacity(parsed_workbook.sheets.len());
+    for entry in parsed_workbook.sheets {
         let rel = relationships
             .get(&entry.r_id)
             .ok_or_else(|| Error::DanglingRelationship { r_id: entry.r_id.clone() })?;
@@ -122,6 +123,7 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
             &shared_string_table,
             &output.pending_styles,
             &stylesheet,
+            date1904,
             output.merge_regions,
         )?;
         sheets.push(sheet);

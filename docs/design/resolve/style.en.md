@@ -8,8 +8,9 @@ Design doc for `src/resolve/style.rs`. This handles the "cell style application"
 
 - Takes the "pending list of cells referencing a style ID" recorded by Phase 3 (`parse/worksheet.rs`), looks each up in [`model::style::StyleSheet`](../model/style.en.md) to obtain the resolved style (`ResolvedStyle`), and sets it on each cell's `style: Option<Arc<ResolvedStyle>>`
 - When the applied style's numeric format (numFmt) is determined to be a date/time format, converts the target cell's `CellValue::Number` to `CellValue::DateTime`. For a value that cannot be converted (negative, `NaN`, `Infinity`, outside Excel's representable range, etc.), skips the conversion and continues processing with `CellValue::Number` left unchanged (a fallback — addresses PR #8 review feedback, resolving Open Question 3; see Error Handling Policy for details)
+- Performs the actual serial-value-to-calendar decomposition in `serial_to_date_time` (Issue #40). `resolve()` takes `date1904: bool` (the `<workbookPr date1904="1"/>` flag [`parse/workbook.rs`](../parse/workbook.en.md) reads) as a parameter, selecting between the 1900 and 1904 date-system epochs
 - Returns `Error::InvalidStyleId` if a style ID is out of the style definitions' range
-- **Not responsible for**: XML parsing of `styles.xml` and the logic that builds `ResolvedStyle` itself (`parse/styles.rs`, not yet designed — this file assumes it receives an already-built `StyleSheet`); the type definitions of `ResolvedStyle` / `StyleSheet` / `StyleId` themselves (moved to [`model/style.rs`](../model/style.en.md) — addresses PR #8 review feedback, resolving Open Question 1); the concrete implementation of the numFmt code rules that determine whether a format is a date/time format (this file assumes `ResolvedStyle` already holds the determination result — see Open Question 2)
+- **Not responsible for**: XML parsing of `styles.xml` and the logic that builds `ResolvedStyle` itself (`parse/styles.rs` — this file assumes it receives an already-built `StyleSheet`); the type definitions of `ResolvedStyle` / `StyleSheet` / `StyleId` themselves (moved to [`model/style.rs`](../model/style.en.md) — addresses PR #8 review feedback, resolving Open Question 1); the concrete implementation of the numFmt code rules that determine whether a format is a date/time format (this file assumes `ResolvedStyle` already holds the determination result — see Open Question 2); reading the `date1904` flag itself ([`parse/workbook.rs`](../parse/workbook.en.md) — this file only consumes the value it was handed)
 
 ## Key Types / Functions (draft)
 
@@ -25,11 +26,14 @@ use crate::parse::worksheet::PendingStyle;
 /// For each entry in `pending`, looks up `ResolvedStyle` in `stylesheet` and
 /// sets it on the corresponding cell in `sheet`. Also converts
 /// `CellValue::Number` to `CellValue::DateTime` when an `is_date_time`
-/// format is applied.
+/// format is applied. `date1904` (`<workbookPr date1904="1"/>`, read once in
+/// Phase 1) selects which of Excel's two serial-value epochs to use — see
+/// `serial_to_date_time` (Issue #40).
 pub(crate) fn resolve(
     sheet: &mut Sheet,
     pending: &[PendingStyle],
     stylesheet: &StyleSheet,
+    date1904: bool,
 ) -> Result<(), Error> {
     for entry in pending {
         let resolved = stylesheet
@@ -43,7 +47,7 @@ pub(crate) fn resolve(
             if let Some(CellValue::Number(serial)) = cell.value {
                 // Leave CellValue::Number unchanged when conversion isn't
                 // possible (fallback — see Error Handling Policy).
-                if let Some(dt) = serial_to_date_time(serial) {
+                if let Some(dt) = serial_to_date_time(serial, date1904) {
                     cell.value = Some(CellValue::DateTime(dt));
                 }
             }
@@ -53,14 +57,31 @@ pub(crate) fn resolve(
     Ok(())
 }
 
-/// Converts an Excel serial value (including the 1900 leap-year bug epoch)
-/// into a `DateTimeValue`. Returns `None` (not an error — see Error
-/// Handling Policy) for values that cannot be converted: negative, `NaN`,
-/// `Infinity`, or outside Excel's representable range (up to roughly
-/// December 31, 9999), etc. The concrete conversion formula is undecided,
-/// tied to [model/cell.md Open Question 4](../model/cell.en.md).
-fn serial_to_date_time(serial: f64) -> Option<DateTimeValue> {
-    let _ = serial;
+/// Converts an Excel serial value into a `DateTimeValue`, using the 1900
+/// date system (epoch equivalent to 1899-12-30) or the 1904 system (epoch
+/// 1904-01-01) depending on `date1904`. Returns `None` (not an error — see
+/// Error Handling Policy) for values that cannot be converted: negative,
+/// `NaN`, `Infinity`, or outside Excel's representable range (up to roughly
+/// December 31, 9999), etc.
+///
+/// **1900 leap-year bug**: for the 1900 system, plain epoch-offset
+/// arithmetic alone is *not* sufficient — verified directly (working
+/// backward from concrete known dates) that ordinary proleptic-Gregorian
+/// arithmetic lands one day early for every serial in `1..60` (e.g. serial
+/// 1 comes out as 1899-12-31 rather than Excel's own 1900-01-01), and
+/// cannot represent serial 60 at all, since the real Gregorian calendar has
+/// no "1900-02-29" (1900 is not actually a leap year — Microsoft KB214326
+/// documents Excel's own fictitious reporting of it). The fix: shift
+/// serials 1-59 forward by one day before applying the offset (the same
+/// technique openpyxl and most other Excel-compatible readers use), and
+/// hardcode serial 60 directly to the fictitious date Excel itself reports.
+/// The date-part conversion itself uses Howard Hinnant's `civil_from_days`
+/// algorithm (public domain, integer arithmetic only — no dependency on
+/// `chrono` or any other date/time crate, per Issue #40's stated
+/// performance requirement). The 1904 system has no leap-year bug (1904 is
+/// a genuine leap year).
+fn serial_to_date_time(serial: f64, date1904: bool) -> Option<DateTimeValue> {
+    let _ = (serial, date1904);
     unimplemented!()
 }
 ```
@@ -68,7 +89,7 @@ fn serial_to_date_time(serial: f64) -> Option<DateTimeValue> {
 ## Dependencies
 
 - Depends on: [`model/sheet.rs`](../model/sheet.en.md) (`Sheet::get_mut`), [`model/cell.rs`](../model/cell.en.md) (`CellValue`, `DateTimeValue`), [`model/style.rs`](../model/style.en.md) (`ResolvedStyle`, `StyleSheet` — moved out of this file, addressing PR #8 review feedback), [`error.rs`](../error.en.md), [`parse::worksheet::PendingStyle`](../parse/worksheet.en.md)
-- Depended on by: [`resolve/mod.rs`](mod.en.md) (called from `resolve_sheet`)
+- Depended on by: [`resolve/mod.rs`](mod.en.md) (called from `resolve_sheet`). `date1904` is read once in Phase 1 by [`pipeline.rs`](../pipeline.en.md) from [`parse/workbook.rs`](../parse/workbook.en.md) and passed straight through to the `resolve_sheet` call, never stored on `model::Workbook` itself — the same "phase-transient value" treatment [model/style.md](../model/style.en.md)'s `StyleSheet` gets
 
 Defining `StyleSheet` / `ResolvedStyle` / `StyleId` in [`model/style.rs`](../model/style.en.md) rather than in `resolve/style.rs` itself means `parse/styles.rs` (not yet designed — the entity that builds `StyleSheet`) and `resolve/style.rs` (the entity that applies it) both depend only on `model/` and never know about each other directly (addresses PR #8 review feedback — see [model/style.md](../model/style.en.md) for details).
 
@@ -92,10 +113,14 @@ Why the `CellValue::Number` → `CellValue::DateTime` conversion happens inside 
 - Verify that applying a normal `is_date_time: false` style leaves `value` unconverted and only sets `style`
 - Verify that applying the same `ResolvedStyle` to multiple cells results in `Cell.style` `Arc`s that are identical under `Arc::ptr_eq` (no duplicate allocation) — a wiring check against [model/cell.md](../model/cell.en.md)'s `Arc` design policy
 - Verify that an empty `pending` list results in a no-op `Ok(())`
+- **Verify serial 1 resolves to 1900-01-01 in the 1900 system** — a regression test for the naive "epoch offset alone" arithmetic, which would otherwise land on 1899-12-31 (Issue #40)
+- **Verify serials 59 and 61 resolve to 1900-02-28 and 1900-03-01 respectively, and serial 60 resolves to the fictitious 1900-02-29 (Microsoft KB214326)** — boundary tests for the 1900 leap-year bug
+- **Verify the 1904 system (`date1904: true`) has no leap-year bug at serial 60** — 1904 is a genuine leap year, so this serial should resolve to an ordinary, non-fictitious date
+- **Verify a fractional serial decomposes correctly into hour/minute/second**, and that a fractional part that rounds to exactly 86,400 seconds (a full day) carries into the next day rather than producing an impossible `hour: 24` (a floating-point rounding boundary test)
 
 ## Open Questions
 
 1. ~~Final location of `ResolvedStyle` / `StyleSheet` / `StyleId`~~ → **Resolved**: newly added [`model/style.rs`](../model/style.en.md) and defined them there. Having both `parse/styles.rs` (the builder) and `resolve/style.rs` (the applier) depend only on `model/` preserves independence between layers (addresses PR #8 review feedback).
 2. ~~Where the date/time format determination logic lives~~ → **Resolved**: it lives on the [`parse/styles.rs`](../parse/styles.en.md) side (including OOXML numFmt determination). This file continues to receive `ResolvedStyle.is_date_time` as an already-determined value and holds none of the determination logic itself. The heuristic's precision remains open — see [parse/styles.md Open Question 2](../parse/styles.en.md).
-3. ~~Implementation of `serial_to_date_time`~~ → **Partially resolved**: settled on a policy where values that cannot be converted return `None` rather than an `Error`, with the caller (this file's `resolve`) falling back to leaving `CellValue::Number` unchanged (addresses PR #8 review feedback). The conversion formula itself (including handling of the 1900 leap-year bug) remains undecided, tied to [model/cell.md Open Question 4](../model/cell.en.md)'s finalization of the `DateTimeValue` type.
+3. ~~Implementation of `serial_to_date_time`~~ → **Resolved** (Issue #40): settled on a policy where values that cannot be converted return `None` rather than an `Error`, with the caller (this file's `resolve`) falling back to leaving `CellValue::Number` unchanged (addresses PR #8 review feedback), and the conversion formula itself (including the 1900 leap-year bug and the 1904 date system) is now implemented as described above. The design initially assumed the epoch offset alone would absorb the leap-year bug automatically; implementation-time verification (working backward from concrete known dates) showed this was wrong, and an explicit shift-plus-hardcode correction was needed instead — the same "measure and verify before committing" discipline this project has applied elsewhere (e.g. [Issue #43](https://github.com/MinamiyamaKotaro/xlsxparser/issues/43)'s performance investigation), here applied to date-conversion correctness instead.
 4. **Concrete style elements such as font/fill/border**: the same point as [model/style.md Open Question 1](../model/style.en.md) (undecided). How far the requirements spec expects cell styling to be included in JSON output will be finalized alongside `json.rs`'s design, or as the requirements spec itself is elaborated.

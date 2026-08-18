@@ -8,7 +8,7 @@ Design doc for `src/pipeline.rs`. This is the orchestrator for the 5-phase pipel
 
 - Owns a [`container::ZipContainer`](container/mod.en.md) and calls `get_entry` sequentially throughout Phases 1–4 (fully consuming one entry before fetching the next — following the sequential-access pattern [container/mod.md](container/mod.en.md) already enforces via `get_entry`'s type signature)
 - Forwards the `SizeLimits` ([lib.md](lib.en.md)) received from the caller (`lib.rs`) into `with_max_entry_size` / `with_max_total_size` ([container/mod.md](container/mod.en.md)) right after `ZipContainer::open_reader`, so callers can override the Zip Bomb size caps (security review Finding 2, Issue [#14](https://github.com/MinamiyamaKotaro/xlsxparser/issues/14))
-- **Phase 1**: fetches and parses `xl/_rels/workbook.xml.rels` and `xl/workbook.xml`, building a "routing plan" of sheet names, visibility, and backing file paths. It also identifies the relationships to `sharedStrings.xml` / `styles.xml` within `xl/_rels/workbook.xml.rels` by relationship type (`Relationship.rel_type`) — implementing the division of labor [relationships.md Not Responsible For](parse/relationships.en.md) assigned to the caller: "which `r:id` corresponds to which part kind is the caller's job"
+- **Phase 1**: fetches and parses `xl/_rels/workbook.xml.rels` and `xl/workbook.xml`, building a "routing plan" of sheet names, visibility, and backing file paths. It also identifies the relationships to `sharedStrings.xml` / `styles.xml` within `xl/_rels/workbook.xml.rels` by relationship type (`Relationship.rel_type`) — implementing the division of labor [relationships.md Not Responsible For](parse/relationships.en.md) assigned to the caller: "which `r:id` corresponds to which part kind is the caller's job". This phase also reads `ParsedWorkbookXml::date1904` (Issue #40) and holds it in a local variable — it never becomes a field on `Workbook`, following the same "phase-transient value" treatment `StyleSheet` gets (see below)
 - Once the routing plan is built, lets the reader used for the rels read and the [`parse::RelationshipMap`](parse/relationships.en.md) go out of scope and be dropped (implements architecture.md's "dispose of the `_rels` scratch buffer immediately once the routing map is built at the end of Phase 1")
 - Once the routing plan is finalized, builds the [`SharedStringTable`](parse/shared_strings.en.md) and [`StyleSheet`](model/style.en.md) exactly once, before entering the per-sheet loop
 - For each sheet, builds an empty sheet via [`model::Sheet::new`](model/sheet.en.md), passes the corresponding entry to [`parse::parse_worksheet`](parse/worksheet.en.md) to stream cells into it (Phase 3), then passes that output to [`resolve::resolve_sheet`](resolve/mod.en.md) to resolve it (Phase 4)
@@ -65,10 +65,11 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
     let workbook_reader = container
         .get_entry(WORKBOOK_PATH)?
         .ok_or_else(|| Error::InvalidPackage(WORKBOOK_PATH.to_string()))?;
-    let sheet_entries = parse::parse_workbook_xml(workbook_reader, WORKBOOK_PATH)?;
+    let parsed_workbook = parse::parse_workbook_xml(workbook_reader, WORKBOOK_PATH)?;
+    let date1904 = parsed_workbook.date1904;
 
-    let mut routes = Vec::with_capacity(sheet_entries.len());
-    for entry in sheet_entries {
+    let mut routes = Vec::with_capacity(parsed_workbook.sheets.len());
+    for entry in parsed_workbook.sheets {
         let rel = relationships
             .get(&entry.r_id)
             .ok_or_else(|| Error::DanglingRelationship { r_id: entry.r_id.clone() })?;
@@ -125,6 +126,7 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
             &shared_string_table,
             &output.pending_styles,
             &stylesheet,
+            date1904,
             output.merge_regions,
         )?;
         sheets.push(sheet);

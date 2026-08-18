@@ -15,10 +15,21 @@
 ```rust
 use std::sync::Arc;
 
-/// 日付・時刻の解決済み値のプレースホルダー型。具体的な型（chrono::NaiveDateTime か
-/// 軽量な自前型か）は未決定（オープンクエスチョン4参照）。実装が確定するまでの
-/// 暫定ダミー定義は次の通り: `pub struct DateTimeValue;`
-pub struct DateTimeValue; // TODO: 実装フェーズで具体的な型に置き換える
+/// 日付・時刻の解決済み値。`resolve/style.rs::serial_to_date_time` が
+/// Excelのシリアル値から各暦フィールドへ分解して構築する(Issue #40。
+/// オープンクエスチョン4参照)。軽量な `Copy` 値型——ミリ秒以下の精度は
+/// 持たない。Excelのシリアル値(`f64`)自体が浮動小数点誤差のノイズを
+/// 超える精度を確実に表現できず、また下流ユースケースからも要求されて
+/// いないため。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DateTimeValue {
+    pub year: i32,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
 
 /// セル座標。Excelに合わせて1-basedとする（A1 = row:1, col:1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -63,7 +74,7 @@ pub struct Cell {
 }
 ```
 
-`ResolvedStyle` は [`model/style.rs`](style.md) が定義する型（PR #8 レビュー指摘を反映し配置を確定）であり、本ファイルはその存在のみを仮定して使用する。`DateTimeValue` は本ファイル内で定義するプレースホルダーで、具体的な型は未確定である（未決事項4参照）。
+`ResolvedStyle` は [`model/style.rs`](style.md) が定義する型（PR #8 レビュー指摘を反映し配置を確定）であり、本ファイルはその存在のみを仮定して使用する。`DateTimeValue` は本ファイル内で定義する（未決事項4参照）。
 
 ## 依存関係
 
@@ -90,4 +101,4 @@ pub struct Cell {
 1. ~~`style` フィールドの表現~~ → **解決**: `Option<Arc<ResolvedStyle>>` を採用する（[PR #5 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948235239)を踏まえて確定）。`Arc` により実データの重複コピーを避けつつ、`StyleSheet` コンテナ自体はフェーズ4完了後に破棄できる。
 2. ~~共有文字列の表現~~ → **解決**: `CellValue::Text(Arc<str>)` を採用する。理由は上記1と同様。
 3. **行・列の桁上限**: Excelの最大列数（16,384列 = XFD）・最大行数（1,048,576行）に対し `u32` で十分だが、`col` を数値として扱うか将来的に列名を別型（`ColumnRef`）として分離するかは未決定。
-4. **`DateTimeValue` の具体的な型**: 日付・時刻を独立したバリアントとして持つこと自体は決定した（`resolve/style.rs` が numFmt を見て `Number` から変換する）が、`chrono::NaiveDateTime` 等の外部クレートに依存するか、依存を増やさない軽量な自前型にするかは未決定。Excelの日付エポック（1900年うるう年バグを含む）の扱いも実装時に確定させる。
+4. ~~`DateTimeValue` の具体的な型~~ → **解決**(Issue #40): `year`/`month`/`day`/`hour`/`minute`/`second` を単純なフィールドとして持つ軽量な `Copy` 構造体とし、意図的に `chrono` 等の外部日付クレートには依存しない——[`resolve/style.rs`](../resolve/style.md) がExcelのシリアル値を自己完結型の整数演算アルゴリズム(Howard Hinnant の `civil_from_days`、パブリックドメイン)で直接分解して構築し、コンパイル時間・バイナリサイズへの影響をゼロに保つ。Excelの1900年うるう年バグ(シリアル60=架空の「1900-02-29」)と `<workbookPr date1904="1"/>` による代替エポックはいずれも同ファイルで処理する——詳細は [resolve/style.md](../resolve/style.md) 参照。

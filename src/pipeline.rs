@@ -47,10 +47,12 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
     let workbook_reader = container
         .get_entry(WORKBOOK_PATH)?
         .ok_or_else(|| Error::InvalidPackage(WORKBOOK_PATH.to_string()))?;
-    let sheet_entries = parse::parse_workbook_xml(BufReader::new(workbook_reader), WORKBOOK_PATH)?;
+    let parsed_workbook =
+        parse::parse_workbook_xml(BufReader::new(workbook_reader), WORKBOOK_PATH)?;
+    let date1904 = parsed_workbook.date1904;
 
-    let mut routes = Vec::with_capacity(sheet_entries.len());
-    for entry in sheet_entries {
+    let mut routes = Vec::with_capacity(parsed_workbook.sheets.len());
+    for entry in parsed_workbook.sheets {
         let rel = relationships
             .get(&entry.r_id)
             .ok_or_else(|| Error::DanglingRelationship {
@@ -112,6 +114,7 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
             &shared_string_table,
             &output.pending_styles,
             &stylesheet,
+            date1904,
             output.col_width_ranges,
             output.default_col_width,
             output.merge_regions,
