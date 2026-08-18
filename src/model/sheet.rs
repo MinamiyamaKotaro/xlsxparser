@@ -183,19 +183,121 @@ impl Sheet {
         self.merged_regions.get(&origin)
     }
 
-    /// An iterator over origin cells only (for JSON generation). A
-    /// coordinate that falls inside a merged region but isn't that region's
-    /// origin is excluded even if `cells` holds an entry for it:
-    /// `parse/worksheet.rs` inserts a `Cell` for every `<c>` element it
-    /// streams, including ones inside a merged range that later turn out
-    /// not to be the origin (e.g. a virtual cell carrying only border
-    /// styling), so `cells` cannot be assumed to hold origin cells
-    /// exclusively (PR #20 review).
+    /// Runs once, after every `<mergeCell>` on this sheet has been
+    /// registered via `insert_merge` (called by `resolve::merge::resolve`
+    /// as its last step). Batch-resolves every currently-inserted cell key
+    /// to its merge origin via a single sweep over rows, then drops every
+    /// entry whose key isn't its own origin.
+    ///
+    /// This never discards observable data: a coordinate that isn't its
+    /// own origin was already unreachable through `get`/`get_mut`/
+    /// `iter_cells` (`resolve_origin` always redirects to the origin
+    /// first — see `iter_cells_excludes_cells_pre_inserted_at_alias_coordinates`),
+    /// so every entry this drops was already dead. What changes is that
+    /// `iter_cells` no longer needs to call `resolve_origin` per cell
+    /// afterwards (see its doc comment).
+    ///
+    /// Before this existed, a sheet whose merges maximized `merge_bounds`
+    /// (e.g. two 1x1 merges at opposite corners) forced every
+    /// `iter_cells` call to fall back to the O(number of merged regions)
+    /// scan in `resolve_origin`, for every cell — a legitimate file
+    /// (hundreds of thousands of cells, tens of thousands of merges, both
+    /// within existing limits) could cost tens of seconds of CPU time in
+    /// `json.rs`'s output generation (measured; see Issue #43). Sorting
+    /// events once and sweeping is O((C + M) log (C + M)) for C cells and
+    /// M merged regions, independent of how the merges are arranged in
+    /// space — closing the adversarial-arrangement gap that three earlier,
+    /// more "clever" attempts (a global tallest-region cutoff, fixed-size
+    /// row bucketing, an augmented BST with ad hoc pruning) were each
+    /// found, by direct measurement, not to close (see Issue #43's
+    /// discussion for the counter-examples).
+    pub(crate) fn finalize_merges(&mut self) {
+        if self.merged_regions.is_empty() {
+            return;
+        }
+
+        enum SweepEvent {
+            /// Fired at `region.start.row`.
+            Start(CellRef),
+            /// Fired at `region.end.row + 1`, i.e. one past the last row
+            /// the region is active for.
+            End(CellRef),
+            /// Fired at the row of a cell coordinate to resolve.
+            Query(CellRef),
+        }
+
+        let mut events: Vec<(u32, u8, SweepEvent)> =
+            Vec::with_capacity(self.merged_regions.len() * 2 + self.cells.len());
+        for region in self.merged_regions.values() {
+            events.push((region.start.row, 0, SweepEvent::Start(region.start)));
+            events.push((region.end.row + 1, 0, SweepEvent::End(region.start)));
+        }
+        for &coord in self.cells.keys() {
+            events.push((coord.row, 2, SweepEvent::Query(coord)));
+        }
+        // Tie-break: at the same row, End/Start (rank 0/1 below) must be
+        // applied before any Query at that row sees the active set.
+        events.sort_by_key(|(row, kind_rank, event)| {
+            let start_end_rank = match event {
+                SweepEvent::End(_) => 0,
+                SweepEvent::Start(_) => 1,
+                SweepEvent::Query(_) => *kind_rank,
+            };
+            (*row, start_end_rank)
+        });
+
+        // Merges active at the current sweep row, holding each region's
+        // `start` (its key in `merged_regions`), sorted by `start.col`.
+        // Disjoint column ranges are guaranteed by resolve::merge's
+        // overlap validation, so at most one active entry can ever
+        // contain a given query column.
+        let mut active: Vec<CellRef> = Vec::new();
+        let mut to_drop: Vec<CellRef> = Vec::new();
+
+        for (_, _, event) in &events {
+            match event {
+                SweepEvent::Start(start) => {
+                    let pos = active.partition_point(|s| s.col < start.col);
+                    active.insert(pos, *start);
+                }
+                SweepEvent::End(start) => {
+                    let pos = active.partition_point(|s| s.col < start.col);
+                    debug_assert_eq!(active.get(pos), Some(start));
+                    active.remove(pos);
+                }
+                SweepEvent::Query(coord) => {
+                    let pos = active.partition_point(|s| s.col <= coord.col);
+                    if pos == 0 {
+                        continue;
+                    }
+                    let candidate_start = active[pos - 1];
+                    if *coord == candidate_start {
+                        continue; // it's already this region's own origin.
+                    }
+                    let region = self
+                        .merged_regions
+                        .get(&candidate_start)
+                        .expect("active set only ever holds keys currently in merged_regions");
+                    if coord.col <= region.end.col {
+                        to_drop.push(*coord);
+                    }
+                }
+            }
+        }
+
+        for coord in to_drop {
+            self.cells.remove(&coord);
+        }
+    }
+
+    /// An iterator over origin cells only (for JSON generation). No longer
+    /// filters via `resolve_origin`: `finalize_merges` (called once, right
+    /// after every merge is registered — see its doc comment) already
+    /// guarantees every remaining `cells` key is its own origin, so a
+    /// plain `cells.iter()` is correct on its own and doesn't pay
+    /// `resolve_origin`'s per-cell cost (Issue #43).
     pub fn iter_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
-        self.cells
-            .iter()
-            .filter(|(&r, _)| self.resolve_origin(r) == r)
-            .map(|(&r, c)| (r, c))
+        self.cells.iter().map(|(&r, c)| (r, c))
     }
 }
 
@@ -302,6 +404,7 @@ mod tests {
             start: r(1, 1),
             end: r(2, 2),
         });
+        sheet.finalize_merges();
 
         let coords: Vec<CellRef> = sheet.iter_cells().map(|(coord, _)| coord).collect();
         assert_eq!(coords, vec![r(1, 1)]);
@@ -333,6 +436,7 @@ mod tests {
             start: r(1, 1),
             end: r(2, 2),
         });
+        sheet.finalize_merges();
 
         let coords: Vec<CellRef> = sheet.iter_cells().map(|(coord, _)| coord).collect();
         assert_eq!(coords, vec![r(1, 1)]);
@@ -385,6 +489,7 @@ mod tests {
                 end: r(2, 2),
             })
         );
+        sheet.finalize_merges();
         let coords: Vec<CellRef> = sheet.iter_cells().map(|(coord, _)| coord).collect();
         assert_eq!(coords, vec![r(1, 1)]);
     }
@@ -484,6 +589,113 @@ mod tests {
             sheet.get(r(5, 1)),
             Some(&Cell {
                 value: Some(crate::model::CellValue::Boolean(true)),
+                style: None,
+            })
+        );
+    }
+
+    #[test]
+    fn finalize_merges_is_a_no_op_when_there_are_no_merges() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.insert_cell(
+            r(1, 1),
+            Cell {
+                value: Some(crate::model::CellValue::Boolean(true)),
+                style: None,
+            },
+        );
+        sheet.finalize_merges();
+
+        let coords: Vec<CellRef> = sheet.iter_cells().map(|(coord, _)| coord).collect();
+        assert_eq!(coords, vec![r(1, 1)]);
+    }
+
+    #[test]
+    fn finalize_merges_drops_non_origin_cells_but_keeps_origin_and_standalone_cells() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        // A1: this merge's origin (real data).
+        sheet.insert_cell(
+            r(1, 1),
+            Cell {
+                value: Some(crate::model::CellValue::Boolean(true)),
+                style: None,
+            },
+        );
+        // B2: a virtual coordinate inside A1:B2, pre-populated the same way
+        // parse/worksheet.rs would for border-only styling.
+        sheet.insert_cell(
+            r(2, 2),
+            Cell {
+                value: None,
+                style: None,
+            },
+        );
+        // C1: unrelated to any merge.
+        sheet.insert_cell(
+            r(1, 3),
+            Cell {
+                value: Some(crate::model::CellValue::Boolean(false)),
+                style: None,
+            },
+        );
+        sheet.insert_merge(MergedRegion {
+            start: r(1, 1),
+            end: r(2, 2),
+        });
+        sheet.finalize_merges();
+
+        let mut coords: Vec<CellRef> = sheet.iter_cells().map(|(coord, _)| coord).collect();
+        coords.sort();
+        assert_eq!(coords, vec![r(1, 1), r(1, 3)]);
+    }
+
+    #[test]
+    fn finalize_merges_resolves_multiple_disjoint_row_bound_merges_correctly() {
+        // Two merges sharing no row overlap, each spanning several
+        // columns, plus data cells scattered both inside and outside
+        // either range — exercises the sweep line's Start/End bookkeeping
+        // across more than one active region.
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        for col in 1..=5 {
+            sheet.insert_cell(
+                r(3, col),
+                Cell {
+                    value: Some(crate::model::CellValue::Number(col as f64)),
+                    style: None,
+                },
+            );
+            sheet.insert_cell(
+                r(8, col),
+                Cell {
+                    value: Some(crate::model::CellValue::Number(col as f64)),
+                    style: None,
+                },
+            );
+        }
+        sheet.insert_cell(
+            r(5, 1),
+            Cell {
+                value: Some(crate::model::CellValue::Boolean(true)),
+                style: None,
+            },
+        );
+        sheet.insert_merge(MergedRegion {
+            start: r(3, 1),
+            end: r(3, 5),
+        });
+        sheet.insert_merge(MergedRegion {
+            start: r(8, 1),
+            end: r(8, 5),
+        });
+        sheet.finalize_merges();
+
+        let mut coords: Vec<CellRef> = sheet.iter_cells().map(|(coord, _)| coord).collect();
+        coords.sort();
+        assert_eq!(coords, vec![r(3, 1), r(5, 1), r(8, 1)]);
+        assert_eq!(
+            sheet.get(r(3, 4)),
+            Some(&Cell {
+                value: Some(crate::model::CellValue::Number(1.0)),
                 style: None,
             })
         );
