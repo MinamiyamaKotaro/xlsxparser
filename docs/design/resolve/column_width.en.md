@@ -2,7 +2,7 @@
 
 *[日本語](column_width.md)*
 
-Design doc for `src/resolve/column_width.rs`. Handles the "column-width range validation and registration" part of Phase 4, added for Issue #39. To realize the downstream "grid-paper Excel" detection use case (see [README.md Motivation](../../README.md#motivation)), it validates the `<cols>` range list before registering it with [`model::Sheet::set_col_widths`](../model/sheet.en.md).
+Design doc for `src/resolve/column_width.rs`. Handles the "column-width range validation and registration" part of Phase 4, added for Issue #39. To realize the downstream "grid-paper Excel" detection use case (see [README.md Motivation](../../../README.md#motivation)), it validates the `<cols>` range list before registering it with [`model::Sheet::set_col_widths`](../model/sheet.en.md).
 
 This file's shape is deliberately a close parallel of [`resolve/merge.rs`](merge.en.md): both validate a batch of ranges collected by Phase 3, then register them into `Sheet` in one call. The two differ where the underlying data differs — see "Relationship to `resolve/merge.rs`" below.
 

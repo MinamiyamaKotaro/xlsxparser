@@ -2,7 +2,7 @@
 
 *[English](column_width.en.md)*
 
-`src/resolve/column_width.rs` に対応する設計書。Issue #39 で追加された、フェーズ4の「列幅範囲の検証・登録」を担う。下流の「方眼紙Excel」検出ユースケース([README.md Motivation](../../README.md#motivation)参照)を実現するため、`<cols>` の範囲リストを検証したうえで [`model::Sheet::set_col_widths`](../model/sheet.md) へ登録する。
+`src/resolve/column_width.rs` に対応する設計書。Issue #39 で追加された、フェーズ4の「列幅範囲の検証・登録」を担う。下流の「方眼紙Excel」検出ユースケース([README.md Motivation](../../../README.md#motivation)参照)を実現するため、`<cols>` の範囲リストを検証したうえで [`model::Sheet::set_col_widths`](../model/sheet.md) へ登録する。
 
 本ファイルの構造は意図的に [`resolve/merge.rs`](merge.md) と対になっている: いずれもフェーズ3が収集した範囲のバッチを検証し、1回の呼び出しで `Sheet` へ登録する。両者の違いは元データの形状の違いに起因する——詳細は下記「`resolve/merge.rs` との関係」参照。
 
