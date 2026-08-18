@@ -10,6 +10,46 @@ use std::sync::Arc;
 use xlsxparser::{parse_workbook_reader, to_json_string, CellRef, CellValue, DateTimeValue};
 
 #[test]
+fn font_size_and_bold_resolve_per_cell_and_serialize_nested_under_style() {
+    let workbook = parse_workbook_reader(Cursor::new(normal::font_styles())).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    let a1_font = &sheet
+        .get(CellRef { row: 1, col: 1 })
+        .unwrap()
+        .style
+        .as_ref()
+        .unwrap()
+        .font;
+    assert_eq!(a1_font.size_pt, 11.0);
+    assert!(!a1_font.bold);
+
+    let b1_font = &sheet
+        .get(CellRef { row: 1, col: 2 })
+        .unwrap()
+        .style
+        .as_ref()
+        .unwrap()
+        .font;
+    assert_eq!(b1_font.size_pt, 14.0);
+    assert!(b1_font.bold);
+
+    let json = to_json_string(&workbook).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let cells = parsed["sheets"][0]["cells"].as_array().unwrap();
+    let a1 = cells.iter().find(|c| c["col"] == 1).unwrap();
+    let b1 = cells.iter().find(|c| c["col"] == 2).unwrap();
+    assert_eq!(
+        a1["style"],
+        serde_json::json!({ "font": { "sizePt": 11.0, "bold": false } })
+    );
+    assert_eq!(
+        b1["style"],
+        serde_json::json!({ "font": { "sizePt": 14.0, "bold": true } })
+    );
+}
+
+#[test]
 fn column_widths_resolve_per_column_and_serialize_as_a_sheet_level_array() {
     let workbook = parse_workbook_reader(Cursor::new(normal::column_widths())).unwrap();
     let sheet = &workbook.sheets()[0];

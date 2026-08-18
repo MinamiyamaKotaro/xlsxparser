@@ -152,12 +152,33 @@ struct JsonCell {
     row_span: u32,
     #[serde(rename = "colSpan", skip_serializing_if = "is_one")]
     col_span: u32,
-    // Style output (font, fill, etc.) is blocked on ResolvedStyle gaining
-    // those fields (docs/design/model/style.en.md Open Question 1).
+    /// Omitted entirely when the cell carries no style at all
+    /// (`Cell.style: None`) — a plain-formatted cell doesn't pay for an
+    /// empty `"style": {}` object. Per-cell, unlike `columns` (Issue #36
+    /// review discussion): font genuinely varies cell-to-cell within the
+    /// same column, so there is no sparse-output principle to preserve by
+    /// hoisting it elsewhere the way `columnWidth` was (see
+    /// docs/design/model/sheet.en.md's "Feature: column width" note).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    style: Option<JsonStyle>,
 }
 
 fn is_one(n: &u32) -> bool {
     *n == 1
+}
+
+#[derive(Debug, Serialize)]
+struct JsonStyle {
+    font: JsonFont,
+    // wrapText/numberFormat/alignment join this struct as their own
+    // sub-issues land (Issue #36).
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonFont {
+    size_pt: f64,
+    bold: bool,
 }
 
 /// A kind-tagged value representation. `#[serde(tag = "type", content =
@@ -198,6 +219,12 @@ fn cell_to_json(sheet: &Sheet, cell_ref: CellRef, cell: &Cell) -> JsonCell {
         value: cell_value_to_json(cell.value.as_ref()),
         row_span,
         col_span,
+        style: cell.style.as_ref().map(|s| JsonStyle {
+            font: JsonFont {
+                size_pt: s.font.size_pt,
+                bold: s.font.bold,
+            },
+        }),
     }
 }
 
@@ -235,7 +262,7 @@ fn visibility_tag(v: SheetVisibility) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DateTimeValue, ResolvedStyle};
+    use crate::model::{DateTimeValue, Font, ResolvedStyle};
     use std::sync::Arc;
 
     fn sheet_with_one_cell(name: &str, value: Option<CellValue>) -> Sheet {
@@ -267,6 +294,46 @@ mod tests {
                 }]
             })
         );
+    }
+
+    #[test]
+    fn styled_cell_reports_font_nested_under_style() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.insert_cell(
+            CellRef { row: 1, col: 1 },
+            Cell {
+                value: Some(CellValue::Number(1.0)),
+                style: Some(Arc::new(ResolvedStyle {
+                    is_date_time: false,
+                    font: Font {
+                        size_pt: 14.0,
+                        bold: true,
+                    },
+                })),
+            },
+        );
+        let workbook = Workbook::new(vec![sheet]);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cell_json = &parsed["sheets"][0]["cells"][0];
+
+        assert_eq!(
+            cell_json["style"],
+            serde_json::json!({ "font": { "sizePt": 14.0, "bold": true } })
+        );
+    }
+
+    #[test]
+    fn unstyled_cell_omits_the_style_field_entirely() {
+        let sheet = sheet_with_one_cell("Sheet1", Some(CellValue::Number(1.0)));
+        let workbook = Workbook::new(vec![sheet]);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cell_json = &parsed["sheets"][0]["cells"][0];
+
+        assert!(cell_json.get("style").is_none());
     }
 
     #[test]
@@ -365,6 +432,7 @@ mod tests {
     fn formatting_only_cell_serializes_as_empty() {
         let style = Arc::new(ResolvedStyle {
             is_date_time: false,
+            ..Default::default()
         });
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
         sheet.insert_cell(

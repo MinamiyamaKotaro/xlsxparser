@@ -9,7 +9,8 @@
 - `<numFmts>`（カスタム数値書式定義）・`<cellXfs>`（実際にセルへ適用される書式定義の配列。インデックスが [`model::style::StyleId`](../model/style.md) に一致する）をパースする
 - `<cellXfs>` の各 `<xf>` が参照する `numFmtId` を、組み込み書式ID（0〜163の範囲で固定的に意味が定義されているもの）または `<numFmts>` で定義されたカスタム書式のいずれかとして解決し、その書式が日付/時刻を表すか（`ResolvedStyle::is_date_time`）を判定する
 - `<cellXfs>` のインデックス順に `StyleId` を割り当て、[`model::style::StyleSheet`](../model/style.md)（`HashMap<StyleId, Arc<ResolvedStyle>>`）を構築する
-- **含まない責務**: `ResolvedStyle` をセルへ適用する処理そのもの（[`resolve/style.rs`](../resolve/style.md)）、`ResolvedStyle` / `StyleSheet` / `StyleId` の型定義そのもの（[`model/style.rs`](../model/style.md)）、フォント・塗りつぶし・罫線などの視覚的なスタイル要素の抽出（[model/style.md オープンクエスチョン1](../model/style.md) が未解決としているとおり、`ResolvedStyle` が現状 `is_date_time` のみを持つため、本ファイルもこれらのXML要素自体は読み飛ばす）
+- `<fonts><font><sz val=".."/><b/>...</font>...</fonts>`(スキーマ上 `<numFmts>` と同様に `<cellXfs>` より前に出現)を位置インデックスの `Vec<Font>` としてパースし、各 `<xf>` の `fontId` 属性をその `Vec` に対して直接解決する——1 `<xf>` あたりO(1)、`<xf>` ごとに `<fonts>` を走査しない(Issue #38が要求するパフォーマンス要件)
+- **含まない責務**: `ResolvedStyle` をセルへ適用する処理そのもの（[`resolve/style.rs`](../resolve/style.md)）、`ResolvedStyle` / `StyleSheet` / `StyleId` / `Font` の型定義そのもの（[`model/style.rs`](../model/style.md)）、`is_date_time`/`font` 以外の視覚的なスタイル要素の抽出(塗りつぶし・罫線・折返し・配置。[model/style.md オープンクエスチョン1](../model/style.md) で未解決のまま)、`applyFont`/`cellStyleXfs` に基づく名前付きスタイル継承の解決(下記オープンクエスチョン6参照——`fontId` を無条件に直接使用する)
 
 ## 主要な型・関数（案）
 
@@ -63,6 +64,8 @@ fn is_date_time_format(numfmt_id: u32, format_code: Option<&str>) -> bool {
 }
 ```
 
+**フォント解決(Issue #38、実装後に追記)**: `<fonts>` は `<numFmts>` と同様の方法でストリームし、出現順の `Vec<Font>`(インデックス = `fontId`)へ収集する。その上で各 `<cellXfs><xf>` の `fontId` 属性(欠落時は`0`、パース不能または `Vec` の範囲外の場合は `Font::default()` ——`numFmtId` が既に採用している段階的縮退方針と同じ)で `Vec::get` により直接引き当てる。`<font>` 自身の `<sz val="..">` が `size_pt` を、`<b/>`(`val`なし)または `<b val="1"/>`/`<b val="true"/>` が `bold: true` を設定し、比較的稀な明示的な `<b val="0"/>`/`<b val="false"/>` は `bold: false` を設定する。`applyFont` は一切参照せず、`<cellStyleXfs>`/`xfId` に基づく名前付きスタイル継承も解決しない——オープンクエスチョン6参照。
+
 ## 依存関係
 
 - 依存先: [`parse/mod.rs`](mod.md)（`create_secure_reader`, `convert_xml_error`, `required_attr`）、[`model/style.rs`](../model/style.md)（`ResolvedStyle`, `StyleId`, `StyleSheet`）、[`error.rs`](../error.md)
@@ -88,6 +91,9 @@ fn is_date_time_format(numfmt_id: u32, format_code: Option<&str>) -> bool {
 - `numFmtId` 属性が省略された `<xf>` がデフォルト値 `0`（`General`、非日付）として扱われることの確認
 - `<cellXfs>` 内の複数 `<xf>` から構築した `StyleSheet` のキー（`StyleId`）が `<cellXfs>` の0始まりインデックス順と一致することの確認（[resolve/style.md](../resolve/style.md) との結線）
 - 仕様上正当な順序（`<numFmts>` が `<cellXfs>` より前）の `styles.xml` が1パスで正しく解決できることの確認。逆順（`<numFmts>` が `<cellXfs>` より後）はECMA-376のスキーマ違反となる非準拠ファイルであり本設計の対象外だが、そのような入力が渡された場合でも `panic` せず、該当 `numFmtId` が「見つからない」ケースとして `is_date_time: false` へフォールバックし処理を継続できることの確認（オープンクエスチョン4の解決に対する回帰テスト観点）
+- **異なる `fontId` を持つ複数の `<xf>` が、対応する `<fonts>` エントリの正しい `size_pt`/`bold` に解決されることの確認**(Issue #38)
+- **`<b val="0"/>`/`<b val="false"/>` が `bold: false` に解決されることの確認**(要素が単に存在しない場合とは異なる、明示的な「太字でない」形式)
+- **`fontId` 属性を持たない `<xf>` が `<fonts>` の先頭エントリ(インデックス0)にデフォルトすること**、未定義の `<font>` を参照する範囲外の `fontId` が `Font::default()` にフォールバックすること、`<fonts>` 要素自体が無いファイルでは全スタイルが `Font::default()` になること、子プロパティを持たない空の `<font/>` は `Font::default()` として登録されること——いずれもエラーにせず段階的に縮退することの確認
 
 ## 未決事項 / オープンクエスチョン
 
@@ -95,5 +101,5 @@ fn is_date_time_format(numfmt_id: u32, format_code: Option<&str>) -> bool {
 2. **カスタム `formatCode` の日付/時刻判定ヒューリスティックの精度**: 条件付き書式の角括弧区間や、引用符・`\` でエスケープされたリテラル文字を正しく除外できるかは実装時の詳細設計に委ねる。誤判定の実害はエラー処理方針で述べたとおり限定的だが、精度そのものの向上余地は残る。
 3. **未定義の `numFmtId` 参照に対するフォールバックとエラー化のどちらが適切か**: 現状は不正確ながら壊れた `styles.xml` をできるだけ読み進める方針（グレースフルデグラデーション）を仮定しているが、[resolve/style.md](../resolve/style.md) の `Error::InvalidStyleId`（セル側の `cellXfs` インデックス自体が不正な場合）との一貫性を取り、`styles.xml` 内部の参照不整合そのものも明確なエラーとして拒否すべきという意見もありうる。
 4. ~~`<numFmts>` と `<cellXfs>` の読み取り順序~~ → **解決**: 単純な1パスのストリーミングパースで実装する（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を反映）。ECMA-376 Part 1（SpreadsheetML）§18.8.39 `CT_Stylesheet` の `xsd:sequence` が `numFmts`, `fonts`, `fills`, `borders`, `cellStyleXfs`, `cellXfs`, `cellStyles`, `dxfs`, `tableStyles`, `colors`, `extLst` の出現順を仕様として強制しており、`numFmts` が `cellXfs` より後に出現するファイルは仕様上無効なOOXMLドキュメントとなるため、2パス読み取りは不要と判断する。なお、この順序に従わない非準拠なファイルに実際に遭遇した場合でも、該当 `numFmtId` は「組み込みにもカスタム定義にも見つからない」ケースとしてエラー処理方針が定める `is_date_time: false` へのフォールバックが働くため、クラッシュせず安全側に縮退する。
-5. **フォント/塗りつぶし/罫線などの具体的なスタイル要素**: [model/style.md オープンクエスチョン1](../model/style.md) と同一の論点（未解決）。要求仕様書がセルスタイルとしてどこまでの要素をJSON出力に含める必要があるかは `json.rs` の設計、または要求仕様書自体の詳細化と合わせて確定させる。
-6. **`applyNumberFormat` 属性・`cellStyleXfs`（名前付きセルスタイルの継承）への対応**: 現状は `<xf>` の `applyNumberFormat` 属性の値に関わらず `numFmtId` を直接権威あるものとして扱い、`xfId` が指す `cellStyleXfs` からの継承チェーンは考慮しない簡略化を仮定している。要求仕様書がスコープとする範囲でこの簡略化が十分かは未確定。
+5. **フォント/塗りつぶし/罫線などの具体的なスタイル要素**: 一部解決——`font: Font { size_pt, bold }`(Issue #38)は上記の通り実装済み。塗りつぶし・罫線・折返し・配置は [Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36) の残りのサブIssue(#37, #41, #42)として引き続き未解決。
+6. **`applyNumberFormat`/`applyFont` 属性・`cellStyleXfs`（名前付きセルスタイルの継承）への対応**: 解決——意図的な簡略化として、Issue #38実装時にnumFmtからフォントへも同じ方針を拡張した。`<xf>` の `applyNumberFormat`/`applyFont` 属性の値に関わらず `numFmtId`/`fontId` を直接権威あるものとして扱い、`xfId` が指す `cellStyleXfs` からの継承チェーンは考慮しない。実務上、`<cellXfs>` 内の `<xf>` は `applyFont`/`applyNumberFormat` の値に関わらず、実際に使用する書式を指す妥当な `fontId`/`numFmtId` をほぼ常に持つ(これらの属性は「読み込み時にその属性が適用されるか」ではなく「ユーザーがその属性を明示的にカスタマイズしたか」を示すUI上のヒントに近い)。`cellStyleXfs` の完全な継承(「標準」「見出し1」等の名前付きセルスタイルの解決)は、まだどの下流ユースケースからも要求されていない、質的により大きな機能である。この簡略化が誤った `font`/`is_date_time` を生む具体的なケースが見つかった場合は再検討する。

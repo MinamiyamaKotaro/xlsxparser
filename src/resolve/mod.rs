@@ -77,6 +77,7 @@ mod tests {
             0,
             Arc::new(ResolvedStyle {
                 is_date_time: false,
+                ..Default::default()
             }),
         );
         let merge_regions = vec![MergedRegion {

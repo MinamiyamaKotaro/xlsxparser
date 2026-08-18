@@ -23,21 +23,43 @@ use std::sync::Arc;
 /// `Error::InvalidStyleId(u32)` と型を揃える。
 pub type StyleId = u32;
 
+/// 解決済みの `<font>` エントリ。Issue #38 が必要とする2つのプロパティ
+/// のみを持ち、`CT_Font` の完全な転写ではない(色・フォント名・斜体・
+/// 下線などは、具体的な用途が現れるまでスコープ外。オープンクエスチョン1参照)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Font {
+    pub size_pt: f64,
+    pub bold: bool,
+}
+
+impl Default for Font {
+    /// Excel自身の既定値(「標準」スタイル、"Calibri 11"、太字なし)——
+    /// `<xf>` の `fontId` が欠落・解決不能な場合に `parse/styles.rs` が
+    /// 使うフォールバック。欠落・不正な `numFmtId` に対して既に確立
+    /// されている `is_date_time` の段階的縮退方針と同じ考え方。
+    fn default() -> Self {
+        Font { size_pt: 11.0, bold: false }
+    }
+}
+
 /// スタイルID解決後の書式情報。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResolvedStyle {
     /// この書式が日付/時刻を表すか。`parse/styles.rs` が `numFmts` の
     /// コード文字列（組み込み・カスタム双方）を解釈し、あらかじめ
     /// 判定した結果をここに格納しておく想定（[resolve/style.md オープンクエスチョン2](../resolve/style.md) 参照）。
     pub is_date_time: bool,
-    // font/fill/border 等の具体的なフィールドは parse/styles.rs の設計時に確定させる
-    // （オープンクエスチョン1参照）。
+    pub font: Font,
+    // fill/border/wrap/alignment 等の具体的なフィールドは、各サブIssueの
+    // 実装が進むにつれて追加する(オープンクエスチョン1参照)。
 }
 
 /// `cellXfs` インデックスから `ResolvedStyle` を引くテーブル。
 /// `parse/styles.rs` が構築する想定。
 pub type StyleSheet = HashMap<StyleId, Arc<ResolvedStyle>>;
 ```
+
+`ResolvedStyle`/`Font` はいずれも `Default` を導出/実装しているため、一部のフィールドしか必要としない呼び出し元(ほとんどのテストフィクスチャ)は全フィールドを列挙せず `ResolvedStyle { is_date_time: true, ..Default::default() }` のように書ける。
 
 ## 依存関係
 
@@ -56,5 +78,5 @@ pub type StyleSheet = HashMap<StyleId, Arc<ResolvedStyle>>;
 
 ## 未決事項 / オープンクエスチョン
 
-1. **フォント/塗りつぶし/罫線などの具体的なスタイル要素**: [resolve/style.md オープンクエスチョン4](../resolve/style.md) と同一の論点。`ResolvedStyle` は現状 `is_date_time` のみを仮定義しているが、要求仕様書がセルスタイルとしてどこまでの要素（フォント色、背景色、罫線、太字/斜体等）をJSON出力に含める必要があるかは `json.rs` の設計、または要求仕様書自体の詳細化と合わせて確定させる。
+1. **塗りつぶし/罫線/折返し/配置などの具体的なスタイル要素**: 一部解決——Issue #38向けに `font: Font { size_pt, bold }` を追加した(下流の方眼紙判定ツールのはみ出し幅推定・見出しブロック判定がこの2プロパティを直接必要とするため。[parse/styles.md](../parse/styles.md)参照)。[Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36) 配下の残りのサブIssue: `wrap_text`(#37)、`number_format` 文字列(#41)、`alignment`(#42)は引き続き未解決。フォント色・塗りつぶし・罫線・斜体・下線などその他の `CT_Font`/`CT_Fill`/`CT_Border` プロパティは、具体的な下流ユースケースが現れるまでスコープ外のまま(`Font` が既に採用している「完全な転写はしない」方針と同じ)。
 2. ~~日付/時刻書式の判定ロジックの置き場所~~ → **解決**: [`parse/styles.rs`](../parse/styles.md) が `numFmtId`/`formatCode` から `ResolvedStyle::is_date_time` を判定するロジックを持つ（[resolve/style.md オープンクエスチョン2](../resolve/style.md) と同一の論点）。判定ヒューリスティックの精度自体は [parse/styles.md オープンクエスチョン2](../parse/styles.md) として引き続き未解決。

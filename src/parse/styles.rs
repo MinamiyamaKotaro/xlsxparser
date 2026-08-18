@@ -3,7 +3,7 @@
 //! date/time or not.
 
 use crate::error::Error;
-use crate::model::{ResolvedStyle, StyleId, StyleSheet};
+use crate::model::{Font, ResolvedStyle, StyleId, StyleSheet};
 use crate::parse::{create_secure_reader, optional_attr, read_event, required_attr};
 use quick_xml::events::Event;
 use std::collections::HashMap;
@@ -18,17 +18,28 @@ use std::sync::Arc;
 const BUILTIN_DATE_TIME_NUMFMT_IDS: &[u32] = &[14, 15, 16, 17, 18, 19, 20, 21, 22, 45, 46, 47];
 
 /// Parses `xl/styles.xml` and builds a `StyleSheet`. Per ECMA-376 Part 1
-/// §18.8.39 `CT_Stylesheet`'s `xsd:sequence`, `<numFmts>` always precedes
-/// `<cellXfs>` in a schema-valid file, so a single streaming pass suffices:
-/// custom format codes are collected first and are already available by the
-/// time `<cellXfs>` is reached.
+/// §18.8.39 `CT_Stylesheet`'s `xsd:sequence`, `<numFmts>` and `<fonts>` both
+/// always precede `<cellXfs>` in a schema-valid file, so a single streaming
+/// pass suffices: custom format codes and font entries are collected first
+/// and are already available by the time `<cellXfs>` is reached.
+///
+/// Font resolution is deliberately shallow: each `<xf>`'s `fontId` indexes
+/// directly into the parsed `<fonts>` list (`applyFont` is not consulted,
+/// and `<cellStyleXfs>`/`xfId`-based named-style inheritance is not
+/// resolved) — see docs/design/parse/styles.en.md Open Question 3 for why.
 pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleSheet, Error> {
     let mut xml_reader = create_secure_reader(reader);
     let mut buf = Vec::new();
     let mut num_fmts: HashMap<u32, String> = HashMap::new();
+    let mut fonts: Vec<Font> = Vec::new();
     let mut stylesheet: StyleSheet = HashMap::new();
+    let mut in_fonts = false;
     let mut in_cell_xfs = false;
     let mut next_style_id: StyleId = 0;
+
+    // State for the <font> currently being read (between its start and end
+    // tag, mirroring parse/worksheet.rs's per-<c> state pattern).
+    let mut cur_font: Option<Font> = None;
 
     loop {
         let event = read_event(&mut xml_reader, &mut buf, path)?;
@@ -39,6 +50,52 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
                 if let Ok(id) = id_str.parse::<u32>() {
                     num_fmts.insert(id, format_code);
                 }
+            }
+            Event::Start(e) if e.local_name().as_ref() == b"fonts" => {
+                in_fonts = true;
+            }
+            Event::End(e) if e.local_name().as_ref() == b"fonts" => {
+                in_fonts = false;
+            }
+            Event::Start(e) if in_fonts && e.local_name().as_ref() == b"font" => {
+                cur_font = Some(Font::default());
+            }
+            Event::Empty(e) if in_fonts && e.local_name().as_ref() == b"font" => {
+                // A <font/> with no child properties at all (unusual, but
+                // not schema-invalid): registers Excel's own default.
+                fonts.push(Font::default());
+            }
+            Event::End(e) if in_fonts && e.local_name().as_ref() == b"font" => {
+                if let Some(font) = cur_font.take() {
+                    fonts.push(font);
+                }
+            }
+            Event::Start(e) | Event::Empty(e)
+                if cur_font.is_some() && e.local_name().as_ref() == b"sz" =>
+            {
+                if let Some(size_pt) =
+                    optional_attr(e, path, "val")?.and_then(|v| v.parse::<f64>().ok())
+                {
+                    cur_font
+                        .as_mut()
+                        .expect("cur_font.is_some() checked above")
+                        .size_pt = size_pt;
+                }
+            }
+            Event::Start(e) | Event::Empty(e)
+                if cur_font.is_some() && e.local_name().as_ref() == b"b" =>
+            {
+                // <b/> (no val) means bold; <b val="0"/>/<b val="false"/>
+                // is the rarer explicit "not bold" form (ECMA-376
+                // ST_OnOff's boolean-like value space).
+                let bold = !matches!(
+                    optional_attr(e, path, "val")?.as_deref(),
+                    Some("0" | "false")
+                );
+                cur_font
+                    .as_mut()
+                    .expect("cur_font.is_some() checked above")
+                    .bold = bold;
             }
             Event::Start(e) if e.local_name().as_ref() == b"cellXfs" => {
                 in_cell_xfs = true;
@@ -57,7 +114,18 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
                     .unwrap_or(0);
                 let is_date_time =
                     is_date_time_format(numfmt_id, num_fmts.get(&numfmt_id).map(String::as_str));
-                stylesheet.insert(next_style_id, Arc::new(ResolvedStyle { is_date_time }));
+                // fontId absent, unparseable, or out of range (a malformed
+                // file referencing a <font> entry that was never defined)
+                // all degrade to Font::default() rather than erroring —
+                // the same graceful-degradation policy as numFmtId above.
+                let font_id = optional_attr(e, path, "fontId")?
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let font = fonts.get(font_id).copied().unwrap_or_default();
+                stylesheet.insert(
+                    next_style_id,
+                    Arc::new(ResolvedStyle { is_date_time, font }),
+                );
                 next_style_id += 1;
             }
             Event::Eof => break,
@@ -242,5 +310,84 @@ mod tests {
 </styleSheet>"#;
         let sheet = parse(xml);
         assert!(!sheet[&0].is_date_time);
+    }
+
+    #[test]
+    fn font_size_and_bold_resolve_via_font_id() {
+        let xml = br#"<styleSheet>
+<fonts count="2">
+<font><sz val="11"/><name val="Calibri"/></font>
+<font><b/><sz val="14"/><name val="Calibri"/></font>
+</fonts>
+<cellXfs><xf fontId="0"/><xf fontId="1"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(
+            sheet[&0].font,
+            Font {
+                size_pt: 11.0,
+                bold: false
+            }
+        );
+        assert_eq!(
+            sheet[&1].font,
+            Font {
+                size_pt: 14.0,
+                bold: true
+            }
+        );
+    }
+
+    #[test]
+    fn bold_val_zero_is_explicitly_not_bold() {
+        let xml = br#"<styleSheet>
+<fonts count="1"><font><b val="0"/><sz val="12"/></font></fonts>
+<cellXfs><xf fontId="0"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert!(!sheet[&0].font.bold);
+    }
+
+    #[test]
+    fn xf_without_font_id_defaults_to_first_font() {
+        let xml = br#"<styleSheet>
+<fonts count="1"><font><b/><sz val="9"/></font></fonts>
+<cellXfs><xf/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(
+            sheet[&0].font,
+            Font {
+                size_pt: 9.0,
+                bold: true
+            }
+        );
+    }
+
+    #[test]
+    fn font_id_out_of_range_falls_back_to_default_font() {
+        let xml = br#"<styleSheet>
+<fonts count="1"><font><sz val="20"/></font></fonts>
+<cellXfs><xf fontId="5"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].font, Font::default());
+    }
+
+    #[test]
+    fn no_fonts_element_at_all_falls_back_to_default_font() {
+        let xml = br#"<styleSheet><cellXfs><xf numFmtId="0"/></cellXfs></styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].font, Font::default());
+    }
+
+    #[test]
+    fn empty_font_element_registers_default_font() {
+        let xml = br#"<styleSheet>
+<fonts count="1"><font/></fonts>
+<cellXfs><xf fontId="0"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].font, Font::default());
     }
 }

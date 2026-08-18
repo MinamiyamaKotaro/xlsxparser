@@ -11,16 +11,42 @@ use std::sync::Arc;
 /// `Error::InvalidStyleId(u32)`.
 pub type StyleId = u32;
 
+/// A resolved `<font>` entry: just the two properties Issue #38 needs
+/// (`size_pt`/`bold` feed the downstream grid-paper detector's overflow-
+/// width estimate and heading-block heuristic), not a full transcription
+/// of `CT_Font` (color, name, italic, underline, ... are out of scope
+/// until a use case needs them).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Font {
+    pub size_pt: f64,
+    pub bold: bool,
+}
+
+impl Default for Font {
+    /// Excel's own default (`Normal` style, "Calibri 11", not bold) — used
+    /// when an `<xf>`'s `fontId` is absent or does not resolve to a parsed
+    /// `<font>` entry (`parse/styles.rs`'s graceful-degradation policy,
+    /// matching how a missing/unresolvable `numFmtId` falls back to "not a
+    /// date" rather than erroring).
+    fn default() -> Self {
+        Font {
+            size_pt: 11.0,
+            bold: false,
+        }
+    }
+}
+
 /// Format information once a style ID has been resolved.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResolvedStyle {
     /// Whether this format represents a date/time. `parse/styles.rs`
     /// interprets the `numFmts` code string (built-in and custom) and stores
     /// the determination result here ahead of time.
     pub is_date_time: bool,
-    // Concrete fields for font/fill/border etc. are added once
-    // parse/styles.rs is implemented (see docs/design/model/style.en.md
-    // Open Question 1).
+    pub font: Font,
+    // Concrete fields for fill/border/wrap/alignment etc. are added as
+    // their own sub-issues land (see docs/design/model/style.en.md Open
+    // Question 1).
 }
 
 /// A table looking up `ResolvedStyle` by `cellXfs` index. Built by

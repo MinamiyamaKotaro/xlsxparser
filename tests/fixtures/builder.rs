@@ -102,6 +102,17 @@ pub const DEFAULT_STYLES_XML: &[u8] =
 pub const DATE_STYLES_XML: &[u8] =
     br#"<styleSheet><cellXfs><xf numFmtId="0"/><xf numFmtId="14"/></cellXfs></styleSheet>"#;
 
+/// A `xl/styles.xml` with two `<fonts>` entries (style id 0 = default
+/// 11pt/not-bold, style id 1 = 14pt/bold) referenced by two `cellXfs`
+/// entries via `fontId`.
+pub const FONT_STYLES_XML: &[u8] = br#"<styleSheet>
+<fonts count="2">
+<font><sz val="11"/><name val="Calibri"/></font>
+<font><b/><sz val="14"/><name val="Calibri"/></font>
+</fonts>
+<cellXfs><xf fontId="0"/><xf fontId="1"/></cellXfs>
+</styleSheet>"#;
+
 /// A minimal `xl/sharedStrings.xml` built from `strings`, preserving index
 /// order (SST-referencing cells use `t="s"` with this order as their
 /// index).

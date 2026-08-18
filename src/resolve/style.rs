@@ -76,6 +76,7 @@ mod tests {
             0,
             Arc::new(ResolvedStyle {
                 is_date_time: false,
+                ..Default::default()
             }),
         );
 
@@ -124,7 +125,13 @@ mod tests {
         let cell_ref = CellRef { row: 1, col: 1 };
         let mut sheet = sheet_with_cell(cell_ref, Some(CellValue::Number(45000.0)));
         let mut stylesheet = StyleSheet::new();
-        stylesheet.insert(0, Arc::new(ResolvedStyle { is_date_time: true }));
+        stylesheet.insert(
+            0,
+            Arc::new(ResolvedStyle {
+                is_date_time: true,
+                ..Default::default()
+            }),
+        );
 
         resolve(
             &mut sheet,
@@ -147,7 +154,13 @@ mod tests {
         let cell_ref = CellRef { row: 1, col: 1 };
         let mut sheet = sheet_with_cell(cell_ref, Some(CellValue::Number(-5.0)));
         let mut stylesheet = StyleSheet::new();
-        stylesheet.insert(0, Arc::new(ResolvedStyle { is_date_time: true }));
+        stylesheet.insert(
+            0,
+            Arc::new(ResolvedStyle {
+                is_date_time: true,
+                ..Default::default()
+            }),
+        );
 
         resolve(
             &mut sheet,
@@ -170,7 +183,13 @@ mod tests {
         let cell_ref = CellRef { row: 1, col: 1 };
         let mut sheet = sheet_with_cell(cell_ref, Some(CellValue::Boolean(true)));
         let mut stylesheet = StyleSheet::new();
-        stylesheet.insert(0, Arc::new(ResolvedStyle { is_date_time: true }));
+        stylesheet.insert(
+            0,
+            Arc::new(ResolvedStyle {
+                is_date_time: true,
+                ..Default::default()
+            }),
+        );
 
         resolve(
             &mut sheet,
@@ -197,6 +216,7 @@ mod tests {
             0,
             Arc::new(ResolvedStyle {
                 is_date_time: false,
+                ..Default::default()
             }),
         );
 
@@ -240,6 +260,7 @@ mod tests {
             0,
             Arc::new(ResolvedStyle {
                 is_date_time: false,
+                ..Default::default()
             }),
         );
 

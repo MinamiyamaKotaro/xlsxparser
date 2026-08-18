@@ -23,22 +23,44 @@ use std::sync::Arc;
 /// [error.rs](../error.en.md)'s `Error::InvalidStyleId(u32)`.
 pub type StyleId = u32;
 
+/// A resolved `<font>` entry: just the two properties Issue #38 needs, not
+/// a full transcription of `CT_Font` (color, name, italic, underline, ...
+/// stay out of scope until a use case needs them — see Open Question 1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Font {
+    pub size_pt: f64,
+    pub bold: bool,
+}
+
+impl Default for Font {
+    /// Excel's own default ("Normal" style, "Calibri 11", not bold) — the
+    /// fallback `parse/styles.rs` uses when an `<xf>`'s `fontId` is absent
+    /// or unresolvable, matching the graceful-degradation policy
+    /// `is_date_time` already established for a missing/invalid `numFmtId`.
+    fn default() -> Self {
+        Font { size_pt: 11.0, bold: false }
+    }
+}
+
 /// Format information once a style ID has been resolved.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResolvedStyle {
     /// Whether this format represents a date/time. `parse/styles.rs` is
     /// expected to interpret the `numFmts` code string (both built-in and
     /// custom) and store the determination result here ahead of time (see
     /// [resolve/style.md Open Question 2](../resolve/style.en.md)).
     pub is_date_time: bool,
-    // Concrete fields for font/fill/border etc. will be finalized when
-    // parse/styles.rs is designed (see Open Question 1).
+    pub font: Font,
+    // Concrete fields for fill/border/wrap/alignment etc. will be added as
+    // their own sub-issues land (see Open Question 1).
 }
 
 /// A table looking up `ResolvedStyle` by `cellXfs` index. Expected to be
 /// built by `parse/styles.rs`.
 pub type StyleSheet = HashMap<StyleId, Arc<ResolvedStyle>>;
 ```
+
+`ResolvedStyle`/`Font` both derive/implement `Default` so call sites needing only a subset of fields (most test fixtures) can write `ResolvedStyle { is_date_time: true, ..Default::default() }` rather than naming every field.
 
 ## Dependencies
 
@@ -57,5 +79,5 @@ Not applicable. Since this file contains only type definitions, it has no unit t
 
 ## Open Questions
 
-1. **Concrete style elements such as font/fill/border**: the same point as [resolve/style.md Open Question 4](../resolve/style.en.md). `ResolvedStyle` currently only tentatively defines `is_date_time`; how far the requirements spec expects cell styling (font color, background color, borders, bold/italic, etc.) to be included in JSON output will be finalized alongside `json.rs`'s design, or as the requirements spec itself is elaborated.
+1. **Concrete style elements such as fill/border/wrap/alignment**: partially resolved — `font: Font { size_pt, bold }` was added for Issue #38 (the downstream grid-paper detector's overflow-width estimate and heading-block heuristic need exactly these two properties; see [parse/styles.en.md](../parse/styles.en.md)). Still open for the remaining sub-issues under [Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36): `wrap_text` (#37), a `number_format` string (#41), and `alignment` (#42). Font color, fill, border, italic, underline, and any other `CT_Font`/`CT_Fill`/`CT_Border` properties remain out of scope until a concrete downstream use case names them — the same "not a full transcription" policy `Font` already follows.
 2. ~~Where the date/time format determination logic lives~~ → **Resolved**: [`parse/styles.rs`](../parse/styles.en.md) owns classifying `ResolvedStyle::is_date_time` from `numFmtId`/`formatCode` (the same point as [resolve/style.md Open Question 2](../resolve/style.en.md)). The heuristic's precision itself remains open — see [parse/styles.md Open Question 2](../parse/styles.en.md).
