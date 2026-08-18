@@ -23,6 +23,13 @@ use crate::model::sheet::{MergedRegion, Sheet};
 /// function rejects clear range overlaps (two or more distinct origin cells
 /// claiming the same cell) as a validation error, so duplicate registration
 /// never actually reaches the `Sheet` side (see Open Question 1).
+///
+/// Once every region is registered, calls
+/// [`Sheet::finalize_merges`](../model/sheet.en.md) to batch-resolve every
+/// cell to its merge origin in one pass — this is what keeps `json.rs`'s
+/// later `iter_cells` call fast regardless of how the merges are arranged
+/// (Issue #43; see `model/sheet.en.md`'s "Fix: `finalize_merges`" note for
+/// the full story).
 pub(crate) fn resolve(sheet: &mut Sheet, regions: Vec<MergedRegion>) -> Result<(), Error> {
     let mut accepted: Vec<MergedRegion> = Vec::with_capacity(regions.len());
     for region in &regions {
@@ -32,6 +39,7 @@ pub(crate) fn resolve(sheet: &mut Sheet, regions: Vec<MergedRegion>) -> Result<(
     for region in regions {
         sheet.insert_merge(region);
     }
+    sheet.finalize_merges();
     Ok(())
 }
 
@@ -77,7 +85,7 @@ fn regions_overlap(a: &MergedRegion, b: &MergedRegion) -> bool {
 
 ## Dependencies
 
-- Depends on: [`model/sheet.rs`](../model/sheet.en.md) (`Sheet::insert_merge`, `MergedRegion`), [`error.rs`](../error.en.md)
+- Depends on: [`model/sheet.rs`](../model/sheet.en.md) (`Sheet::insert_merge`, `Sheet::finalize_merges`, `MergedRegion`), [`error.rs`](../error.en.md)
 - Depended on by: [`resolve/mod.rs`](mod.en.md) (called from `resolve_sheet`)
 
 `validate_region` never expands a range into a `HashSet<CellRef>`; it detects overlaps purely through rectangle-intersection tests against ranges that already passed validation (`accepted: &[MergedRegion]`). The per-range cost is O(1) regardless of the range's area (cell count), and the total cost of validating `N` ranges is bounded by O(N²) (each range is compared against those already validated) (addresses PR #8 review feedback — the earlier `HashSet<CellRef>` expansion could turn a single huge range like `A1:XFD1048576` into a loop over more than a billion cells, capable of hanging the CPU).
@@ -98,10 +106,12 @@ fn regions_overlap(a: &MergedRegion, b: &MergedRegion) -> bool {
 - Verify that when a validation error occurs, no ranges are registered into `Sheet` at all — including ones that passed validation earlier in the list (confirming the whole-batch rejection)
 - Verify that an empty merged-range list results in a no-op `Ok(())`
 - Verify that a 1x1 merged range (a trivial, effectively-not-merged case) is handled correctly (boundary value)
+- Verify that `resolve` calls `Sheet::finalize_merges` after registering all regions (covered indirectly via `model/sheet.en.md`'s `finalize_merges` tests plus the end-to-end fixture `sparse_merge_bounding_box_amplification` in `tests/fixtures/security.rs`, exercised through the full pipeline rather than this module in isolation)
 
 ## Open Questions
 
 1. **Validity of placing overlap validation in this file rather than in `Sheet::insert_merge`**: [model/sheet.md](../model/sheet.en.md) states that "calling `insert_merge` multiple times is expected to simply overwrite," meaning that without this file's validation layer, overlapping ranges would be silently overwritten last-write-wins. Introducing validation turns this behavior into an error — a design decision — but it's undecided whether the requirements spec includes a future use case that intentionally wants to tolerate overlaps (e.g. an error-tolerant mode that reads as much of a corrupted `.xlsx` as possible).
 2. ~~Computational complexity of overlap detection~~ → **Resolved**: replaced the per-cell `HashSet<CellRef>` expansion with an O(1) geometric intersection test (separating-axis test) between rectangles. Validating one new range against N already-validated ranges costs O(N), and O(N²) overall — independent of a range's area (cell count). If the number of ranges N becomes very large (e.g. tens of thousands), there is room to further improve to O(N log N) via sorting plus a sweep line, but since it is expected to be rare for a real-world Excel file to reach tens of thousands of merged ranges, the simple O(N²) implementation is considered sufficient for now (addresses PR #8 review feedback).
    **Addendum (2026-08-17, following [Security Code Review Finding 1](../../security/code-review.en.md))**: the "rare in real-world files" premise above does not hold once an attacker deliberately crafts a non-conforming file packed with `<mergeCell>` entries. Each entry is only ~20-30 bytes, so the Zip Bomb byte cap (512 MiB per entry by default) does not effectively bound the range count N — measurements confirmed the O(N²) cost alone can turn a few-hundred-KB-to-few-MB file into tens of seconds to minutes of CPU blocking. Rather than pursuing the O(N log N) sweep-line rewrite, a defensive count cap was added: `resolve::merge::MAX_MERGE_REGIONS` (20,000 by default) now returns `Error::TooManyMergedRanges` before the O(N²) loop ever runs, if exceeded.
+   **Second addendum (2026-08-18, Issue #43)**: `MAX_MERGE_REGIONS` bounds *this file's own* O(N²) validation cost, but a separate, previously-unnoticed cost lived one level up the call stack — `model::Sheet::get`/`get_mut`/`iter_cells`'s per-cell alias resolution, which the `merge_bounds` O(1) pre-check ([model/sheet.en.md](../model/sheet.en.md)) only partially protects against. Measured at up to tens of seconds of CPU time for `json.rs`'s cell iteration alone, on a file within every existing limit. Unlike this file's own O(N²), which a sweep-line rewrite was explicitly considered and deferred for (see the addendum above), that fix *was* the sweep-line rewrite — just applied to `Sheet::finalize_merges` (a new method `resolve` now calls after registering every region) rather than to `validate_region`. See [model/sheet.en.md](../model/sheet.en.md)'s "Fix: `finalize_merges`" note for the full story, including three simpler attempts that measurement showed didn't actually close the gap.
 3. **Validity of passing `MergedRegion` as a batched `Vec`**: As with [resolve/mod.md Open Question 3](mod.en.md), since `parse/worksheet.rs` is not yet designed, at what point in the stream the `<mergeCells>` element (which typically appears near the end of `worksheet.xml`, after all row data) can be finalized into a `Vec<MergedRegion>` is undecided and will be settled when `parse/worksheet.rs` is designed.

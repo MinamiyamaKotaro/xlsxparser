@@ -25,6 +25,11 @@ pub(crate) const MAX_MERGE_REGIONS: usize = 20_000;
 /// start/end coordinate pair or a range that overlaps one already
 /// validated as `Error::InvalidMergedRange`. If even one range is invalid,
 /// nothing is registered (reject the whole batch — fail closed).
+///
+/// Once every region is registered, calls `Sheet::finalize_merges` to
+/// batch-resolve every cell to its merge origin in one pass — this is what
+/// keeps `json.rs`'s later `iter_cells` call fast regardless of how the
+/// merges are arranged (Issue #43).
 pub(crate) fn resolve(sheet: &mut Sheet, regions: Vec<MergedRegion>) -> Result<(), Error> {
     if regions.len() > MAX_MERGE_REGIONS {
         return Err(Error::TooManyMergedRanges {
@@ -40,6 +45,7 @@ pub(crate) fn resolve(sheet: &mut Sheet, regions: Vec<MergedRegion>) -> Result<(
     for region in regions {
         sheet.insert_merge(region);
     }
+    sheet.finalize_merges();
     Ok(())
 }
 

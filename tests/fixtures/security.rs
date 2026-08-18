@@ -45,6 +45,82 @@ pub fn zip_bomb() -> Vec<u8> {
     ])
 }
 
+/// 20,000 single-cell merges (at `MAX_MERGE_REGIONS`, `resolve::merge`'s
+/// cap) arranged so their combined bounding box covers virtually the whole
+/// sheet: most sit on row 2, but one is planted at the sheet's far corner
+/// (`XFD1048576`) purely to stretch `merge_bounds`. 300,000 data cells sit
+/// far from every merge (row 500,000), each carrying a non-default style
+/// (`s="0"`) so a `PendingStyle` gets recorded for it — a structurally
+/// valid file (every merge is 1x1, non-overlapping, and within
+/// `MAX_MERGE_REGIONS`) rather than a malformed one.
+///
+/// Before `Sheet::finalize_merges` (Issue #43), `json.rs`'s `iter_cells`
+/// resolved each of those 300,000 cells by scanning all 20,000 merged
+/// regions (the O(1) `merge_bounds` pre-check never rejects them, since
+/// they fall inside it) — a directly measured multi-second CPU stall from
+/// a file only a few hundred KB in size, with none of the individual
+/// merge-count/cell-count/byte-size limits actually violated.
+pub fn sparse_merge_bounding_box_amplification() -> Vec<u8> {
+    const NUM_FILLER_MERGES: usize = 19_999;
+    const NUM_DATA_CELLS: usize = 300_000;
+
+    let mut merges = String::new();
+    for i in 0..NUM_FILLER_MERGES {
+        let col = (i % 16_384) + 1;
+        let row = 2 + (i / 16_384);
+        let a1 = format!("{}{row}", column_letters(col as u32));
+        merges.push_str(&format!("<mergeCell ref=\"{a1}:{a1}\"/>"));
+    }
+    merges.push_str("<mergeCell ref=\"XFD1048576:XFD1048576\"/>");
+    let merge_cells_xml = format!(
+        "<mergeCells count=\"{}\">{merges}</mergeCells>",
+        NUM_FILLER_MERGES + 1
+    );
+
+    let mut rows = String::new();
+    for i in 0..NUM_DATA_CELLS {
+        let col = (i % 16_384) + 1;
+        rows.push_str(&format!(
+            "<row r=\"500000\"><c r=\"{}500000\" s=\"0\"><v>1</v></c></row>\n",
+            column_letters(col as u32)
+        ));
+    }
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "styles", "styles.xml"),
+            ])
+            .as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        ("xl/styles.xml", DEFAULT_STYLES_XML),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(&rows, &merge_cells_xml).as_bytes(),
+        ),
+    ])
+}
+
+/// Converts a 1-based column number to A1-style letters (mirrors
+/// `model::cell`'s private `column_number_to_letters`; duplicated here for
+/// the same reason `tests/fixtures/load.rs` does).
+fn column_letters(mut n: u32) -> String {
+    let mut buf = Vec::new();
+    while n > 0 {
+        let rem = ((n - 1) % 26) as u8;
+        buf.push(b'A' + rem);
+        n = (n - 1) / 26;
+    }
+    buf.reverse();
+    String::from_utf8(buf).unwrap()
+}
+
 /// An otherwise-normal package that also contains one ZIP entry named
 /// `../../../../../../../tmp/evil.txt` — a path-traversal entry name of the
 /// kind Zip Slip exploits to write outside the intended extraction

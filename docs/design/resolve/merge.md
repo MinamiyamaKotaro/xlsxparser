@@ -23,6 +23,12 @@ use crate::model::sheet::{MergedRegion, Sheet};
 /// （同一セルに対する2つ以上の異なる起点セル指定）を検証エラーとして拒否
 /// するため、実際に重複登録が `Sheet` 側まで到達することはない
 /// （オープンクエスチョン1参照）。
+///
+/// 全範囲を登録し終えた後、[`Sheet::finalize_merges`](../model/sheet.md)
+/// を呼び出し、全セルを起点へ一括解決する——これにより、結合セルが
+/// どう配置されていても `json.rs` の後続の `iter_cells` 呼び出しが
+/// 高速なままになる（Issue #43。詳細は `model/sheet.md` の
+/// 「修正: `finalize_merges`」を参照）。
 pub(crate) fn resolve(sheet: &mut Sheet, regions: Vec<MergedRegion>) -> Result<(), Error> {
     let mut accepted: Vec<MergedRegion> = Vec::with_capacity(regions.len());
     for region in &regions {
@@ -32,6 +38,7 @@ pub(crate) fn resolve(sheet: &mut Sheet, regions: Vec<MergedRegion>) -> Result<(
     for region in regions {
         sheet.insert_merge(region);
     }
+    sheet.finalize_merges();
     Ok(())
 }
 
@@ -75,7 +82,7 @@ fn regions_overlap(a: &MergedRegion, b: &MergedRegion) -> bool {
 
 ## 依存関係
 
-- 依存先: [`model/sheet.rs`](../model/sheet.md)（`Sheet::insert_merge`, `MergedRegion`）、[`error.rs`](../error.md)
+- 依存先: [`model/sheet.rs`](../model/sheet.md)（`Sheet::insert_merge`, `Sheet::finalize_merges`, `MergedRegion`）、[`error.rs`](../error.md)
 - 依存元: [`resolve/mod.rs`](mod.md)（`resolve_sheet` から呼び出される）
 
 `validate_region` は結合範囲を `HashSet<CellRef>` へ展開せず、既に検証を通過した範囲（`accepted: &[MergedRegion]`）との矩形交差判定のみで重複を検出する。1件あたりの判定コストは範囲の面積（セル数）に依存せずO(1)、`N`件の範囲全体を検証する総コストはO(N²)（各範囲がそれまでに検証済みの範囲と比較するため）に抑えられる（PR #8 レビュー指摘を反映。旧設計の `HashSet<CellRef>` 展開では `A1:XFD1048576` のような広大な範囲1件だけで10億セル超のループが発生しCPUをハングアップさせうる問題があった）。
@@ -96,10 +103,12 @@ fn regions_overlap(a: &MergedRegion, b: &MergedRegion) -> bool {
 - 検証エラーが発生した場合、それより前に検証を通過した範囲も含めて `Sheet` へ一切登録されないことの確認（全体拒否の確認）
 - 結合範囲リストが空の場合に何もせず `Ok(())` を返すことの確認
 - 1x1の結合範囲（実質的に結合ではない自明なケース）が正しく処理されることの確認（境界値）
+- `resolve` が全範囲登録後に `Sheet::finalize_merges` を呼ぶことの確認(`model/sheet.md` の `finalize_merges` テスト群と、`tests/fixtures/security.rs` の `sparse_merge_bounding_box_amplification` によるエンドツーエンドのフィクスチャで間接的にカバーする。本モジュール単体ではなくパイプライン全体を通して検証する)
 
 ## 未決事項 / オープンクエスチョン
 
 1. **重複検証を `Sheet::insert_merge` 側ではなく本ファイル側に置く設計の妥当性**: [model/sheet.md](../model/sheet.md) は「`insert_merge` を複数回呼んだ場合は単純に上書きする実装を想定」と述べており、本ファイルの検証層がなければ重複範囲はサイレントに後勝ち上書きされる。検証を挟むことでこの挙動を「エラー」に変える設計判断だが、意図的に重複を許容したい将来のユースケース（例えば壊れた `.xlsx` を可能な限り読み進めたいエラー耐性モード）が要求仕様に含まれるかは未確定。
 2. ~~重複判定の計算量~~ → **解決**: セル単位の `HashSet<CellRef>` 展開ではなく、矩形同士の幾何的交差判定（分離軸判定）をO(1)で行う設計に変更した。検証済みのN件の範囲に対して新規の1件を検証するコストはO(N)、全体でO(N²)に収まり、結合範囲の面積（セル数）に依存しない。範囲の件数Nが非常に多い場合（例: 数万件規模）はソート+スイープライン法でO(N log N)へさらに改善する余地があるが、実務上のExcelファイルで結合範囲が万単位に達するケースは稀と想定されるため、現時点ではO(N²)のシンプルな実装で十分とする（PR #8 レビュー指摘を反映）。
    **追記（2026-08-17、[セキュリティコードレビュー Finding 1](../../security/code-review.md) を受けて）**: 「実務上のファイルでは稀」という上記の前提は、攻撃者が意図的に大量の `<mergeCell>` を詰め込んだ非正規のファイルを作る場合には成立しない。`<mergeCell>` 1件は約20〜30バイトしかないため、Zip Bomb対策のバイト数上限（既定512MiB/エントリ）は範囲件数Nを実質的に有界にできず、O(N²)のまま数百KB〜数MBのファイルで数十秒〜数分のCPU拘束を引き起こせることを実測で確認した。根本対策（スイープライン法へのO(N log N)化）は見送ったまま、`resolve::merge::MAX_MERGE_REGIONS`（既定20,000件）による防御的な件数上限を追加し、上限超過時はO(N²)ループに入る前に `Error::TooManyMergedRanges` を返すようにした。
+   **第2の追記（2026-08-18、Issue #43）**: `MAX_MERGE_REGIONS` は**本ファイル自身**のO(N²)検証コストを抑えるものだが、これとは別に、それまで気づかれていなかったコストが呼び出しスタックの一段上——`model::Sheet` の `get`/`get_mut`/`iter_cells` によるセル単位のエイリアス解決——に存在していた。これは `merge_bounds` によるO(1)事前チェック（[model/sheet.md](../model/sheet.md)）でも部分的にしか防げない。既存の全ての上限内に収まるファイルで、`json.rs` のセル走査だけで最大数十秒のCPU時間を要することを実測した。本ファイル自身のO(N²)(上記の追記でスイープライン法への書き換えを検討し見送った箇所)とは異なり、今回の対策は**まさにそのスイープライン法への書き換え**である——ただし `validate_region` ではなく、全範囲登録後に `resolve` が新たに呼び出す `Sheet::finalize_merges` に適用した。詳細（3種の単純な対策が実測により効果が無いと判明した経緯を含む）は [model/sheet.md](../model/sheet.md) の「修正: `finalize_merges`」を参照。
 3. **`MergedRegion` を `Vec` として一括受け渡しする設計の妥当性**: [resolve/mod.md オープンクエスチョン3](mod.md) と同様、`parse/worksheet.rs` が未設計のため、`<mergeCells>` 要素（`worksheet.xml` 内で通常は全行データの後、末尾近くに出現する）をストリームのどの時点で `Vec<MergedRegion>` として確定できるかは `parse/worksheet.rs` の設計時に確定させる。

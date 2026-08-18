@@ -152,17 +152,89 @@ impl Sheet {
         self.merged_regions.get(&origin)
     }
 
-    /// An iterator over origin cells only (for JSON generation). Excludes
-    /// any coordinate that `resolve_origin` maps to a *different* cell:
-    /// `parse/worksheet.rs` inserts a `Cell` for every `<c>` element it
-    /// streams, including ones inside a merged range that later turn out
-    /// not to be the origin (e.g. a virtual cell carrying only border
-    /// styling), so `cells` cannot be assumed to hold origin cells
-    /// exclusively (fixed at implementation time — PR #20 review;
-    /// `cells.iter()` without this filter would leak such virtual cells
-    /// into `json.rs`'s output as duplicates).
+    /// Runs once, after every `<mergeCell>` on this sheet has been
+    /// registered via `insert_merge` (called by `resolve::merge::resolve`
+    /// as its last step). Batch-resolves every currently-inserted cell key
+    /// to its merge origin via a sweep line over rows — O((C + M) log
+    /// (C + M)) for C cells and M merged regions — then drops every entry
+    /// whose key isn't its own origin. See the note after the code block
+    /// (Issue #43) for why, and `iter_cells`'s doc comment for what this
+    /// buys.
+    pub(crate) fn finalize_merges(&mut self) {
+        if self.merged_regions.is_empty() {
+            return;
+        }
+
+        enum SweepEvent {
+            Start(CellRef),        // fired at region.start.row
+            End(CellRef),          // fired at region.end.row + 1
+            Query(CellRef),        // fired at a cell coordinate's row
+        }
+
+        let mut events: Vec<(u32, u8, SweepEvent)> = Vec::new();
+        for region in self.merged_regions.values() {
+            events.push((region.start.row, 0, SweepEvent::Start(region.start)));
+            events.push((region.end.row + 1, 0, SweepEvent::End(region.start)));
+        }
+        for &coord in self.cells.keys() {
+            events.push((coord.row, 2, SweepEvent::Query(coord)));
+        }
+        // End/Start (rank 0/1) before Query at the same row, so a query
+        // always sees the fully up-to-date active set for its row.
+        events.sort_by_key(|(row, rank, event)| {
+            let start_end_rank = match event {
+                SweepEvent::End(_) => 0,
+                SweepEvent::Start(_) => 1,
+                SweepEvent::Query(_) => *rank,
+            };
+            (*row, start_end_rank)
+        });
+
+        // Merges active at the current row, holding each region's `start`
+        // (its merged_regions key), sorted by start.col. Column ranges are
+        // disjoint by construction (resolve::merge rejects overlaps), so
+        // at most one active entry can ever contain a query column.
+        let mut active: Vec<CellRef> = Vec::new();
+        let mut to_drop: Vec<CellRef> = Vec::new();
+        for (_, _, event) in &events {
+            match event {
+                SweepEvent::Start(start) => {
+                    let pos = active.partition_point(|s| s.col < start.col);
+                    active.insert(pos, *start);
+                }
+                SweepEvent::End(start) => {
+                    let pos = active.partition_point(|s| s.col < start.col);
+                    active.remove(pos);
+                }
+                SweepEvent::Query(coord) => {
+                    let pos = active.partition_point(|s| s.col <= coord.col);
+                    if pos == 0 {
+                        continue;
+                    }
+                    let candidate = active[pos - 1];
+                    if *coord == candidate {
+                        continue; // it's already this region's own origin.
+                    }
+                    let region = self.merged_regions.get(&candidate).unwrap();
+                    if coord.col <= region.end.col {
+                        to_drop.push(*coord);
+                    }
+                }
+            }
+        }
+        for coord in to_drop {
+            self.cells.remove(&coord);
+        }
+    }
+
+    /// An iterator over origin cells only (for JSON generation). No longer
+    /// calls `resolve_origin` per cell: `finalize_merges` (called once,
+    /// right after every merge is registered) already guarantees every
+    /// remaining `cells` key is its own origin, so a plain `cells.iter()`
+    /// is correct on its own. See the note after the code block (Issue
+    /// #43) for why this changed from the PR #20-era filtered version.
     pub fn iter_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
-        self.cells.iter().filter(|(&r, _)| self.resolve_origin(r) == r).map(|(&r, c)| (r, c))
+        self.cells.iter().map(|(&r, c)| (r, c))
     }
 }
 ```
@@ -171,12 +243,18 @@ impl Sheet {
 
 **Follow-up optimization: `merge_bounds` (PR #23 review).** `Sheet` also tracks `merge_bounds: Option<(u32, u32, u32, u32)>` — the union bounding box (min/max row, min/max col) across every merged region's `start`/`end`, updated in `insert_merge` alongside `merged_regions`. `resolve_origin` checks this first: a coordinate outside the combined bounding box is rejected in O(1), before ever touching the O(N) per-region scan. Since most cells on a sheet with merges concentrated in one area fall outside that area entirely, this turns the common case back into O(1) while keeping the O(N) fallback correct for coordinates that land inside the bounding box but between two regions (with a gap between them) rather than inside either one — see the regression test `get_inside_bounding_box_but_outside_any_region_resolves_to_itself`. The bound is a conservative upper bound, not necessarily the tightest possible one: overwriting a merge at the same origin with a smaller region never shrinks `merge_bounds` back down, since the old bound isn't retracted. That only costs a missed early exit in a rare edge case, never a correctness issue, because the full scan remains authoritative whenever the bounds check doesn't reject a coordinate outright.
 
+**Fix: `finalize_merges` (Issue #43, closing an adversarial-arrangement gap `merge_bounds` couldn't).** `merge_bounds`'s O(1) pre-check only rejects a coordinate *outside* the combined bounding box; a legitimate arrangement as small as two 1x1 merges at opposite corners of the sheet stretches that box to cover virtually the whole sheet, so every other cell falls back to the O(N) per-region scan regardless of how far it actually is from any merge. `json.rs`'s `iter_cells` calls `resolve_origin` once per cell, so this turned into an O(cells × merged regions) cost during JSON generation — directly measured at tens of seconds of CPU time for a file well within every existing limit (hundreds of thousands of cells, tens of thousands of merges, both within `MAX_MERGE_REGIONS`; a few hundred KB on disk).
+
+Three "clever" per-query fixes were tried and each, in turn, measured to still degrade to roughly the original cost under a specifically-constructed (but entirely legitimate) merge arrangement: a single global "tallest merge seen" cutoff (defeated by one additional full-height merge), fixed-size row bucketing (defeated by concentrating merges and queries into one bucket), and a height-balanced interval tree whose search algorithm explored both children instead of one (defeated by merges that share a wide row range but occupy different columns). See Issue #43's discussion thread for each counter-example and its measurement.
+
+The fix that held up is `Sheet::finalize_merges`: called once by `resolve::merge::resolve`, right after every merge for the sheet has been registered via `insert_merge`. It resolves every currently-inserted cell key to its merge origin in a single sweep-line pass over rows — Start/End events from each merged region's row range, interleaved with a Query event per cell key, sorted once (O((C + M) log (C + M)) for C cells and M merged regions) and then swept in one pass, tracking the column-sorted set of merges active at the current row (disjoint by construction, since `resolve::merge`'s validation already rejects overlapping ranges) — and drops every cell whose key isn't its own origin. This never discards observable data: a coordinate that isn't its own origin was already unreachable through `get`/`iter_cells` (`resolve_origin` always redirects to the origin first), so the entries dropped were already dead, exactly as the `iter_cells_excludes_cells_pre_inserted_at_alias_coordinates` regression test already established. What changes is that `iter_cells` no longer needs to call `resolve_origin` at all afterwards — every remaining key already equals its own origin — closing the cost path regardless of how the merges are arranged in space. `get`/`get_mut`'s own general-purpose fallback (used by external callers querying an arbitrary coordinate after parsing completes) is unchanged; only the internally-driven, file-size-scaled `iter_cells` path — the one an attacker actually controls — needed this.
+
 ## Dependencies
 
 - Depends on: [`model/cell.rs`](cell.en.md) (`Cell`, `CellRef`)
-- Depended on by: `model::Workbook` (holds multiple sheets), [`pipeline.rs`](../pipeline.en.md) (constructs sheets via `Sheet::new`), `resolve/merge.rs` (calls `insert_merge` to register merged cells), `resolve/shared_strings.rs` / `resolve/style.rs` (rewrite a cell's value/style with resolved data via `get_mut`), [`json.rs`](../json.en.md) (assembles JSON from `iter_cells` and `merged_region_at`), `parse/worksheet.rs` (inserts parsed data via `insert_cell`)
+- Depended on by: `model::Workbook` (holds multiple sheets), [`pipeline.rs`](../pipeline.en.md) (constructs sheets via `Sheet::new`), `resolve/merge.rs` (calls `insert_merge` to register merged cells, then `finalize_merges` once all of them are registered), `resolve/shared_strings.rs` / `resolve/style.rs` (rewrite a cell's value/style with resolved data via `get_mut`), [`json.rs`](../json.en.md) (assembles JSON from `iter_cells` and `merged_region_at`), `parse/worksheet.rs` (inserts parsed data via `insert_cell`)
 
-The `cells` / `merged_regions` fields themselves stay fully private — not even `pub(crate)` — and writes to these internal data structures are restricted to the three methods `insert_cell` / `insert_merge` / `get_mut`. The alternative of making the fields directly `pub(crate)` (as originally suggested in review) was also considered, but that would require every caller across multiple `resolve/` modules to individually remember to keep `max_row`/`max_col` up to date and to backfill a merge's origin cell — scattering the invariant across the crate. Restricting writes to these methods keeps the invariant contained inside `Sheet` itself, so callers don't need to worry about correctness.
+The `cells` / `merged_regions` fields themselves stay fully private — not even `pub(crate)` — and writes to these internal data structures are restricted to `insert_cell` / `insert_merge` / `get_mut` / `finalize_merges`. The alternative of making the fields directly `pub(crate)` (as originally suggested in review) was also considered, but that would require every caller across multiple `resolve/` modules to individually remember to keep `max_row`/`max_col` up to date and to backfill a merge's origin cell — scattering the invariant across the crate. Restricting writes to these methods keeps the invariant contained inside `Sheet` itself, so callers don't need to worry about correctness.
 
 ## Error Handling Policy
 
@@ -197,6 +275,10 @@ The `cells` / `merged_regions` fields themselves stay fully private — not even
 - Verifying that `max_row` / `max_col` are updated correctly on every `insert_cell` call (confirming they can be computed without trusting `<dimension>`)
 - **Verifying that calling `insert_merge` on a range with neither value nor formatting inserts a blank placeholder at the origin cell, and that it is then correctly retrievable via `iter_cells` / `merged_region_at`** (a regression-test point added following the [PR #5 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948259819))
 - **Verifying that when the only real data is at `A1`, but it is merged as `A1:C3`, calling `insert_merge` results in `max_row == 3` and `max_col == 3`** (regression test for the case where a merge region's end coordinate expands the sheet's effective used range)
+- **Verifying `finalize_merges` is a no-op on a sheet with no merges** (the common case must stay cheap)
+- **Verifying `finalize_merges` drops a cell that was pre-inserted at a virtual (non-origin) coordinate while keeping both the merge's origin cell and an unrelated standalone cell** (Issue #43; supersedes needing `iter_cells`'s own filter for this)
+- **Verifying `finalize_merges` resolves correctly across more than one merged region with disjoint row ranges**, including a data cell that sits outside every region entirely (exercises the sweep line's Start/End bookkeeping, not just a single region)
+- **End-to-end regression: a file with `MAX_MERGE_REGIONS` merges arranged to maximize `merge_bounds` (two arranged at opposite corners) plus hundreds of thousands of unrelated cells completes JSON generation without the multi-second stall measured pre-fix** (`tests/security.rs`'s `sparse_merge_bounding_box_does_not_amplify_json_generation_cost`, using the `sparse_merge_bounding_box_amplification` fixture — categorized under Category 5 (security) rather than Category 4 (load), since it's specifically an adversarial-arrangement DoS concern, matching `zip_bomb`/`zip_slip`/`xxe_attack`)
 
 ## Open Questions
 

@@ -168,15 +168,88 @@ impl Sheet {
         self.merged_regions.get(&origin)
     }
 
-    /// 起点セルのみを走査するイテレータ（JSON生成用）。`resolve_origin` が
-    /// 自分自身とは異なる座標へ解決する座標は除外する: `parse/worksheet.rs`
-    /// はストリームする `<c>` 要素ごとに `Cell` を挿入するため、結合範囲内で
-    /// 後から仮想セルだと判明する座標（罫線のみのスタイルなど）も `cells` に
-    /// 含まれうる。よって `cells` が起点セルのみを保持するとは限らない
-    /// （実装時に修正。PR #20 レビュー。このフィルタが無いと、そうした
-    /// 仮想セルが `json.rs` の出力に起点セルの重複として漏れ出る）。
+    /// このシートの `<mergeCell>` が全て `insert_merge` で登録された後
+    /// （`resolve::merge::resolve` の最後のステップとして呼ばれる）に
+    /// 一度だけ実行する。現時点で挿入済みの全セルキーを、行方向の
+    /// スイープラインでバッチ解決する——C個のセル・M個の結合範囲に対して
+    /// O((C + M) log (C + M))——その上で、自分自身が起点でないエントリを
+    /// すべて削除する。詳細と理由（Issue #43）はコードブロック直後の注記、
+    /// これが何を実現するかは `iter_cells` のdocコメントを参照。
+    pub(crate) fn finalize_merges(&mut self) {
+        if self.merged_regions.is_empty() {
+            return;
+        }
+
+        enum SweepEvent {
+            Start(CellRef),        // region.start.row で発火
+            End(CellRef),          // region.end.row + 1 で発火
+            Query(CellRef),        // セル座標の行で発火
+        }
+
+        let mut events: Vec<(u32, u8, SweepEvent)> = Vec::new();
+        for region in self.merged_regions.values() {
+            events.push((region.start.row, 0, SweepEvent::Start(region.start)));
+            events.push((region.end.row + 1, 0, SweepEvent::End(region.start)));
+        }
+        for &coord in self.cells.keys() {
+            events.push((coord.row, 2, SweepEvent::Query(coord)));
+        }
+        // 同一行では End/Start（rank 0/1）を Query より先に処理し、
+        // クエリが常にその行までの最新のアクティブ集合を参照できるようにする。
+        events.sort_by_key(|(row, rank, event)| {
+            let start_end_rank = match event {
+                SweepEvent::End(_) => 0,
+                SweepEvent::Start(_) => 1,
+                SweepEvent::Query(_) => *rank,
+            };
+            (*row, start_end_rank)
+        });
+
+        // 現在の走査行でアクティブな結合範囲を、各範囲の`start`
+        // （merged_regionsのキー）として`start.col`でソートして保持する。
+        // 列範囲は構成上排他的（resolve::mergeが重複を拒否するため）なので、
+        // クエリ列を含みうるアクティブなエントリは高々1件。
+        let mut active: Vec<CellRef> = Vec::new();
+        let mut to_drop: Vec<CellRef> = Vec::new();
+        for (_, _, event) in &events {
+            match event {
+                SweepEvent::Start(start) => {
+                    let pos = active.partition_point(|s| s.col < start.col);
+                    active.insert(pos, *start);
+                }
+                SweepEvent::End(start) => {
+                    let pos = active.partition_point(|s| s.col < start.col);
+                    active.remove(pos);
+                }
+                SweepEvent::Query(coord) => {
+                    let pos = active.partition_point(|s| s.col <= coord.col);
+                    if pos == 0 {
+                        continue;
+                    }
+                    let candidate = active[pos - 1];
+                    if *coord == candidate {
+                        continue; // すでにこの結合範囲自身の起点である
+                    }
+                    let region = self.merged_regions.get(&candidate).unwrap();
+                    if coord.col <= region.end.col {
+                        to_drop.push(*coord);
+                    }
+                }
+            }
+        }
+        for coord in to_drop {
+            self.cells.remove(&coord);
+        }
+    }
+
+    /// 起点セルのみを走査するイテレータ（JSON生成用）。もはや
+    /// `resolve_origin` を呼ばない: `finalize_merges`（結合範囲が全て
+    /// 登録された直後に一度だけ呼ばれる）により、残っている `cells`
+    /// のキーは全て自分自身の起点であることが既に保証されているため、
+    /// 単純な `cells.iter()` だけで正しい（PR #20時代のフィルタ付き版から
+    /// 変更した理由はコードブロック直後の注記(Issue #43)参照）。
     pub fn iter_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
-        self.cells.iter().filter(|(&r, _)| self.resolve_origin(r) == r).map(|(&r, c)| (r, c))
+        self.cells.iter().map(|(&r, c)| (r, c))
     }
 }
 ```
@@ -185,12 +258,18 @@ impl Sheet {
 
 **追加の最適化: `merge_bounds`（PR #23 レビュー）。** `Sheet` はさらに `merge_bounds: Option<(u32, u32, u32, u32)>`——全結合範囲の `start`/`end` を包含する合成バウンディングボックス（行・列それぞれの最小値・最大値）——を保持し、`insert_merge` 内で `merged_regions` と合わせて更新する。`resolve_origin` はまずこれを確認し、合成バウンディングボックスの外側にある座標はO(N)の個別範囲走査に入る前にO(1)で棄却する。結合範囲が特定の領域に集中しているシートでは、大半のセルがその領域の外側にあるため、この事前チェックにより一般的なケースを実質O(1)に戻せる。一方で、バウンディングボックス内だが個々のどの範囲にも属さない座標（2つの結合範囲の間の隙間など）については、O(N)のフォールバック走査が引き続き正しく機能することを回帰テスト `get_inside_bounding_box_but_outside_any_region_resolves_to_itself` で確認している。このバウンディングボックスは常に最もタイトな値とは限らない保守的な上限である点に注意: 同じ起点セルへの `insert_merge` の上書きでより小さい範囲に置き換わっても、古い（より大きい）境界は縮小されない。これはまれなケースでO(1)早期棄却の機会を1回逃すだけであり、正当性には影響しない——バウンディングボックスチェックが座標を棄却しない限り、最終的な判定は常にO(N)の全走査が担うため。
 
+**修正: `finalize_merges`（Issue #43。`merge_bounds` では塞ぎきれなかった、意図的な結合配置による抜け道の解消）。** `merge_bounds` のO(1)事前チェックは、合成バウンディングボックスの**外側**にある座標しか棄却できない。対角に1x1の結合セルを2個置くだけの、ごく小さな正当な配置でこのボックスはシート全体近くまで拡大しうるため、それ以外の全セルは実際の結合セルからの距離に関係なくO(N)の個別範囲走査にフォールバックしてしまう。`json.rs` の `iter_cells` はセルごとに `resolve_origin` を呼ぶため、これがJSON生成時にO(セル数 × 結合範囲数)のコストへと転化していた——既存の全ての上限内(数十万セル、`MAX_MERGE_REGIONS` 以内の数万件の結合セル、ディスク上数百KB)に収まる正当なファイルで、実測で数十秒のCPU時間になることを確認した。
+
+3種類の「賢い」個別クエリ向け対策を試したが、いずれも特定の(だが完全に正当な)結合配置により元とほぼ同等のコストへ劣化することが実測で判明した: グローバルな「これまで見た最大の結合高さ」による打ち切り(全高の結合セルを1個追加するだけで無効化される)、固定サイズの行バケット分割(結合セルとクエリを1バケットに集中させるだけで無効化される)、両方の子を探索してしまう高さ平衡区間木(行範囲は広いが列が異なる結合セル群で無効化される)。各反例と実測値はIssue #43の議論スレッド参照。
+
+最終的に有効だったのが `Sheet::finalize_merges` である。シートの全結合セルが `insert_merge` で登録された直後に `resolve::merge::resolve` から一度だけ呼ばれる。現時点で挿入済みの全セルキーを、行方向の単一スイープラインパスで起点へ解決する——各結合範囲の行範囲からStart/Endイベントを生成し、セルキーごとのQueryイベントと合わせて1回だけソートし(C個のセル・M個の結合範囲に対してO((C + M) log (C + M)))、その行で現在アクティブな結合セル集合(`resolve::merge` の検証により重複しないことが構成上保証されている、列でソートされた集合)を維持しながら1回だけ走査する——その上で、自分自身が起点でないセルを全て削除する。これは観測可能なデータを一切失わない: 自分自身が起点でない座標はもともと `get`/`iter_cells` からは到達不能だった(`resolve_origin` が常に先に起点へリダイレクトするため)ので、削除されるエントリは元々死んでいたものであり、これは既存の回帰テスト `iter_cells_excludes_cells_pre_inserted_at_alias_coordinates` が既に確認している事実そのものである。変わるのは、`iter_cells` がその後 `resolve_origin` を一切呼ばなくて済むようになる点だけである——残っている全てのキーが既に自分自身の起点と等しいため——これにより、結合セルが空間的にどう配置されていてもコスト経路が塞がれる。`get`/`get_mut` 自身の汎用フォールバック(パース完了後に外部呼び出し元が任意の座標を問い合わせる用途)は変更しない。攻撃者が実際に制御できる、内部駆動でファイルサイズに比例する `iter_cells` の経路だけがこの対応を必要としていた。
+
 ## 依存関係
 
 - 依存先: [`model/cell.rs`](cell.md)（`Cell`, `CellRef`）
-- 依存元: `model::Workbook`（複数シートを保持）、[`pipeline.rs`](../pipeline.md)（`Sheet::new` でシートを構築する）、`resolve/merge.rs`（`insert_merge` を呼び出して結合セルを登録する）、`resolve/shared_strings.rs` / `resolve/style.rs`（`get_mut` を通じてセルの値・スタイルを解決済みデータへ書き換える）、[`json.rs`](../json.md)（`iter_cells` と `merged_region_at` からJSONを組み立てる）、`parse/worksheet.rs`（`insert_cell` でパース結果を挿入する）
+- 依存元: `model::Workbook`（複数シートを保持）、[`pipeline.rs`](../pipeline.md)（`Sheet::new` でシートを構築する）、`resolve/merge.rs`（`insert_merge` を呼び出して結合セルを登録し、全件登録後に `finalize_merges` を呼ぶ）、`resolve/shared_strings.rs` / `resolve/style.rs`（`get_mut` を通じてセルの値・スタイルを解決済みデータへ書き換える）、[`json.rs`](../json.md)（`iter_cells` と `merged_region_at` からJSONを組み立てる）、`parse/worksheet.rs`（`insert_cell` でパース結果を挿入する）
 
-`cells` / `merged_regions` フィールド自体は `pub(crate)` にも公開せず完全に非公開のままとし、これらの内部データ構造への書き込みは `insert_cell` / `insert_merge` / `get_mut` の3メソッドのみに限定する。フィールドを直接 `pub(crate)` にする案（初回レビューでの提案）も検討したが、その場合 `max_row`/`max_col` の更新漏れや結合起点セルの補完漏れを各呼び出し元（`resolve/` 配下の複数モジュール）が個別に守る必要があり、不変条件がクレート全体に分散してしまう。メソッド経由に限定することで不変条件を `Sheet` 自身に閉じ込め、呼び出し側は正しさを気にせず利用できる。
+`cells` / `merged_regions` フィールド自体は `pub(crate)` にも公開せず完全に非公開のままとし、これらの内部データ構造への書き込みは `insert_cell` / `insert_merge` / `get_mut` / `finalize_merges` に限定する。フィールドを直接 `pub(crate)` にする案（初回レビューでの提案）も検討したが、その場合 `max_row`/`max_col` の更新漏れや結合起点セルの補完漏れを各呼び出し元（`resolve/` 配下の複数モジュール）が個別に守る必要があり、不変条件がクレート全体に分散してしまう。メソッド経由に限定することで不変条件を `Sheet` 自身に閉じ込め、呼び出し側は正しさを気にせず利用できる。
 
 ## エラー処理方針
 
@@ -211,6 +290,10 @@ impl Sheet {
 - `insert_cell` 呼び出しのたびに `max_row` / `max_col` が正しく更新されることの確認（`<dimension>` を信頼せずに算出できることの確認）
 - **値も書式も持たない結合範囲に対して `insert_merge` を呼んだ場合、起点セルが空セルとして `cells` に挿入され、`iter_cells` / `merged_region_at` から正しく参照できることの確認**（PR #5 レビューで追加した回帰テスト観点）
 - **実データが `A1` のみだが `A1:C3` として結合されているケースで、`insert_merge` 呼び出し後に `max_row == 3` かつ `max_col == 3` となることの確認**（結合範囲の終点がシートの実質的な使用範囲を広げるケースの回帰テスト）
+- **結合が無いシートで `finalize_merges` がno-opであることの確認**（共通ケースを軽量に保つ必要がある）
+- **`finalize_merges` が、仮想（非起点）座標に事前挿入されたセルを削除しつつ、結合の起点セルと無関係な独立セルは保持することの確認**（Issue #43。これにより `iter_cells` 自身がフィルタを持つ必要がなくなる）
+- **`finalize_merges` が、行範囲の重ならない複数の結合範囲にまたがって正しく解決できることの確認**（単一範囲だけでなく、どの範囲にも属さないセルも含めてスイープラインのStart/End管理を検証する）
+- **エンドツーエンド回帰テスト: `MAX_MERGE_REGIONS` 件の結合セルを`merge_bounds`が最大化するよう配置(対角に2個配置)し、さらに無関係なセルを数十万件加えたファイルが、修正前に実測した数秒単位の停止なしにJSON生成を完了できることの確認**（`tests/security.rs` の `sparse_merge_bounding_box_does_not_amplify_json_generation_cost`、`sparse_merge_bounding_box_amplification` フィクスチャを使用。意図的な配置によるDoS懸念であるため、`zip_bomb`/`zip_slip`/`xxe_attack` と同じくCategory 4（負荷）ではなくCategory 5（セキュリティ）に分類）
 
 ## 未決事項 / オープンクエスチョン
 

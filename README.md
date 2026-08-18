@@ -231,6 +231,32 @@ is what gets the process killed.
 the number of populated cells, never to the sheet's addressable bounding
 box — so `extreme_sparse.xlsx` costs `xlsxparser` exactly 2 map entries.
 
+### Sparse merged-cell arrangements
+
+A merge-heavy file could hit an unrelated cost even while respecting every
+existing limit ([Issue #43](https://github.com/MinamiyamaKotaro/xlsxparser/issues/43)):
+two 1x1 merges placed at opposite corners of a sheet stretch the merged-cell
+bounding box to cover virtually the whole sheet, so every other cell fell
+back to a linear scan over every merged region when resolving its origin —
+turning a legitimate file into an O(cells × merged regions) cost during JSON
+generation. `Sheet::finalize_merges` closes this with a single sweep-line
+pass, independent of how the merges are arranged in space (see
+[docs/design/model/sheet.md](docs/design/model/sheet.md)'s "修正:
+`finalize_merges`" section for the full story).
+
+Measured the same way as above (`hyperfine`, `--warmup 1`, same machine), on
+a generated 836 KB file with 300,000 populated cells and 20,000 merges
+(`resolve::merge::MAX_MERGE_REGIONS`, the current cap) arranged to maximize
+the bounding box:
+
+```bash
+before (pre-#43 fix)
+  Time (mean ± σ):     2.016 s  ±  22 ms      5 runs
+
+after (this fix)
+  Time (mean ± σ):     511.8 ms ±  48.9 ms    5 runs
+```
+
 ## Security notes
 
 - **Zip Bomb / Zip Slip / XXE**: guarded against at parse time (see

@@ -7,7 +7,27 @@ mod fixtures;
 
 use fixtures::security;
 use std::io::Cursor;
-use xlsxparser::{parse_workbook_reader, parse_workbook_reader_with_limits, Error, SizeLimits};
+use xlsxparser::{
+    parse_workbook_reader, parse_workbook_reader_with_limits, to_json_string, Error, SizeLimits,
+};
+
+#[test]
+fn sparse_merge_bounding_box_does_not_amplify_json_generation_cost() {
+    // Issue #43: a legitimate file (every individual limit — merge count,
+    // cell count, byte size — respected) that arranges 20,000 merges to
+    // maximize `merge_bounds` used to make `json.rs`'s `iter_cells` fall
+    // back to an O(merged regions) scan for each of 300,000 unrelated
+    // cells. Doesn't assert wall-clock time (CI hardware varies too much,
+    // per `tests/fixtures/load.rs`'s stated convention) — completing at
+    // all within the test run, rather than stalling for the tens of
+    // seconds directly measured pre-fix, is the signal.
+    let workbook = parse_workbook_reader(Cursor::new(
+        security::sparse_merge_bounding_box_amplification(),
+    ))
+    .unwrap();
+    let json = to_json_string(&workbook).unwrap();
+    assert!(json.contains("\"maxRow\":1048576"));
+}
 
 #[test]
 fn zip_bomb_is_capped_before_full_decompression() {
