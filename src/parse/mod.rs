@@ -456,7 +456,7 @@ mod tests {
         ));
     }
 
-    fn parse_si_body(xml: &[u8]) -> String {
+    fn parse_si_body_result(xml: &[u8]) -> Result<String, Error> {
         let mut reader = create_secure_reader(xml);
         let mut buf = Vec::new();
         // Advance past the opening `<si>`/`<is>` tag.
@@ -473,7 +473,11 @@ mod tests {
             buf.clear();
         }
         buf.clear();
-        concat_rich_text(&mut reader, "xl/sharedStrings.xml").unwrap()
+        concat_rich_text(&mut reader, "xl/sharedStrings.xml")
+    }
+
+    fn parse_si_body(xml: &[u8]) -> String {
+        parse_si_body_result(xml).unwrap()
     }
 
     #[test]
@@ -574,6 +578,43 @@ mod tests {
         // branch), producing an empty string instead of the CDATA content.
         let xml = b"<si><t><![CDATA[Hello CDATA]]></t></si>";
         assert_eq!(parse_si_body(xml), "Hello CDATA");
+    }
+
+    #[test]
+    fn concat_rich_text_invalid_utf8_in_plain_text_is_xml_parse_error() {
+        // Same as the CDATA case above, but for the plain-text decode path
+        // (unchanged by this PR, but exercised through the new `t_start`
+        // gating for the first time here).
+        let mut xml = b"<si><t>".to_vec();
+        xml.push(0xFF);
+        xml.extend_from_slice(b"</t></si>");
+        let err = parse_si_body_result(&xml).unwrap_err();
+        assert!(matches!(err, Error::XmlParse { .. }));
+    }
+
+    #[test]
+    fn concat_rich_text_invalid_utf8_in_cdata_is_xml_parse_error() {
+        // Regression test for the CData decode error path introduced
+        // alongside CDATA support: an invalid byte sequence must surface
+        // as Error::XmlParse, not panic.
+        let mut xml = b"<si><t><![CDATA[".to_vec();
+        xml.push(0xFF); // not valid UTF-8 on its own
+        xml.extend_from_slice(b"]]></t></si>");
+        let err = parse_si_body_result(&xml).unwrap_err();
+        assert!(matches!(err, Error::XmlParse { .. }));
+    }
+
+    #[test]
+    fn concat_rich_text_eof_before_closing_tag_is_missing_required_element() {
+        let xml = b"<si><t>unterminated";
+        let err = parse_si_body_result(xml).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MissingRequiredElement {
+                name: "si/is closing tag",
+                ..
+            }
+        ));
     }
 
     #[test]
