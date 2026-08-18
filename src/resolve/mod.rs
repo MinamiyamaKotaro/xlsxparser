@@ -30,12 +30,13 @@ pub(crate) fn resolve_sheet(
     shared_string_table: &SharedStringTable,
     pending_styles: &[PendingStyle],
     stylesheet: &StyleSheet,
+    date1904: bool,
     col_width_ranges: Vec<ColWidthRange>,
     default_col_width: Option<f64>,
     merge_regions: Vec<MergedRegion>,
 ) -> Result<(), Error> {
     shared_strings::resolve(sheet, pending_shared_strings, shared_string_table)?;
-    style::resolve(sheet, pending_styles, stylesheet)?;
+    style::resolve(sheet, pending_styles, stylesheet, date1904)?;
     column_width::resolve(sheet, col_width_ranges, default_col_width)?;
     merge::resolve(sheet, merge_regions)?;
     Ok(())
@@ -97,6 +98,7 @@ mod tests {
                 style_id: 0,
             }],
             &stylesheet,
+            false,
             vec![ColWidthRange {
                 min: 1,
                 max: 5,
@@ -147,6 +149,7 @@ mod tests {
             &empty_table,
             &[],
             &stylesheet,
+            false,
             vec![],
             None,
             bad_merge_regions,
@@ -169,6 +172,7 @@ mod tests {
             &table,
             &[],
             &stylesheet,
+            false,
             vec![],
             None,
             vec![],

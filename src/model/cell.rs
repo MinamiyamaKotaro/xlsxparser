@@ -4,11 +4,20 @@ use crate::error::Error;
 use crate::model::style::ResolvedStyle;
 use std::sync::Arc;
 
-/// Placeholder type for a resolved date/time value. The concrete type is
-/// undecided (docs/design/model/cell.en.md Open Question 4); this stand-in
-/// carries no data yet.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DateTimeValue;
+/// A resolved date/time value, decomposed into its calendar fields by
+/// `resolve/style.rs::serial_to_date_time` from an Excel date serial number
+/// (Issue #40). A plain `Copy` value type — no sub-second precision, since
+/// Excel serial values (`f64`) can't reliably represent it beyond float
+/// rounding noise, and no downstream use case has asked for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DateTimeValue {
+    pub year: i32,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
 
 /// Cell coordinates. 1-based, matching Excel (A1 = row:1, col:1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -182,9 +191,18 @@ mod tests {
     fn cell_value_equality() {
         assert_eq!(CellValue::Number(1.5), CellValue::Number(1.5));
         assert_ne!(CellValue::Number(1.5), CellValue::Number(2.5));
-        assert_eq!(
-            CellValue::DateTime(DateTimeValue),
-            CellValue::DateTime(DateTimeValue)
+        let dt = DateTimeValue {
+            year: 2024,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        };
+        assert_eq!(CellValue::DateTime(dt), CellValue::DateTime(dt));
+        assert_ne!(
+            CellValue::DateTime(dt),
+            CellValue::DateTime(DateTimeValue { day: 2, ..dt })
         );
         assert_eq!(
             CellValue::Text(Arc::from("hello")),

@@ -2,7 +2,9 @@
 //! streaming cell-by-cell rather than buffering a whole sheet in memory.
 
 use crate::error::Error;
-use crate::model::{Cell, CellRef, CellValue, ColWidthRange, Sheet, SheetVisibility, Workbook};
+use crate::model::{
+    Cell, CellRef, CellValue, ColWidthRange, DateTimeValue, Sheet, SheetVisibility, Workbook,
+};
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Serialize, Serializer};
 use std::io::Write;
@@ -189,24 +191,17 @@ struct JsonFont {
 #[serde(tag = "type", content = "value", rename_all = "camelCase")]
 enum JsonCellValue {
     Number(f64),
-    /// The concrete string representation (ISO 8601, etc.) is to be decided
-    /// once `model::DateTimeValue` gains real fields — see
-    /// `cell_value_to_json`'s `CellValue::DateTime` arm, which currently
-    /// cannot construct this variant since the placeholder type carries no
-    /// data yet.
-    ///
-    /// Not constructed by `cell_value_to_json` for the reason above, but
-    /// exercised directly by the test
-    /// `date_time_value_currently_serializes_as_empty` to pin down the
-    /// serialized tag shape ahead of time.
-    #[allow(dead_code)]
+    /// ISO 8601, no fractional seconds (`DateTimeValue` doesn't carry
+    /// sub-second precision — see `model/cell.rs`), e.g.
+    /// `"2024-01-01T13:45:30"`. A date-only cell serializes with a midnight
+    /// time component, since Excel itself doesn't distinguish date-only
+    /// from date+time as a type — there is no extra information to report.
     DateTime(String),
     Text(std::sync::Arc<str>),
     Boolean(bool),
     Error(String),
     /// A cell with no value (formatting only), or the fallback destination
-    /// for a value JSON cannot represent (non-finite floats, or a
-    /// not-yet-representable `DateTime` — see below).
+    /// for a value JSON cannot represent (non-finite floats — see below).
     Empty,
 }
 
@@ -242,16 +237,20 @@ fn cell_value_to_json(value: Option<&CellValue>) -> JsonCellValue {
         // (JSON `null`) instead lets the frontend safely treat it as "no
         // value present."
         Some(CellValue::Number(_)) => JsonCellValue::Empty,
-        // `model::DateTimeValue` is currently a data-less placeholder (see
-        // docs/design/model/cell.en.md Open Question 4) — there is no
-        // calendar value to serialize yet, so this falls back to Empty the
-        // same way an unrepresentable Number does, rather than fabricating
-        // a string. Revisit once DateTimeValue carries real data.
-        Some(CellValue::DateTime(_)) => JsonCellValue::Empty,
+        Some(CellValue::DateTime(dt)) => JsonCellValue::DateTime(format_date_time(dt)),
         Some(CellValue::Text(s)) => JsonCellValue::Text(s.clone()),
         Some(CellValue::Boolean(b)) => JsonCellValue::Boolean(*b),
         Some(CellValue::Error(e)) => JsonCellValue::Error(e.clone()),
     }
+}
+
+/// Formats a `DateTimeValue` as ISO 8601 without a timezone designator or
+/// fractional seconds, e.g. `"2024-01-01T13:45:30"`.
+fn format_date_time(dt: &DateTimeValue) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
+    )
 }
 
 fn visibility_tag(v: SheetVisibility) -> &'static str {
@@ -265,7 +264,7 @@ fn visibility_tag(v: SheetVisibility) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DateTimeValue, Font, ResolvedStyle};
+    use crate::model::{Font, ResolvedStyle};
     use std::sync::Arc;
 
     fn sheet_with_one_cell(name: &str, value: Option<CellValue>) -> Sheet {
@@ -472,18 +471,66 @@ mod tests {
     }
 
     #[test]
-    fn date_time_value_currently_serializes_as_empty() {
-        // DateTimeValue carries no data yet (docs/design/model/cell.en.md
-        // Open Question 4); confirms this degrades gracefully rather than
-        // fabricating a string, and documents the JsonCellValue::DateTime
-        // tag shape for when that changes.
+    fn date_time_value_serializes_as_iso_8601_without_fractional_seconds() {
+        let dt = DateTimeValue {
+            year: 2024,
+            month: 1,
+            day: 5,
+            hour: 13,
+            minute: 45,
+            second: 30,
+        };
         assert_eq!(
-            cell_value_to_json(Some(&CellValue::DateTime(DateTimeValue))),
-            JsonCellValue::Empty
+            cell_value_to_json(Some(&CellValue::DateTime(dt))),
+            JsonCellValue::DateTime("2024-01-05T13:45:30".into())
         );
 
-        let json = serde_json::to_string(&JsonCellValue::DateTime("2024-01-01".into())).unwrap();
-        assert_eq!(json, r#"{"type":"dateTime","value":"2024-01-01"}"#);
+        let json =
+            serde_json::to_string(&JsonCellValue::DateTime("2024-01-01T00:00:00".into())).unwrap();
+        assert_eq!(json, r#"{"type":"dateTime","value":"2024-01-01T00:00:00"}"#);
+    }
+
+    #[test]
+    fn date_time_value_pads_single_digit_calendar_fields() {
+        // Regression test for the `{:02}`/`{:04}` format specifiers in
+        // `format_date_time` — a naive `{}` would produce "2024-1-5T3:5:9",
+        // which is not valid ISO 8601.
+        let dt = DateTimeValue {
+            year: 2024,
+            month: 1,
+            day: 5,
+            hour: 3,
+            minute: 5,
+            second: 9,
+        };
+        assert_eq!(format_date_time(&dt), "2024-01-05T03:05:09");
+    }
+
+    #[test]
+    fn styled_date_time_cell_round_trips_through_json_string() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.insert_cell(
+            CellRef { row: 1, col: 1 },
+            Cell {
+                value: Some(CellValue::DateTime(DateTimeValue {
+                    year: 2023,
+                    month: 3,
+                    day: 15,
+                    hour: 0,
+                    minute: 0,
+                    second: 0,
+                })),
+                style: None,
+            },
+        );
+        let workbook = Workbook::new(vec![sheet]);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["sheets"][0]["cells"][0]["value"],
+            serde_json::json!({"type": "dateTime", "value": "2023-03-15T00:00:00"})
+        );
     }
 
     #[test]

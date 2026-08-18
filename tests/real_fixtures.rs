@@ -42,9 +42,18 @@ fn real_basic_types_xlsx_maps_every_cell_type() {
         sheet.get(CellRef { row: 1, col: 3 }).unwrap().value,
         Some(CellValue::Number(19.99))
     );
+    // scripts/generate_real_fixtures.py's basic_types() writes D1 as
+    // datetime.date(2023, 6, 15).
     assert_eq!(
         sheet.get(CellRef { row: 1, col: 4 }).unwrap().value,
-        Some(CellValue::DateTime(DateTimeValue))
+        Some(CellValue::DateTime(DateTimeValue {
+            year: 2023,
+            month: 6,
+            day: 15,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        }))
     );
     assert_eq!(
         sheet.get(CellRef { row: 1, col: 5 }).unwrap().value,
