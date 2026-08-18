@@ -42,6 +42,26 @@ impl Default for Font {
     }
 }
 
+/// `<xf><alignment horizontal=".."/></xf>` の水平方向配置
+/// (ECMA-376 `ST_HorizontalAlignmentValues`)、Issue #42。文字列ではなく
+/// 列挙型として持つことで、コピー可能な小サイズに収める(Issue #42の
+/// パフォーマンス要件)。垂直方向配置や `wrapText`/`horizontal` 以外の
+/// その他の `CT_CellAlignment` 属性は、具体的な下流ユースケースが現れる
+/// までスコープ外のまま(`Font` が既に採用している「完全な転写はしない」
+/// 方針と同じ)。
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Alignment {
+    #[default]
+    General,
+    Left,
+    Center,
+    Right,
+    Fill,
+    Justify,
+    CenterContinuous,
+    Distributed,
+}
+
 /// スタイルID解決後の書式情報。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResolvedStyle {
@@ -54,6 +74,11 @@ pub struct ResolvedStyle {
     /// ——下流の方眼紙判定ツールがはみ出し判定のゲート条件として使う:
     /// 折返し設定のセルは決してはみ出し扱いにならない。
     pub wrap_text: bool,
+    /// `<cellXfs><xf><alignment horizontal=".."/></xf></cellXfs>`
+    /// (Issue #42)。`alignment` ではなく `horizontal_` を冠する名前に
+    /// することで、将来 `vertical_alignment` を追加する際にフィールド名の
+    /// 衝突・改名を避ける。
+    pub horizontal_alignment: Alignment,
     /// `<xf>` が参照する `numFmtId` を書式コード文字列へ解決したもの
     /// (Issue #41)——組み込み(ECMA-376 Part 1 §18.8.30)・カスタム
     /// (`<numFmts>`)いずれも対象。`None` は `numFmtId=0`(「General」)、
@@ -63,8 +88,8 @@ pub struct ResolvedStyle {
     /// `Arc<str>` を採用する理由は `CellValue::Text` と同じ: 同一の
     /// 書式コードが多数の `StyleId` 間で共有されることが多いため。
     pub number_format: Option<Arc<str>>,
-    // fill/border等その他のalignmentプロパティは、各サブIssueの
-    // 実装が進むにつれて追加する(オープンクエスチョン1参照)。
+    // fill/border等その他のプロパティは、各サブIssueの実装が進むにつれて
+    // 追加する(オープンクエスチョン1参照)。
 }
 
 /// `cellXfs` インデックスから `ResolvedStyle` を引くテーブル。
@@ -91,5 +116,5 @@ pub type StyleSheet = HashMap<StyleId, Arc<ResolvedStyle>>;
 
 ## 未決事項 / オープンクエスチョン
 
-1. **塗りつぶし/罫線/折返し/配置などの具体的なスタイル要素**: さらに解決が進んだ——`font: Font { size_pt, bold }`(Issue #38)、`wrap_text: bool`(Issue #37、はみ出し判定のゲート条件)、`number_format: Option<Arc<str>>`(Issue #41)をいずれも実装済み。[Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36) 配下の残りのサブIssueは `alignment`(#42)のみ。フォント色・塗りつぶし・罫線・斜体・下線などその他の `CT_Font`/`CT_Fill`/`CT_Border` プロパティ、および `wrapText` 以外の `CT_CellAlignment` の属性(水平/垂直配置、インデント、テキスト回転等)は、具体的な下流ユースケースが現れるまでスコープ外のまま(`Font` が既に採用している「完全な転写はしない」方針と同じ)。
+1. **塗りつぶし/罫線/折返し/配置などの具体的なスタイル要素**: さらに解決が進んだ——`font: Font { size_pt, bold }`(Issue #38)、`wrap_text: bool`(Issue #37、はみ出し判定のゲート条件)、`number_format: Option<Arc<str>>`(Issue #41)、`horizontal_alignment: Alignment`(Issue #42)をいずれも実装済み。[Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36) 配下のサブIssueは全て解決済み。フォント色・塗りつぶし・罫線・斜体・下線などその他の `CT_Font`/`CT_Fill`/`CT_Border` プロパティ、および `wrapText`/`horizontal` 以外の `CT_CellAlignment` の属性(垂直方向配置、インデント、テキスト回転等)は、具体的な下流ユースケースが現れるまでスコープ外のまま(`Font` が既に採用している「完全な転写はしない」方針と同じ)。
 2. ~~日付/時刻書式の判定ロジックの置き場所~~ → **解決**: [`parse/styles.rs`](../parse/styles.md) が `numFmtId`/`formatCode` から `ResolvedStyle::is_date_time` を判定するロジックを持つ（[resolve/style.md オープンクエスチョン2](../resolve/style.md) と同一の論点）。判定ヒューリスティックの精度自体は [parse/styles.md オープンクエスチョン2](../parse/styles.md) として引き続き未解決。
