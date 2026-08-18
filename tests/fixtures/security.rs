@@ -48,11 +48,15 @@ pub fn zip_bomb() -> Vec<u8> {
 /// 20,000 single-cell merges (at `MAX_MERGE_REGIONS`, `resolve::merge`'s
 /// cap) arranged so their combined bounding box covers virtually the whole
 /// sheet: most sit on row 2, but one is planted at the sheet's far corner
-/// (`XFD1048576`) purely to stretch `merge_bounds`. 300,000 data cells sit
-/// far from every merge (row 500,000), each carrying a non-default style
-/// (`s="0"`) so a `PendingStyle` gets recorded for it — a structurally
-/// valid file (every merge is 1x1, non-overlapping, and within
-/// `MAX_MERGE_REGIONS`) rather than a malformed one.
+/// (`XFD1048576`) purely to stretch `merge_bounds`. 300,000 *distinct* data
+/// cells sit far from every merge (rows 500,000 onward, wrapping to a new
+/// row every 16,384 columns so each one gets its own coordinate — a fixed
+/// row here would collapse them all into at most 16,384 unique `CellRef`s,
+/// silently understating both the fixture's cell count and any benchmark
+/// run against it), each carrying a non-default style (`s="0"`) so a
+/// `PendingStyle` gets recorded for it — a structurally valid file (every
+/// merge is 1x1, non-overlapping, and within `MAX_MERGE_REGIONS`) rather
+/// than a malformed one.
 ///
 /// Before `Sheet::finalize_merges` (Issue #43), `json.rs`'s `iter_cells`
 /// resolved each of those 300,000 cells by scanning all 20,000 merged
@@ -80,8 +84,9 @@ pub fn sparse_merge_bounding_box_amplification() -> Vec<u8> {
     let mut rows = String::new();
     for i in 0..NUM_DATA_CELLS {
         let col = (i % 16_384) + 1;
+        let row = 500_000 + (i / 16_384);
         rows.push_str(&format!(
-            "<row r=\"500000\"><c r=\"{}500000\" s=\"0\"><v>1</v></c></row>\n",
+            "<row r=\"{row}\"><c r=\"{}{row}\" s=\"0\"><v>1</v></c></row>\n",
             column_letters(col as u32)
         ));
     }
