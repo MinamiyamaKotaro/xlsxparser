@@ -123,6 +123,36 @@ pub fn overlapping_col_widths() -> Vec<u8> {
     ])
 }
 
+/// A `<col min="10" max="5" width=".."/>` has its `min`/`max` reversed.
+/// Verifies it surfaces as `Error::InvalidColumnWidthRange` rather than
+/// silently registering as dead, unreachable data (PR #48 review; Issue
+/// #39).
+pub fn reversed_col_width_range() -> Vec<u8> {
+    let worksheet = r#"<worksheet>
+<cols>
+<col min="10" max="5" width="10"/>
+</cols>
+<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+</worksheet>"#;
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "styles", "styles.xml"),
+            ])
+            .as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        ("xl/styles.xml", DEFAULT_STYLES_XML),
+        ("xl/worksheets/sheet1.xml", worksheet.as_bytes()),
+    ])
+}
+
 /// A `<mergeCell ref="C3:A1"/>` has its start/end coordinates reversed
 /// (end is above-and-left of start). Verifies the bounding-box computation
 /// rejects it as `Error::InvalidMergedRange` rather than panicking or

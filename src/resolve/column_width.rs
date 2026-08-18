@@ -24,13 +24,20 @@ pub(crate) const MAX_COLUMN_WIDTH_RANGES: usize = 2_000;
 ///
 /// Rejects a batch larger than [`MAX_COLUMN_WIDTH_RANGES`] as
 /// `Error::TooManyColumnWidthRanges` before doing any sorting. Otherwise
-/// sorts `ranges` by `min` — O(R log R) — and rejects any two adjacent
-/// ranges that overlap (`Error::InvalidColumnWidthRange`), fail-closed
-/// (nothing is registered if any pair overlaps). Checking only adjacent
-/// pairs after sorting by `min` is sufficient to detect *any* overlapping
-/// pair: if every adjacent pair satisfies `prev.max < next.min`, that
-/// relation chains transitively across the whole sorted sequence, so no
-/// non-adjacent pair can overlap either.
+/// rejects any individual range with `min > max` (mirrors
+/// `resolve::merge::validate_region`'s reversed start/end check — without
+/// this, a range like `min=10, max=5` isn't a crash or memory-safety
+/// issue, since `Sheet::column_width`'s binary search simply never
+/// matches it for any column, but it would silently register as dead,
+/// unreachable data instead of surfacing the malformed input as an error;
+/// found via PR #48 review), then sorts `ranges` by `min` — O(R log R) —
+/// and rejects any two adjacent ranges that overlap
+/// (`Error::InvalidColumnWidthRange`), fail-closed (nothing is registered
+/// if any range is invalid). Checking only adjacent pairs after sorting by
+/// `min` is sufficient to detect *any* overlapping pair: if every adjacent
+/// pair satisfies `prev.max < next.min`, that relation chains transitively
+/// across the whole sorted sequence, so no non-adjacent pair can overlap
+/// either.
 pub(crate) fn resolve(
     sheet: &mut Sheet,
     mut ranges: Vec<ColWidthRange>,
@@ -41,6 +48,16 @@ pub(crate) fn resolve(
             count: ranges.len(),
             limit: MAX_COLUMN_WIDTH_RANGES,
         });
+    }
+
+    for range in &ranges {
+        if range.min > range.max {
+            return Err(Error::InvalidColumnWidthRange {
+                min: range.min,
+                max: range.max,
+                reason: "min must not be greater than max".to_string(),
+            });
+        }
     }
 
     ranges.sort_by_key(|r| r.min);
@@ -88,6 +105,18 @@ mod tests {
             sheet.col_width_ranges(),
             &[range(1, 5, 10.0), range(10, 20, 20.0)]
         );
+    }
+
+    #[test]
+    fn reversed_min_max_is_an_error() {
+        // PR #48 review: without this check, a range like min=10, max=5
+        // isn't a crash (column_width's binary search just never matches
+        // it), but it would silently register as dead, unreachable data
+        // instead of surfacing the malformed input as an error.
+        let mut sheet = new_sheet();
+        let err = resolve(&mut sheet, vec![range(10, 5, 99.0)], None).unwrap_err();
+        assert!(matches!(err, Error::InvalidColumnWidthRange { .. }));
+        assert_eq!(sheet.col_width_ranges().len(), 0);
     }
 
     #[test]

@@ -32,6 +32,16 @@ pub(crate) fn resolve(
         });
     }
 
+    for range in &ranges {
+        if range.min > range.max {
+            return Err(Error::InvalidColumnWidthRange {
+                min: range.min,
+                max: range.max,
+                reason: "min must not be greater than max".to_string(),
+            });
+        }
+    }
+
     ranges.sort_by_key(|r| r.min);
     for pair in ranges.windows(2) {
         let (prev, next) = (&pair[0], &pair[1]);
@@ -67,13 +77,14 @@ pub(crate) fn resolve(
 
 ## エラー処理方針
 
-- 件数が `MAX_COLUMN_WIDTH_RANGES` を超える場合、または2つの範囲が重複する場合は、それぞれ `Error::TooManyColumnWidthRanges` / `Error::InvalidColumnWidthRange { min, max, reason }` として拒否する(`Error::TooManyMergedRanges` / `Error::InvalidMergedRange` と同じ形)。
+- 件数が `MAX_COLUMN_WIDTH_RANGES` を超える場合、個々の範囲が `min > max` の場合、または2つの範囲が重複する場合は、それぞれ `Error::TooManyColumnWidthRanges` / `Error::InvalidColumnWidthRange { min, max, reason }` として拒否する(`Error::TooManyMergedRanges` / `Error::InvalidMergedRange` と同じ形——`resolve::merge::validate_region` の座標逆転チェックも含む。[PR #48のレビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/48#pullrequestreview-4956349641)を受けて追加: `min > max` の範囲はそれ自体クラッシュやメモリ安全性の問題は起こさない(`Sheet::column_width` の二分探索がどの列にも一致させないだけ)が、このチェックが無いと、不正な入力をエラーとして表面化させる代わりに死んだ・到達不能なデータとして静かに登録されてしまう)。
 - `panic` はしない(不正・悪意ある範囲は信頼できない外部入力に由来しうるため)。
-- 重複検証に失敗した場合、何も登録しない(fail closed)——`resolve/merge.rs` と同じ方針。
+- 検証(件数・逆転範囲・重複のいずれか)に失敗した場合、何も登録しない(fail closed)——`resolve/merge.rs` と同じ方針。
 
 ## テスト方針
 
 - 入力順序によらず、非重複の範囲が正しく登録されること(内部でソートされる)の確認
+- **`min > max` の範囲が `Error::InvalidColumnWidthRange` として拒否されることの確認(本モジュールのレベル、および `<col min="10" max="5" .../>` フィクスチャによるエンドツーエンドの両方)**(PR #48レビューでの指摘)
 - 重複する範囲(完全に同一な重複を含む)が `Error::InvalidColumnWidthRange` として拒否され、その後何も登録されないことの確認
 - 隣接するが重複しない範囲(一方の `max` がもう一方の `min - 1` に等しい)が受理されることの確認(隣接ペア判定の境界値テスト)
 - 件数がちょうど `MAX_COLUMN_WIDTH_RANGES` の場合は受理され、1件超過すると `Error::TooManyColumnWidthRanges` として拒否されることの確認
@@ -83,4 +94,4 @@ pub(crate) fn resolve(
 
 ## 未決事項 / オープンクエスチョン
 
-現時点で無し——上記のIssue #36レビュープロセスを通じて、実装着手前に設計が収束した。
+現時点で無し。核となるアルゴリズムは上記のIssue #36レビュープロセスを通じて実装着手前に収束した。実装後に見つかった唯一の抜け([`min > max` 検証の欠落](https://github.com/MinamiyamaKotaro/xlsxparser/pull/48#pullrequestreview-4956349641))は未決事項として残さず、既に上記へ反映済み。

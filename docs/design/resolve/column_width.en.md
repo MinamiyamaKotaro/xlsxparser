@@ -32,6 +32,16 @@ pub(crate) fn resolve(
         });
     }
 
+    for range in &ranges {
+        if range.min > range.max {
+            return Err(Error::InvalidColumnWidthRange {
+                min: range.min,
+                max: range.max,
+                reason: "min must not be greater than max".to_string(),
+            });
+        }
+    }
+
     ranges.sort_by_key(|r| r.min);
     for pair in ranges.windows(2) {
         let (prev, next) = (&pair[0], &pair[1]);
@@ -67,13 +77,14 @@ Even though this module has no O(R²)/O(R³) risk of its own, it still caps the 
 
 ## Error Handling Policy
 
-- A range count over `MAX_COLUMN_WIDTH_RANGES`, or any two overlapping ranges, is rejected as `Error::TooManyColumnWidthRanges` / `Error::InvalidColumnWidthRange { min, max, reason }` (mirroring `Error::TooManyMergedRanges` / `Error::InvalidMergedRange`'s shape).
+- A range count over `MAX_COLUMN_WIDTH_RANGES`, an individual range with `min > max`, or any two overlapping ranges, is rejected as `Error::TooManyColumnWidthRanges` / `Error::InvalidColumnWidthRange { min, max, reason }` (mirroring `Error::TooManyMergedRanges` / `Error::InvalidMergedRange`'s shape — including `resolve::merge::validate_region`'s reversed-coordinate check, added following [PR #48's review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/48#pullrequestreview-4956349641): a `min > max` range isn't a crash or memory-safety issue on its own (`Sheet::column_width`'s binary search simply never matches it for any column), but without this check it would silently register as dead, unreachable data instead of surfacing the malformed input as an error).
 - No `panic` (malformed/adversarial ranges stem from untrusted external input).
-- Once overlap validation fails, nothing is registered (fail-closed) — same policy as `resolve/merge.rs`.
+- Once validation fails (count, reversed range, or overlap), nothing is registered (fail-closed) — same policy as `resolve/merge.rs`.
 
 ## Testing Strategy
 
 - Verify non-overlapping ranges register correctly regardless of input order (sorted internally)
+- **Verify a range with `min > max` is rejected as `Error::InvalidColumnWidthRange`, both at this module's level and end to end via a `<col min="10" max="5" .../>` fixture** (PR #48 review finding)
 - Verify overlapping ranges (including identical duplicates) are rejected as `Error::InvalidColumnWidthRange`, and that nothing was registered afterward
 - Verify touching-but-not-overlapping ranges (`max` of one equals `min - 1` of the next) are accepted — a boundary-value test for the adjacent-pair check
 - Verify the range count exactly at `MAX_COLUMN_WIDTH_RANGES` is accepted, and one over it is rejected as `Error::TooManyColumnWidthRanges`
@@ -83,4 +94,4 @@ Even though this module has no O(R²)/O(R³) risk of its own, it still caps the 
 
 ## Open Questions
 
-None currently — the design converged through the Issue #36 review process described above before implementation began.
+None currently. The core algorithm converged through the Issue #36 review process before implementation began; the one gap found afterward (the missing `min > max` check, [PR #48 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/48#pullrequestreview-4956349641)) is already reflected above rather than left open.

@@ -60,3 +60,12 @@ fn overlapping_col_widths_is_reported_as_invalid_column_width_range() {
         "expected Error::InvalidColumnWidthRange, got {err:?}"
     );
 }
+
+#[test]
+fn reversed_col_width_range_is_reported_as_invalid_column_width_range() {
+    let err = parse_workbook_reader(Cursor::new(error::reversed_col_width_range())).unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidColumnWidthRange { .. }),
+        "expected Error::InvalidColumnWidthRange, got {err:?}"
+    );
+}
