@@ -3,7 +3,8 @@
 
 use crate::error::Error;
 use crate::model::{
-    Cell, CellRef, CellValue, ColWidthRange, DateTimeValue, Sheet, SheetVisibility, Workbook,
+    Alignment, Cell, CellRef, CellValue, ColWidthRange, DateTimeValue, Sheet, SheetVisibility,
+    Workbook,
 };
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Serialize, Serializer};
@@ -174,8 +175,11 @@ fn is_one(n: &u32) -> bool {
 struct JsonStyle {
     font: JsonFont,
     wrap_text: bool,
-    // numberFormat/alignment join this struct as their own sub-issues land
-    // (Issue #36).
+    /// Always present, like `font`/`wrap_text` (never `Option`) — unlike
+    /// `numberFormat`, "general" is a real, meaningful alignment mode, not
+    /// "nothing to report" (Issue #42).
+    alignment: &'static str,
+    // numberFormat joins this struct as its own sub-issue lands (Issue #36).
 }
 
 #[derive(Debug, Serialize)]
@@ -222,6 +226,7 @@ fn cell_to_json(sheet: &Sheet, cell_ref: CellRef, cell: &Cell) -> JsonCell {
                 bold: s.font.bold,
             },
             wrap_text: s.wrap_text,
+            alignment: alignment_tag(s.horizontal_alignment),
         }),
     }
 }
@@ -251,6 +256,22 @@ fn format_date_time(dt: &DateTimeValue) -> String {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
         dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
     )
+}
+
+/// `model::style::Alignment` doesn't derive `Serialize` directly (keeping
+/// `serde` out of `model/`'s dependency surface — see this file's
+/// Dependencies doc), so this mirrors `visibility_tag`'s pattern instead.
+fn alignment_tag(a: Alignment) -> &'static str {
+    match a {
+        Alignment::General => "general",
+        Alignment::Left => "left",
+        Alignment::Center => "center",
+        Alignment::Right => "right",
+        Alignment::Fill => "fill",
+        Alignment::Justify => "justify",
+        Alignment::CenterContinuous => "centerContinuous",
+        Alignment::Distributed => "distributed",
+    }
 }
 
 fn visibility_tag(v: SheetVisibility) -> &'static str {
@@ -312,6 +333,7 @@ mod tests {
                         bold: true,
                     },
                     wrap_text: true,
+                    ..Default::default()
                 })),
             },
         );
@@ -325,7 +347,8 @@ mod tests {
             cell_json["style"],
             serde_json::json!({
                 "font": { "sizePt": 14.0, "bold": true },
-                "wrapText": true
+                "wrapText": true,
+                "alignment": "general"
             })
         );
     }

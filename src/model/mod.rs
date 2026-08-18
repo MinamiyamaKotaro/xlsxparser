@@ -9,5 +9,5 @@ mod workbook;
 
 pub use cell::{Cell, CellRef, CellValue, DateTimeValue};
 pub use sheet::{ColWidthRange, MergedRegion, Sheet, SheetVisibility};
-pub use style::{Font, ResolvedStyle, StyleId, StyleSheet};
+pub use style::{Alignment, Font, ResolvedStyle, StyleId, StyleSheet};
 pub use workbook::Workbook;

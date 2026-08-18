@@ -3,7 +3,7 @@
 //! format as date/time or not and resolving each `<xf>`'s font/wrap-text.
 
 use crate::error::Error;
-use crate::model::{Font, ResolvedStyle, StyleId, StyleSheet};
+use crate::model::{Alignment, Font, ResolvedStyle, StyleId, StyleSheet};
 use crate::parse::{create_secure_reader, optional_attr, read_event, required_attr};
 use quick_xml::events::{BytesStart, Event};
 use std::collections::HashMap;
@@ -121,6 +121,7 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
                     numfmt_id,
                     font_id,
                     wrap_text: false,
+                    horizontal_alignment: Alignment::General,
                 });
             }
             Event::Empty(e) if in_cell_xfs && e.local_name().as_ref() == b"xf" => {
@@ -133,6 +134,7 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
                     numfmt_id,
                     font_id,
                     false,
+                    Alignment::General,
                 );
             }
             Event::End(e) if in_cell_xfs && e.local_name().as_ref() == b"xf" => {
@@ -145,6 +147,7 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
                         xf.numfmt_id,
                         xf.font_id,
                         xf.wrap_text,
+                        xf.horizontal_alignment,
                     );
                 }
             }
@@ -159,10 +162,24 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
                     optional_attr(e, path, "wrapText")?.as_deref(),
                     Some("1" | "true")
                 );
-                cur_xf
-                    .as_mut()
-                    .expect("cur_xf.is_some() checked above")
-                    .wrap_text = wrap_text;
+                // Read off the same start tag as wrapText (Issue #42) — no
+                // additional <xf> scan. `horizontal`'s value space is
+                // ECMA-376 ST_HorizontalAlignmentValues; "general", an
+                // absent attribute, or any unrecognized value all fall back
+                // to Alignment::General.
+                let horizontal_alignment = match optional_attr(e, path, "horizontal")?.as_deref() {
+                    Some("left") => Alignment::Left,
+                    Some("center") => Alignment::Center,
+                    Some("right") => Alignment::Right,
+                    Some("fill") => Alignment::Fill,
+                    Some("justify") => Alignment::Justify,
+                    Some("centerContinuous") => Alignment::CenterContinuous,
+                    Some("distributed") => Alignment::Distributed,
+                    _ => Alignment::General,
+                };
+                let xf = cur_xf.as_mut().expect("cur_xf.is_some() checked above");
+                xf.wrap_text = wrap_text;
+                xf.horizontal_alignment = horizontal_alignment;
             }
             Event::Eof => break,
             _ => {}
@@ -179,6 +196,7 @@ struct CurXf {
     numfmt_id: u32,
     font_id: usize,
     wrap_text: bool,
+    horizontal_alignment: Alignment,
 }
 
 /// Reads `numFmtId`/`fontId` off an `<xf>` start tag. Both are optional;
@@ -207,6 +225,7 @@ fn push_resolved_style(
     numfmt_id: u32,
     font_id: usize,
     wrap_text: bool,
+    horizontal_alignment: Alignment,
 ) {
     let is_date_time = is_date_time_format(numfmt_id, num_fmts.get(&numfmt_id).map(String::as_str));
     let font = fonts.get(font_id).copied().unwrap_or_default();
@@ -216,6 +235,7 @@ fn push_resolved_style(
             is_date_time,
             font,
             wrap_text,
+            horizontal_alignment,
         }),
     );
     *next_style_id += 1;
@@ -532,6 +552,57 @@ mod tests {
             }
         );
         assert!(sheet[&0].wrap_text);
+    }
+
+    #[test]
+    fn horizontal_alignment_resolves_each_known_value() {
+        let xml = br#"<styleSheet><cellXfs>
+<xf numFmtId="0"><alignment horizontal="left"/></xf>
+<xf numFmtId="0"><alignment horizontal="center"/></xf>
+<xf numFmtId="0"><alignment horizontal="right"/></xf>
+<xf numFmtId="0"><alignment horizontal="fill"/></xf>
+<xf numFmtId="0"><alignment horizontal="justify"/></xf>
+<xf numFmtId="0"><alignment horizontal="centerContinuous"/></xf>
+<xf numFmtId="0"><alignment horizontal="distributed"/></xf>
+</cellXfs></styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].horizontal_alignment, Alignment::Left);
+        assert_eq!(sheet[&1].horizontal_alignment, Alignment::Center);
+        assert_eq!(sheet[&2].horizontal_alignment, Alignment::Right);
+        assert_eq!(sheet[&3].horizontal_alignment, Alignment::Fill);
+        assert_eq!(sheet[&4].horizontal_alignment, Alignment::Justify);
+        assert_eq!(sheet[&5].horizontal_alignment, Alignment::CenterContinuous);
+        assert_eq!(sheet[&6].horizontal_alignment, Alignment::Distributed);
+    }
+
+    #[test]
+    fn horizontal_alignment_general_absent_and_unknown_all_resolve_to_general() {
+        let xml = br#"<styleSheet><cellXfs>
+<xf numFmtId="0"><alignment horizontal="general"/></xf>
+<xf numFmtId="0"><alignment vertical="center"/></xf>
+<xf numFmtId="0"><alignment horizontal="notARealValue"/></xf>
+</cellXfs></styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].horizontal_alignment, Alignment::General);
+        assert_eq!(sheet[&1].horizontal_alignment, Alignment::General);
+        assert_eq!(sheet[&2].horizontal_alignment, Alignment::General);
+    }
+
+    #[test]
+    fn self_closing_xf_with_no_alignment_child_is_horizontal_alignment_general() {
+        let xml = br#"<styleSheet><cellXfs><xf numFmtId="0"/></cellXfs></styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].horizontal_alignment, Alignment::General);
+    }
+
+    #[test]
+    fn wrap_text_and_horizontal_alignment_both_resolve_from_the_same_alignment_element() {
+        let xml = br#"<styleSheet>
+<cellXfs><xf numFmtId="0"><alignment wrapText="1" horizontal="center"/></xf></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert!(sheet[&0].wrap_text);
+        assert_eq!(sheet[&0].horizontal_alignment, Alignment::Center);
     }
 
     #[test]

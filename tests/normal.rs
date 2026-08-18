@@ -76,14 +76,16 @@ fn font_size_and_bold_resolve_per_cell_and_serialize_nested_under_style() {
         a1["style"],
         serde_json::json!({
             "font": { "sizePt": 11.0, "bold": false },
-            "wrapText": false
+            "wrapText": false,
+            "alignment": "general"
         })
     );
     assert_eq!(
         b1["style"],
         serde_json::json!({
             "font": { "sizePt": 14.0, "bold": true },
-            "wrapText": false
+            "wrapText": false,
+            "alignment": "general"
         })
     );
 }
@@ -111,6 +113,41 @@ fn date1904_workbook_pr_selects_the_1904_epoch_end_to_end() {
         parsed["sheets"][0]["cells"][0]["value"],
         serde_json::json!({"type": "dateTime", "value": "1904-01-02T00:00:00"})
     );
+}
+
+#[test]
+fn alignment_resolves_per_cell_and_serializes_nested_under_style() {
+    let workbook = parse_workbook_reader(Cursor::new(normal::alignment_styles())).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    assert_eq!(
+        sheet
+            .get(CellRef { row: 1, col: 1 })
+            .unwrap()
+            .style
+            .as_ref()
+            .unwrap()
+            .horizontal_alignment,
+        xlsxparser::Alignment::Center
+    );
+    assert_eq!(
+        sheet
+            .get(CellRef { row: 1, col: 2 })
+            .unwrap()
+            .style
+            .as_ref()
+            .unwrap()
+            .horizontal_alignment,
+        xlsxparser::Alignment::General
+    );
+
+    let json = to_json_string(&workbook).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let cells = parsed["sheets"][0]["cells"].as_array().unwrap();
+    let a1 = cells.iter().find(|c| c["col"] == 1).unwrap();
+    let b1 = cells.iter().find(|c| c["col"] == 2).unwrap();
+    assert_eq!(a1["style"]["alignment"], "center");
+    assert_eq!(b1["style"]["alignment"], "general");
 }
 
 #[test]
