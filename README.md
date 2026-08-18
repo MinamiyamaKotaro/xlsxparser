@@ -109,13 +109,27 @@ sheet with a single merged region, `A1:C3`, holding one text cell):
 - Each cell's `value` is tagged by `type`:
   `"number"` | `"text"` | `"boolean"` | `"error"` | `"dateTime"` |
   `"empty"` (a cell with formatting only, or a value JSON can't
-  represent — `NaN`/`±Infinity`, or — for now — any date/time value, since
-  `DateTimeValue` doesn't carry real calendar data yet; see
-  [docs/design/model/cell.en.md](docs/design/model/cell.en.md) Open
-  Question 4).
+  represent — `NaN`/`±Infinity`).
+  `"dateTime"` serializes as ISO 8601 with no timezone designator or
+  fractional seconds (e.g. `"2023-06-15T00:00:00"`; a date-only cell gets a
+  midnight time component, since Excel itself doesn't distinguish
+  date-only from date+time as a type).
 - `rowSpan`/`colSpan` are present (and `> 1`) only on a merged region's
   anchor cell; every other coordinate inside the region resolves to that
   same anchor and is not emitted as a separate JSON cell.
+- `style` is present only when the cell carries a resolved style at all
+  (omitted entirely otherwise, not emitted as `"style": {}`):
+  - `font`: `{"sizePt": 11.0, "bold": false}`.
+  - `wrapText`: boolean.
+  - `alignment`: the horizontal alignment as a string — `"general"` |
+    `"left"` | `"center"` | `"right"` | `"fill"` | `"justify"` |
+    `"centerContinuous"` | `"distributed"`. Always present (unlike
+    `numberFormat` below, `"general"` is itself a meaningful value, not
+    "nothing to report").
+  - `numberFormat`: the resolved format code as a string (e.g. `"0%"`,
+    `"yyyy-mm-dd"`), covering both the built-in numFmtId table
+    (ECMA-376 §18.8.30) and custom `<numFmt>` codes. Omitted when the
+    format is `"General"` (no special formatting to report).
 
 A second real example — every `CellValue` variant in one row
 (`tests/fixtures/normal/basic_types.xlsx`; cells re-ordered by column here
@@ -135,7 +149,16 @@ for readability, since actual order is unspecified):
         { "row": 1, "col": 1, "value": { "type": "text", "value": "日本語Text" } },
         { "row": 1, "col": 2, "value": { "type": "number", "value": 42.0 } },
         { "row": 1, "col": 3, "value": { "type": "number", "value": 19.99 } },
-        { "row": 1, "col": 4, "value": { "type": "empty" } },
+        {
+          "row": 1, "col": 4,
+          "value": { "type": "dateTime", "value": "2023-06-15T00:00:00" },
+          "style": {
+            "font": { "sizePt": 11.0, "bold": false },
+            "wrapText": false,
+            "alignment": "general",
+            "numberFormat": "yyyy-mm-dd"
+          }
+        },
         { "row": 1, "col": 5, "value": { "type": "boolean", "value": true } },
         { "row": 1, "col": 6, "value": { "type": "boolean", "value": false } },
         { "row": 1, "col": 7, "value": { "type": "error", "value": "#N/A" } }
@@ -145,8 +168,9 @@ for readability, since actual order is unspecified):
 }
 ```
 
-(Column 4 is a date cell — it currently serializes as `"empty"` rather than
-`"dateTime"`, per the placeholder-`DateTimeValue` note above.)
+(Column 4 is a date cell — its `numberFormat` comes from the cell's
+`<xf numFmtId="...">`, resolved against `xl/styles.xml`'s built-in/custom
+`<numFmt>` table; `openpyxl`'s default date format is `"yyyy-mm-dd"`.)
 
 A third real example — a sheet that does declare `<cols>`
 (`tests/fixtures/normal.rs`'s `column_widths()`: `<col min="1" max="3"
@@ -222,9 +246,14 @@ src/
 ## OOXML parts covered
 
 - `xl/_rels/workbook.xml.rels`
-- `xl/workbook.xml`
-- `xl/sharedStrings.xml` (including `xml:space="preserve"` handling)
-- `xl/styles.xml`
+- `xl/workbook.xml` (including `<workbookPr date1904="...">`, needed to
+  resolve a date/time cell's serial value under the 1900 vs. 1904 date
+  system)
+- `xl/sharedStrings.xml` (rich-text run concatenation, `xml:space="preserve"`
+  handling, CDATA runs, and the `_x000D_` escape Excel uses for a literal CR)
+- `xl/styles.xml` (font size/bold, horizontal alignment, wrap text, and
+  number format — both the built-in numFmtId table (ECMA-376 §18.8.30) and
+  custom `<numFmt>` codes)
 - `xl/worksheets/sheetX.xml` (`<sheetData>`, `<mergeCells>`)
 
 `[Content_Types].xml` is not read; fixed paths such as `xl/workbook.xml`
