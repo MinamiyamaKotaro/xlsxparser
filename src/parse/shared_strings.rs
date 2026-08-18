@@ -79,7 +79,11 @@ mod tests {
 
     #[test]
     fn rich_text_runs_concatenate() {
-        let xml = br#"<sst><si><r><t>hello </t></r><r><t>world</t></r></si></sst>"#;
+        // xml:space="preserve" marks the meaningful trailing space (Issue
+        // #56) — without it, `parse::concat_rich_text` now correctly trims
+        // each run's own leading/trailing whitespace.
+        let xml =
+            br#"<sst><si><r><t xml:space="preserve">hello </t></r><r><t>world</t></r></si></sst>"#;
         let table = parse(xml);
         assert_eq!(table.get(0).unwrap().as_ref(), "hello world");
     }

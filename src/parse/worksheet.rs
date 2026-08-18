@@ -394,7 +394,7 @@ mod tests {
     fn inline_str_simple_and_rich_text() {
         let xml = br#"<worksheet><sheetData><row r="1">
 <c r="A1" t="inlineStr"><is><t>plain</t></is></c>
-<c r="B1" t="inlineStr"><is><r><t>rich </t></r><r><t>text</t></r></is></c>
+<c r="B1" t="inlineStr"><is><r><t xml:space="preserve">rich </t></r><r><t>text</t></r></is></c>
 </row></sheetData></worksheet>"#;
         let (sheet, _output) = parse(xml);
         assert_eq!(

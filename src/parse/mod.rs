@@ -194,6 +194,33 @@ pub(crate) fn push_general_ref(
 /// (phonetic hints) are excluded from concatenation, since only their
 /// *sibling* `<t>` (the run's actual text) contributes to the value.
 ///
+/// Only text found *inside* a `<t>` element contributes to the result —
+/// insignificant whitespace between sibling tags (`<is>`, `<r>`, `<rPr>`,
+/// `</r>`, ...) in pretty-printed/indented XML is never captured, since it
+/// arrives as its own `Event::Text` outside any `<t>` (Issue #53: this used
+/// to be missed, since the previous implementation captured any
+/// `Event::Text` seen anywhere under `<si>`/`<is>` with no positive check
+/// for "currently inside `<t>`", so indentation whitespace leaked into the
+/// result on non-minified XML).
+///
+/// Each `<t>`'s own content is trimmed of leading/trailing whitespace
+/// unless that `<t>` carries `xml:space="preserve"` (Issue #56) — Excel's
+/// own convention, and the one `xml:space`-conditional trimming other
+/// Excel-compatible readers implement. Trimming is applied per `<t>`, not
+/// to the whole concatenated result, since `xml:space` is an attribute of
+/// the individual `<t>` element (ECMA-376), not of `<si>`/`<is>` as a whole.
+///
+/// Every fragment (`Event::Text`/`Event::CData`/`Event::GeneralRef`) is
+/// appended directly to the final `text` buffer as it arrives — there is
+/// no separate per-run buffer — and trimming is done in place on `text`'s
+/// own tail once a `<t>` closes (see [`trim_tail_in_place`]). An earlier
+/// version accumulated each run into its own `String` first specifically
+/// to trim it before appending; benchmarking against a 50,000-entry shared
+/// string table showed that extra allocation-and-copy costing roughly 17%
+/// versus the pre-Issue-#56 baseline, which this in-place approach avoids
+/// entirely while still trimming correctly, since nothing from a later run
+/// is ever appended before the current run's own trim is resolved.
+///
 /// Called with the reader positioned just after the opening `<si>`/`<is>`
 /// tag; consumes events up to and including the matching closing tag.
 pub(crate) fn concat_rich_text<R: BufRead>(
@@ -203,8 +230,14 @@ pub(crate) fn concat_rich_text<R: BufRead>(
     let mut text = String::new();
     let mut buf = Vec::new();
     // Depth of exclusion zones (`<rPr>`/`<rPh>`) the cursor is currently
-    // inside; `<t>` is only appended to `text` while this is zero.
+    // inside; `<t>` is only recognized while this is zero.
     let mut skip_depth: u32 = 0;
+    // Byte offset into `text` where the `<t>` element currently being read
+    // started contributing content — `None` whenever the cursor is not
+    // inside a `<t>` element, which is when stray whitespace/text must be
+    // ignored rather than appended.
+    let mut t_start: Option<usize> = None;
+    let mut t_preserve = false;
 
     loop {
         match read_event(reader, &mut buf, path)? {
@@ -212,7 +245,18 @@ pub(crate) fn concat_rich_text<R: BufRead>(
             Event::Start(e) if e.local_name().as_ref() == b"rPh" => skip_depth += 1,
             Event::End(e) if e.local_name().as_ref() == b"rPr" => skip_depth -= 1,
             Event::End(e) if e.local_name().as_ref() == b"rPh" => skip_depth -= 1,
-            Event::Text(e) if skip_depth == 0 => {
+            Event::Start(e) if skip_depth == 0 && e.local_name().as_ref() == b"t" => {
+                t_preserve = optional_attr(&e, path, "xml:space")?.as_deref() == Some("preserve");
+                t_start = Some(text.len());
+            }
+            Event::End(e) if skip_depth == 0 && e.local_name().as_ref() == b"t" => {
+                if let Some(start) = t_start.take() {
+                    if !t_preserve {
+                        trim_tail_in_place(&mut text, start);
+                    }
+                }
+            }
+            Event::Text(e) if skip_depth == 0 && t_start.is_some() => {
                 // Plain text content only: quick-xml 0.41 tokenizes any
                 // `&...;` reference within content as a separate
                 // `Event::GeneralRef`, never leaving escaped syntax inside
@@ -221,12 +265,25 @@ pub(crate) fn concat_rich_text<R: BufRead>(
                     path: path.to_string(),
                     source: Box::new(err),
                 })?;
-                text.push_str(&decoded);
+                text.push_str(&normalize_line_endings(&decoded));
+            }
+            // `<t><![CDATA[...]]></t>` — a third-party-tool form real
+            // Excel never writes but that legitimately occurs in the wild.
+            // CDATA content is never XML-escaped by definition, so this
+            // decodes it directly rather than going through `push_general_ref`.
+            Event::CData(e) if skip_depth == 0 && t_start.is_some() => {
+                let decoded = e.decode().map_err(|err| Error::XmlParse {
+                    path: path.to_string(),
+                    source: Box::new(err),
+                })?;
+                text.push_str(&normalize_line_endings(&decoded));
             }
             // `&#x...;`/`&#...;` (character references) or `&amp;`/`&lt;`/etc.
             // (the 5 predefined XML entities — the only ones that can occur
             // without a DTD, which `read_event` already rejects outright).
-            Event::GeneralRef(e) if skip_depth == 0 => push_general_ref(&mut text, &e, path)?,
+            Event::GeneralRef(e) if skip_depth == 0 && t_start.is_some() => {
+                push_general_ref(&mut text, &e, path)?
+            }
             Event::End(e)
                 if e.local_name().as_ref() == b"si" || e.local_name().as_ref() == b"is" =>
             {
@@ -243,7 +300,70 @@ pub(crate) fn concat_rich_text<R: BufRead>(
         buf.clear();
     }
 
+    // Excel's own convention for embedding a literal CR that XML syntax
+    // can't represent raw within a text node (Issue #57) — restore it
+    // after concatenation rather than per-`<t>`, so the substitution is
+    // correct even in the (unrealistic, but not worth special-casing
+    // against) case where the literal marker straddles a run boundary.
+    if text.contains("_x000D_") {
+        text = text.replace("_x000D_", "\r");
+    }
+
     Ok(text)
+}
+
+/// Trims leading/trailing whitespace from `text[start..]` in place, with no
+/// additional allocation. Only ever called immediately after appending one
+/// `<t>` run's content and before any later run's content has been
+/// appended (`concat_rich_text` enforces this by construction — trimming
+/// happens synchronously at each `</t>`), so removing leading whitespace
+/// via [`String::drain`] only ever has to shift *this run's own* remaining
+/// bytes, never the whole accumulated string.
+fn trim_tail_in_place(text: &mut String, start: usize) {
+    let trailing_len = text.len() - start - text[start..].trim_end().len();
+    text.truncate(text.len() - trailing_len);
+
+    let leading_len = text[start..].len() - text[start..].trim_start().len();
+    if leading_len > 0 {
+        text.drain(start..start + leading_len);
+    }
+}
+
+/// XML 1.0 §2.11 End-of-Line Handling mandates that a parser normalize
+/// every raw line break in the source document (a literal CRLF, or a lone
+/// CR not followed by LF) to a single LF before the application ever sees
+/// the text — different source files legitimately use different line-
+/// ending conventions, and that difference must never leak into the
+/// application's view of the actual character data. `quick-xml` does not
+/// perform this normalization itself (verified against its source — only
+/// XML *attribute*-value normalization is implemented), so this project's
+/// own text-reading path does it explicitly. Discovered via Issue #57: the
+/// fixture exercising the `_x000D_` escape happens to also use CRLF line
+/// endings in its raw XML source, which — without this normalization —
+/// doubled up into `\r\r\n` once combined with the escape's own `\r`.
+///
+/// Deliberately not applied to [`push_general_ref`]'s output: an explicit
+/// `&#13;`/`&#x0D;` character reference is a real, intentional CR the
+/// author chose to spell out as an entity rather than a raw line break, so
+/// it must survive unnormalized (the XML spec's rule applies to raw source
+/// bytes, before entity resolution, not to characters produced by it).
+fn normalize_line_endings(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains('\r') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -336,7 +456,7 @@ mod tests {
         ));
     }
 
-    fn parse_si_body(xml: &[u8]) -> String {
+    fn parse_si_body_result(xml: &[u8]) -> Result<String, Error> {
         let mut reader = create_secure_reader(xml);
         let mut buf = Vec::new();
         // Advance past the opening `<si>`/`<is>` tag.
@@ -353,7 +473,11 @@ mod tests {
             buf.clear();
         }
         buf.clear();
-        concat_rich_text(&mut reader, "xl/sharedStrings.xml").unwrap()
+        concat_rich_text(&mut reader, "xl/sharedStrings.xml")
+    }
+
+    fn parse_si_body(xml: &[u8]) -> String {
+        parse_si_body_result(xml).unwrap()
     }
 
     #[test]
@@ -364,7 +488,10 @@ mod tests {
 
     #[test]
     fn concat_rich_text_multiple_runs() {
-        let xml = b"<si><r><t>hello </t></r><r><t>world</t></r></si>";
+        // Real Excel output marks a run's meaningful trailing space with
+        // xml:space="preserve" (Issue #56) — without it, that space would
+        // now correctly be trimmed away rather than surviving by accident.
+        let xml = br#"<si><r><t xml:space="preserve">hello </t></r><r><t>world</t></r></si>"#;
         assert_eq!(parse_si_body(xml), "hello world");
     }
 
@@ -372,6 +499,122 @@ mod tests {
     fn concat_rich_text_excludes_rpr_and_rph() {
         let xml = b"<si><r><rPr><b/></rPr><t>bold</t></r><rPh><t>phonetic</t></rPh></si>";
         assert_eq!(parse_si_body(xml), "bold");
+    }
+
+    #[test]
+    fn concat_rich_text_ignores_whitespace_between_sibling_tags_in_pretty_printed_xml() {
+        // Issue #53: indentation between <r>/<rPr>/<t> in non-minified XML
+        // must never leak into the result — only text found inside <t>
+        // itself contributes.
+        let xml = b"<si>\n  <r>\n    <rPr>\n      <b/>\n    </rPr>\n    <t>NN</t>\n  </r>\n</si>";
+        assert_eq!(parse_si_body(xml), "NN");
+    }
+
+    #[test]
+    fn concat_rich_text_trims_whitespace_unless_xml_space_preserve() {
+        // Issue #56: Excel/calamine convention — trim leading/trailing
+        // whitespace from <t> content unless xml:space="preserve".
+        let untagged = b"<si><t>  trimmed value  </t></si>";
+        assert_eq!(parse_si_body(untagged), "trimmed value");
+
+        let preserved = br#"<si><t xml:space="preserve">  preserved value  </t></si>"#;
+        assert_eq!(parse_si_body(preserved), "  preserved value  ");
+
+        let whitespace_only = b"<si><t> \t\n</t></si>";
+        assert_eq!(parse_si_body(whitespace_only), "");
+    }
+
+    #[test]
+    fn concat_rich_text_trims_each_run_independently() {
+        // Trimming is scoped to the individual <t> (xml:space is its own
+        // attribute per ECMA-376), not to the whole concatenated result —
+        // an untrimmed run's boundary whitespace must not bleed into an
+        // adjacent trimmed run.
+        let xml = br#"<si><r><t xml:space="preserve">  a  </t></r><r><t>  b  </t></r></si>"#;
+        assert_eq!(parse_si_body(xml), "  a  b");
+    }
+
+    #[test]
+    fn concat_rich_text_restores_x000d_escape() {
+        // Issue #57: Excel's own convention for embedding a literal CR
+        // that XML can't represent raw within a text node.
+        let xml = b"<si><t>ABC_x000D_\nDEF</t></si>";
+        assert_eq!(parse_si_body(xml), "ABC\r\nDEF");
+    }
+
+    #[test]
+    fn concat_rich_text_x000d_escape_followed_by_raw_crlf_source_line_ending_is_not_doubled() {
+        // Regression test discovered while verifying Issue #57 against a
+        // real calamine fixture: when the raw XML source itself uses CRLF
+        // line endings, the literal \r\n right after the _x000D_ marker
+        // must first be normalized to a single \n (XML 1.0 end-of-line
+        // handling) before the marker's own \r is restored — otherwise the
+        // result doubles up into "\r\r\n" instead of "\r\n".
+        let xml = b"<si><t>ABC_x000D_\r\nDEF</t></si>";
+        assert_eq!(parse_si_body(xml), "ABC\r\nDEF");
+    }
+
+    #[test]
+    fn concat_rich_text_normalizes_raw_crlf_and_lone_cr_to_lf() {
+        let crlf = b"<si><t xml:space=\"preserve\">a\r\nb</t></si>";
+        assert_eq!(parse_si_body(crlf), "a\nb");
+
+        let lone_cr = b"<si><t xml:space=\"preserve\">a\rb</t></si>";
+        assert_eq!(parse_si_body(lone_cr), "a\nb");
+    }
+
+    #[test]
+    fn concat_rich_text_does_not_normalize_an_explicit_cr_character_reference() {
+        // An explicit &#13; is a deliberate, author-chosen CR — distinct
+        // from a raw source line break — and must survive unnormalized.
+        let xml = b"<si><t xml:space=\"preserve\">a&#13;b</t></si>";
+        assert_eq!(parse_si_body(xml), "a\rb");
+    }
+
+    #[test]
+    fn concat_rich_text_reads_cdata_content() {
+        // A third-party-tool form real Excel never writes, but occurs in
+        // the wild — previously silently ignored (fell into the catch-all
+        // branch), producing an empty string instead of the CDATA content.
+        let xml = b"<si><t><![CDATA[Hello CDATA]]></t></si>";
+        assert_eq!(parse_si_body(xml), "Hello CDATA");
+    }
+
+    #[test]
+    fn concat_rich_text_invalid_utf8_in_plain_text_is_xml_parse_error() {
+        // Same as the CDATA case above, but for the plain-text decode path
+        // (unchanged by this PR, but exercised through the new `t_start`
+        // gating for the first time here).
+        let mut xml = b"<si><t>".to_vec();
+        xml.push(0xFF);
+        xml.extend_from_slice(b"</t></si>");
+        let err = parse_si_body_result(&xml).unwrap_err();
+        assert!(matches!(err, Error::XmlParse { .. }));
+    }
+
+    #[test]
+    fn concat_rich_text_invalid_utf8_in_cdata_is_xml_parse_error() {
+        // Regression test for the CData decode error path introduced
+        // alongside CDATA support: an invalid byte sequence must surface
+        // as Error::XmlParse, not panic.
+        let mut xml = b"<si><t><![CDATA[".to_vec();
+        xml.push(0xFF); // not valid UTF-8 on its own
+        xml.extend_from_slice(b"]]></t></si>");
+        let err = parse_si_body_result(&xml).unwrap_err();
+        assert!(matches!(err, Error::XmlParse { .. }));
+    }
+
+    #[test]
+    fn concat_rich_text_eof_before_closing_tag_is_missing_required_element() {
+        let xml = b"<si><t>unterminated";
+        let err = parse_si_body_result(xml).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MissingRequiredElement {
+                name: "si/is closing tag",
+                ..
+            }
+        ));
     }
 
     #[test]

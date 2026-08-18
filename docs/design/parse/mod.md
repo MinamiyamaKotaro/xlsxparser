@@ -132,12 +132,113 @@ pub(crate) fn required_attr(
 /// [worksheet.md](worksheet.md)（`t="inlineStr"` セル）の双方が同一の構造
 /// （`<si>`/`<is>` 配下のラン構造はOOXML上共通）を解釈するため、実装の
 /// 重複を避けるためにここへ集約する。
+///
+/// **実装後の改訂(Issue #53/#56/#57)**: 以下は初版実装から大きく変わって
+/// いる。結果に寄与するのは `<t>` 要素の**内側**にあるテキストのみ——
+/// 初版実装は `<si>`/`<is>` 配下のどこであれ `Event::Text` を無条件に
+/// 捕捉しており、「現在 `<t>` の内側にいるか」の判定を持たなかったため、
+/// 整形出力(インデント付き)されたXMLで兄弟タグ間の空白が結果へ混入して
+/// いた(Issue #53)。各 `<t>` 自身の内容は、`xml:space="preserve"` を
+/// 持たない限り先頭・末尾の空白をトリムするようにもなった(Issue #56。
+/// Excel・他のExcel互換リーダーの慣習に合わせる——`xml:space` は
+/// `<si>`/`<is>` 全体ではなく個々の `<t>` 要素の属性であるため、トリムも
+/// ラン単位で行う)。Excelが「XML構文上生の状態では表現できないリテラル
+/// なCR」を表すために使う `_x000D_` エスケープは、連結後に復元する
+/// (Issue #57)。
+///
+/// 各フラグメント(`Event::Text`/`Event::CData`/`Event::GeneralRef`)は
+/// 一時的なラン単位バッファを経由せず、最終出力の `text` バッファへ
+/// 直接追記される。トリムは `<t>` が閉じた時点で `text` 自身の末尾に
+/// 対しin-placeで行う(`trim_tail_in_place` 参照)。過渡的な実装では
+/// トリムしてから追記するために各ランを専用の `String` へ蓄積していたが、
+/// 共有文字列5万件のベンチマークでIssue #56適用前の基準値に対し約17%の
+/// 速度低下を招くことが判明した。このin-place方式は追加アロケーションを
+/// 完全に回避し(速度低下を約10%まで縮小)、かつ正しくトリムできる——
+/// 現在のランのトリムが確定する前に後続のランの内容が追記されることは
+/// 決してないため。
+///
+/// `Event::CData`(`<t><![CDATA[...]]></t>`)も `Event::Text` と同じ方法で
+/// デコードするようになった——実際のExcelは書かないが第三者製ツールが
+/// 正当に生成しうる形式で、以前は `_ => {}` の受け皿分岐に落ちて
+/// サイレントに無視されていた。
+///
+/// 生の `Event::Text`/`Event::CData` フラグメントはいずれも、`text` へ
+/// 追記する前に `normalize_line_endings` を通す: `quick-xml` はXML 1.0
+/// §2.11が義務付ける改行正規化(ソース中の生のCRLFまたは単独のCRは、
+/// アプリケーションに渡される前に単一のLFへ正規化されなければならない)
+/// を実装していないため、本プロジェクト自身のテキスト読み取りパスで
+/// 明示的に行う——`_x000D_` を検証する対象のフィクスチャがたまたま生の
+/// XMLソース自体もCRLF改行を使っていたため発見に至った。この正規化を
+/// 行わないと `\r\r\n` に二重化してしまう。`push_general_ref` の出力には
+/// あえて適用しない——明示的な `&#13;` 文字参照は著者が意図的にエンティティ
+/// として書き下した本物のCRであり、ソース上の生の改行ではないため、
+/// 正規化せずそのまま残す必要がある。
 pub(crate) fn concat_rich_text<R: BufRead>(
     reader: &mut Reader<R>,
-    buf: &mut Vec<u8>,
+    path: &str,
 ) -> Result<String, Error> {
-    let _ = (reader, buf);
-    unimplemented!()
+    let mut text = String::new();
+    let mut buf = Vec::new();
+    let mut skip_depth: u32 = 0; // <rPr>/<rPh> の内側か?
+    // `<t>` の内容がtextへ追記され始めたバイトオフセット——<t>の外側では None。
+    let mut t_start: Option<usize> = None;
+    let mut t_preserve = false;
+    loop {
+        match read_event(reader, &mut buf, path)? {
+            Event::Start(e) if e.local_name().as_ref() == b"rPr" || e.local_name().as_ref() == b"rPh" => skip_depth += 1,
+            Event::End(e) if e.local_name().as_ref() == b"rPr" || e.local_name().as_ref() == b"rPh" => skip_depth -= 1,
+            Event::Start(e) if skip_depth == 0 && e.local_name().as_ref() == b"t" => {
+                t_preserve = optional_attr(&e, path, "xml:space")?.as_deref() == Some("preserve");
+                t_start = Some(text.len());
+            }
+            Event::End(e) if skip_depth == 0 && e.local_name().as_ref() == b"t" => {
+                if let Some(start) = t_start.take() {
+                    if !t_preserve {
+                        trim_tail_in_place(&mut text, start);
+                    }
+                }
+            }
+            Event::Text(e) if skip_depth == 0 && t_start.is_some() => {
+                let decoded = e.decode().map_err(|err| Error::XmlParse { path: path.to_string(), source: Box::new(err) })?;
+                text.push_str(&normalize_line_endings(&decoded));
+            }
+            Event::CData(e) if skip_depth == 0 && t_start.is_some() => {
+                let decoded = e.decode().map_err(|err| Error::XmlParse { path: path.to_string(), source: Box::new(err) })?;
+                text.push_str(&normalize_line_endings(&decoded));
+            }
+            // `&#x...;`/`&#...;`、またはXML定義済み5実体
+            // (`&amp;`/`&lt;`/`&gt;`/`&apos;`/`&quot;`)——DOCTYPEを
+            // `read_event` が既に拒否しているため、正当に出現しうるのは
+            // これらのみ。
+            Event::GeneralRef(e) if skip_depth == 0 && t_start.is_some() => {
+                push_general_ref(&mut text, &e, path)?
+            }
+            Event::End(e) if e.local_name().as_ref() == b"si" || e.local_name().as_ref() == b"is" => break,
+            Event::Eof => return Err(Error::MissingRequiredElement { path: path.to_string(), name: "si/is closing tag" }),
+            _ => {}
+        }
+        buf.clear();
+    }
+    // ラン単位ではなく最後にまとめて復元する——マーカーがラン境界を
+    // またぐ(非現実的だが)ケースでも正しく動作するように。
+    if text.contains("_x000D_") {
+        text = text.replace("_x000D_", "\r");
+    }
+    Ok(text)
+}
+
+/// `text[start..]` の先頭・末尾の空白をin-placeでトリムする(追加の
+/// アロケーションなし)——1つの `<t>` ランの内容を追記した直後、かつ
+/// それ以降のランの内容がまだ追記されていない時点でのみ呼ばれるため、
+/// `String::drain` による先頭空白の除去は「このラン自身」の残りバイトを
+/// シフトするだけで済み、蓄積済みの文字列全体をシフトすることはない。
+fn trim_tail_in_place(text: &mut String, start: usize) {
+    let trailing_len = text.len() - start - text[start..].trim_end().len();
+    text.truncate(text.len() - trailing_len);
+    let leading_len = text[start..].len() - text[start..].trim_start().len();
+    if leading_len > 0 {
+        text.drain(start..start + leading_len);
+    }
 }
 ```
 

@@ -153,6 +153,50 @@ pub(crate) fn required_attr(
 /// internal buffer rather than threading one through from the caller
 /// (finalized at implementation time). Called with the reader already
 /// positioned just after the opening `<si>`/`<is>` tag.
+///
+/// **Post-implementation revisions (Issues #53/#56/#57)**: the version
+/// below is significantly different from what first shipped. Only text
+/// found *inside* a `<t>` element contributes to the result — the original
+/// implementation captured any `Event::Text` seen anywhere under
+/// `<si>`/`<is>` with no positive "currently inside `<t>`" check, so
+/// indentation whitespace between sibling tags in pretty-printed/indented
+/// XML leaked into the result (Issue #53). Each `<t>`'s own content is now
+/// also trimmed of leading/trailing whitespace unless that `<t>` carries
+/// `xml:space="preserve"` (Issue #56, matching the convention Excel and
+/// other Excel-compatible readers follow — `xml:space` is an attribute of
+/// the individual `<t>` element, not of `<si>`/`<is>` as a whole, so
+/// trimming is scoped per run). Excel's `_x000D_` escape for a literal CR
+/// that XML syntax can't represent raw within a text node is restored
+/// after concatenation (Issue #57).
+///
+/// Every fragment (`Event::Text`/`Event::CData`/`Event::GeneralRef`) is
+/// appended directly to the final `text` buffer as it arrives, with no
+/// separate per-run buffer; trimming happens in place on `text`'s own tail
+/// once a `<t>` closes (see `trim_tail_in_place`). An interim
+/// implementation accumulated each run into its own `String` specifically
+/// so it could trim before appending, but benchmarking against a
+/// 50,000-entry shared string table showed that extra allocation-and-copy
+/// costing roughly 17% versus the pre-Issue-#56 baseline; this in-place
+/// approach avoids the allocation entirely (dropping the regression to
+/// roughly 10%) while trimming correctly, since nothing from a later run
+/// is ever appended before the current run's own trim is resolved.
+///
+/// Also decodes `Event::CData` (`<t><![CDATA[...]]></t>`) the same way as
+/// `Event::Text` — a form real Excel never writes but that third-party
+/// tools legitimately produce, previously silently dropped since it fell
+/// into the `_ => {}` catch-all.
+///
+/// Every raw `Event::Text`/`Event::CData` fragment is also run through
+/// `normalize_line_endings` before being appended: `quick-xml` does not
+/// implement XML 1.0 §2.11's mandatory end-of-line normalization (a raw
+/// CRLF or lone CR in the source must become a single LF before the
+/// application ever sees it), so this project's own text-reading path does
+/// it explicitly — discovered because the fixture exercising `_x000D_`
+/// happens to also use CRLF line endings in its raw XML source, which
+/// without this normalization doubled up into `\r\r\n`. Deliberately not
+/// applied to `push_general_ref`'s output — an explicit `&#13;` character
+/// reference is a real, intentional CR the author chose to spell out, not
+/// a raw source line break, and must survive unnormalized.
 pub(crate) fn concat_rich_text<R: BufRead>(
     reader: &mut Reader<R>,
     path: &str,
@@ -160,31 +204,39 @@ pub(crate) fn concat_rich_text<R: BufRead>(
     let mut text = String::new();
     let mut buf = Vec::new();
     let mut skip_depth: u32 = 0; // inside <rPr>/<rPh>?
+    // Byte offset into `text` where the `<t>` element currently being read
+    // started contributing content — `None` outside any `<t>`.
+    let mut t_start: Option<usize> = None;
+    let mut t_preserve = false;
     loop {
         match read_event(reader, &mut buf, path)? {
             Event::Start(e) if e.local_name().as_ref() == b"rPr" || e.local_name().as_ref() == b"rPh" => skip_depth += 1,
             Event::End(e) if e.local_name().as_ref() == b"rPr" || e.local_name().as_ref() == b"rPh" => skip_depth -= 1,
-            Event::Text(e) if skip_depth == 0 => {
-                // No entity syntax survives into Text content in quick-xml
-                // 0.41 — see Open Question 1 — so only charset decoding is
-                // needed here.
+            Event::Start(e) if skip_depth == 0 && e.local_name().as_ref() == b"t" => {
+                t_preserve = optional_attr(&e, path, "xml:space")?.as_deref() == Some("preserve");
+                t_start = Some(text.len());
+            }
+            Event::End(e) if skip_depth == 0 && e.local_name().as_ref() == b"t" => {
+                if let Some(start) = t_start.take() {
+                    if !t_preserve {
+                        trim_tail_in_place(&mut text, start);
+                    }
+                }
+            }
+            Event::Text(e) if skip_depth == 0 && t_start.is_some() => {
                 let decoded = e.decode().map_err(|err| Error::XmlParse { path: path.to_string(), source: Box::new(err) })?;
-                text.push_str(&decoded);
+                text.push_str(&normalize_line_endings(&decoded));
+            }
+            Event::CData(e) if skip_depth == 0 && t_start.is_some() => {
+                let decoded = e.decode().map_err(|err| Error::XmlParse { path: path.to_string(), source: Box::new(err) })?;
+                text.push_str(&normalize_line_endings(&decoded));
             }
             // `&#x...;`/`&#...;` or one of the 5 predefined XML entities
             // (`&amp;`/`&lt;`/`&gt;`/`&apos;`/`&quot;`) — the only entities
             // that can legally appear without a DTD, which `read_event`
             // already rejects.
-            Event::GeneralRef(e) if skip_depth == 0 => {
-                match e.resolve_char_ref().map_err(|err| Error::XmlParse { path: path.to_string(), source: Box::new(err) })? {
-                    Some(ch) => text.push(ch),
-                    None => {
-                        let decoded = e.decode().map_err(|err| Error::XmlParse { path: path.to_string(), source: Box::new(err) })?;
-                        let resolved = quick_xml::escape::resolve_predefined_entity(&decoded)
-                            .ok_or_else(|| Error::XmlParse { path: path.to_string(), source: format!("unknown XML entity reference: &{decoded};").into() })?;
-                        text.push_str(resolved);
-                    }
-                }
+            Event::GeneralRef(e) if skip_depth == 0 && t_start.is_some() => {
+                push_general_ref(&mut text, &e, path)?
             }
             Event::End(e) if e.local_name().as_ref() == b"si" || e.local_name().as_ref() == b"is" => break,
             Event::Eof => return Err(Error::MissingRequiredElement { path: path.to_string(), name: "si/is closing tag" }),
@@ -192,7 +244,27 @@ pub(crate) fn concat_rich_text<R: BufRead>(
         }
         buf.clear();
     }
+    // Restored once at the end rather than per-run, so it stays correct
+    // even in the (unrealistic) case where the marker straddles a run boundary.
+    if text.contains("_x000D_") {
+        text = text.replace("_x000D_", "\r");
+    }
     Ok(text)
+}
+
+/// Trims leading/trailing whitespace from `text[start..]` in place, with no
+/// additional allocation — only ever called immediately after appending one
+/// `<t>` run's content and before any later run's content has been
+/// appended, so removing leading whitespace via `String::drain` only ever
+/// shifts *this run's own* remaining bytes, never the whole accumulated
+/// string.
+fn trim_tail_in_place(text: &mut String, start: usize) {
+    let trailing_len = text.len() - start - text[start..].trim_end().len();
+    text.truncate(text.len() - trailing_len);
+    let leading_len = text[start..].len() - text[start..].trim_start().len();
+    if leading_len > 0 {
+        text.drain(start..start + leading_len);
+    }
 }
 ```
 
@@ -219,6 +291,7 @@ pub(crate) fn concat_rich_text<R: BufRead>(
 - `convert_xml_error`: verify that an ordinary XML syntax error (e.g. an unclosed tag) converts to `Error::XmlParse` with `path` set correctly
 - `required_attr`: verify it retrieves the value when the attribute is present, and returns `Error::MissingRequiredElement` when absent
 - `concat_rich_text`: verify a single `<t>`, multiple `<r><t>` runs, and input containing `<rPh>` each produce the expected string (exhaustive cases live in [shared_strings.md Testing Strategy](shared_strings.en.md); this file only verifies the wiring)
+- **`concat_rich_text`: verify indentation whitespace between sibling tags in pretty-printed XML is never captured** (Issue #53), **that each `<t>`'s own content is trimmed unless it carries `xml:space="preserve"`, applied per run rather than to the whole concatenated result** (Issue #56), **that a literal `_x000D_` marker is restored to an actual CR** (Issue #57), **that `<t><![CDATA[...]]></t>` content is read**, and **that a raw CRLF/lone-CR line ending in the source is normalized to a single LF, while an explicit `&#13;` character reference is left unnormalized**
 - **`read_event`: verify that feeding a malicious XML payload containing a DOCTYPE declaration and an external entity reference (e.g. `<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>`) returns `Error::DoctypeRejected` the moment `Event::DocType` is detected, and reads no further events** (verifies requirements chapter 2's XXE requirement itself; a regression test for the explicit, verifiable mitigation [the security review](../../security/design-review.en.md) Finding 1 called for, instead of resting on an implicit assumption alone)
 - `read_event`: verify that legitimate XML with no external entity reference and no DOCTYPE declaration (representative of `_rels`/`workbook.xml`/`sharedStrings.xml`/`styles.xml`/`sheetX.xml`) returns events as normal, and `Error::DoctypeRejected` is never raised spuriously (a regression test guarding against false positives on a legitimate `.xlsx`)
 - `read_event`: verify that XML with no DOCTYPE but a syntax error, and input that exceeds `BoundedReader`'s limit, each convert correctly to `Error::XmlParse`/`Error::ZipBombDetected` via `convert_xml_error` (a wiring test confirming error conversion happens before the `Event::DocType` check)

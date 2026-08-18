@@ -5,7 +5,7 @@
 use crate::container::sanitize::SizeLimits;
 use crate::container::ZipContainer;
 use crate::error::Error;
-use crate::model::{Sheet, SheetVisibility, Workbook};
+use crate::model::{Sheet, SheetVisibility, StyleSheet, Workbook};
 use crate::parse::SharedStringTable;
 use crate::{parse, resolve};
 use std::io::{BufReader, Read, Seek};
@@ -68,12 +68,15 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
         .values()
         .find(|r| r.rel_type.ends_with(SHARED_STRINGS_REL_TYPE_SUFFIX))
         .map(|r| r.target.clone());
-    // styles.xml is a mandatory part in OOXML, so its absence is Error::InvalidPackage.
+    // A workbook that applies no cell styling at all is not required by
+    // OOXML to carry a styles.xml part (Issue #54) — real third-party
+    // writers have been observed to omit it entirely, and both Excel and
+    // other readers accept such files by falling back to no styling rather
+    // than rejecting the package.
     let styles_path = relationships
         .values()
         .find(|r| r.rel_type.ends_with(STYLES_REL_TYPE_SUFFIX))
-        .map(|r| r.target.clone())
-        .ok_or_else(|| Error::InvalidPackage("styles relationship not found".to_string()))?;
+        .map(|r| r.target.clone());
 
     // The reader used for the rels read, and the RelationshipMap, go out of
     // scope and are dropped here (implements architecture.md's "dispose of
@@ -92,10 +95,20 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
         // omitted for a workbook with no string cells at all).
         None => SharedStringTable::default(),
     };
-    let styles_reader = container
-        .get_entry(&styles_path)?
-        .ok_or_else(|| Error::InvalidPackage(styles_path.clone()))?;
-    let stylesheet = parse::parse_styles(BufReader::new(styles_reader), &styles_path)?;
+    let stylesheet = match styles_path {
+        Some(path) => {
+            let reader = container
+                .get_entry(&path)?
+                .ok_or_else(|| Error::InvalidPackage(path.clone()))?;
+            parse::parse_styles(BufReader::new(reader), &path)?
+        }
+        // The relationship itself is absent — genuinely no styles.xml part
+        // (as opposed to a relationship pointing at a missing entity, which
+        // stays Error::InvalidPackage above). No cell can reference a
+        // StyleId that was never assigned, so an empty StyleSheet degrades
+        // gracefully rather than erroring.
+        None => StyleSheet::new(),
+    };
 
     // --- Per sheet: Phase 3 (streaming parse) -> Phase 4 (resolution) ---
     let mut sheets = Vec::with_capacity(routes.len());
@@ -386,6 +399,33 @@ mod tests {
         ]);
         let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
         assert!(matches!(err, Error::DanglingRelationship { .. }));
+    }
+
+    #[test]
+    fn missing_styles_relationship_falls_back_to_empty_stylesheet() {
+        // Issue #54: no relationship of type .../relationships/styles at
+        // all — the genuine "this OOXML part is entirely absent" case,
+        // distinct from missing_styles_entity_is_invalid_package below
+        // (where the relationship exists but the target entity doesn't).
+        let rels_without_styles: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#;
+        let plain_sheet: &[u8] = br#"<worksheet><sheetData>
+<row r="1"><c r="A1"><v>1</v></c></row>
+</sheetData></worksheet>"#;
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", rels_without_styles),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/worksheets/sheet1.xml", plain_sheet),
+        ]);
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+        assert_eq!(
+            workbook.sheets()[0]
+                .get(CellRef { row: 1, col: 1 })
+                .unwrap()
+                .value,
+            Some(CellValue::Number(1.0))
+        );
     }
 
     #[test]

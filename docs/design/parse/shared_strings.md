@@ -16,7 +16,8 @@
 
 ```rust
 use crate::error::Error;
-use crate::parse::{concat_rich_text, convert_xml_error, create_secure_reader};
+use crate::parse::{concat_rich_text, create_secure_reader, read_event};
+use quick_xml::events::Event;
 use std::io::BufRead;
 use std::sync::Arc;
 
@@ -40,22 +41,37 @@ impl SharedStringTable {
 }
 
 /// `xl/sharedStrings.xml` をパースし、`SharedStringTable` を構築する。
+/// `<sst>` 直下の各 `<si>` は `concat_rich_text` により1つの文字列へ
+/// 解決される（単純な `<t>`・複数ランのリッチテキスト・空の `<si/>` の
+/// いずれも扱う）。
 pub(crate) fn parse_shared_strings(reader: impl BufRead, path: &str) -> Result<SharedStringTable, Error> {
     let mut xml_reader = create_secure_reader(reader);
     let mut buf = Vec::new();
     let mut strings = Vec::new();
-    // 実装方針: <sst>直下の各<si>開始イベントごとに concat_rich_text を呼び、
-    // 得られた文字列をArc::from()でstringsへ push する。<si>は<r>を複数持つ
-    // リッチテキスト、単一の<t>、またはテキストを持たない空文字列
-    // （空の<si/>）のいずれの形も取りうる。
-    let _ = (&mut xml_reader, path, &mut buf, &mut strings);
-    unimplemented!()
+    loop {
+        let event = read_event(&mut xml_reader, &mut buf, path)?;
+        match &event {
+            Event::Start(e) if e.local_name().as_ref() == b"si" => {
+                buf.clear();
+                let text = concat_rich_text(&mut xml_reader, path)?;
+                strings.push(Arc::from(text));
+                continue;
+            }
+            Event::Empty(e) if e.local_name().as_ref() == b"si" => {
+                strings.push(Arc::from(""));
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(SharedStringTable { strings })
 }
 ```
 
 ## 依存関係
 
-- 依存先: [`parse/mod.rs`](mod.md)（`create_secure_reader`, `convert_xml_error`, `concat_rich_text`）、[`error.rs`](../error.md)。`model/` には依存しない（`SharedStringTable` は `parse/` 固有の中間データ構造であり、`model::CellValue::Text` へは [`resolve/shared_strings.rs`](../resolve/shared_strings.md) が変換する）
+- 依存先: [`parse/mod.rs`](mod.md)（`create_secure_reader`, `read_event`, `concat_rich_text`）、[`error.rs`](../error.md)。`model/` には依存しない（`SharedStringTable` は `parse/` 固有の中間データ構造であり、`model::CellValue::Text` へは [`resolve/shared_strings.rs`](../resolve/shared_strings.md) が変換する）
 - 依存元: [`resolve/shared_strings.rs`](../resolve/shared_strings.md)（`SharedStringTable::get`）、[`resolve/mod.rs`](../resolve/mod.md)（`resolve_sheet` の引数として受け渡す）、`pipeline.rs`（フェーズ1〜3の間で一度だけ構築し、`resolve_sheet` の呼び出しに渡す。architecture.md 「フェーズ4完了時に `SharedStringTable` や `StyleSheet` を破棄する」に従い、全シートの解決が終わった時点で破棄する）
 
 `resolve/shared_strings.rs` が `SharedStringTable` を（`model/` を経由せず）直接 `parse::shared_strings` から `use` する設計は、[resolve/mod.md 依存関係](../resolve/mod.md) が既に「`parse::shared_strings::SharedStringTable` への依存はarchitecture.md設計方針2が禁じる『I/Oへの依存』ではなく『フェーズ3が既に構築済みの、メモリ上の構造化データへの依存』である」と整理していた前提をそのまま実装する。
@@ -78,6 +94,6 @@ pub(crate) fn parse_shared_strings(reader: impl BufRead, path: &str) -> Result<S
 
 ## 未決事項 / オープンクエスチョン
 
-1. **`xml:space` 属性値そのものを分岐せず常に非トリムとする設計の妥当性**: [`parse/mod.rs`](mod.md) の `create_secure_reader` が `trim_text(false)` を既定とするため、本ファイルは `xml:space` の値によらず常に空白を保持する。要求仕様書が明示的に `xml:space="preserve"` の遵守のみを求めている文脈から、値によらない一律非トリムという単純化で要件を満たせると判断しているが、将来 `xml:space="default"` 時に選択的なトリムが必要になった場合は見直す。
+1. ~~`xml:space` 属性値そのものを分岐せず常に非トリムとする設計の妥当性~~ — **解決済み（Issue #56）。** [`parse/mod.rs`](mod.md) の `create_secure_reader` は今も `trim_text(false)` を既定とするが（quick-xml自体は空白のみのテキストノードを無意味なものとして扱わない）、`concat_rich_text` 自身が `<t>` 要素ごとに分岐するようになった——その `<t>` が `xml:space="preserve"` を持たない限り、各ランの前後空白をin-placeでトリムする（Excel自身の慣習に合わせる）。実装は [parse/mod.md](mod.md) の `concat_rich_text`/`trim_tail_in_place` を参照。
 2. **大規模な `sharedStrings.xml`（`uniqueCount` が非常に大きい方眼紙Excel等）に対するメモリ確保戦略**: `<sst count="N" uniqueCount="M">` の `uniqueCount` 属性を先読みし `Vec::with_capacity(M)` による事前確保を行うべきかは、パフォーマンス要件と合わせて確定させる。
 3. **名前空間の扱い**: [parse/mod.md オープンクエスチョン4](mod.md) と同一の論点。`<t>` / `<r>` / `<rPh>` 自体は接頭辞を持たない要素のため、本ファイルへの影響は限定的と見込む。

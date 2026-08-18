@@ -8,7 +8,7 @@
 
 - [`container::ZipContainer`](container/mod.md) を所有し、フェーズ1〜4を通じて `get_entry` を逐次呼び出す（1エントリを読み切ってから次のエントリを取得する。[container/mod.md](container/mod.md) が `get_entry` の型シグネチャで既に強制している逐次アクセスパターンに従う）
 - 呼び出し元（`lib.rs`）から受け取った `SizeLimits`（[lib.md](lib.md)）を `ZipContainer::open_reader` 直後に `with_max_entry_size` / `with_max_total_size`（[container/mod.md](container/mod.md)）へ橋渡しし、Zip Bombサイズ上限を呼び出し側が上書きできるようにする（セキュリティレビュー Finding 2、Issue [#14](https://github.com/MinamiyamaKotaro/xlsxparser/issues/14)）
-- **フェーズ1**: `xl/_rels/workbook.xml.rels` と `xl/workbook.xml` を取得・パースし、シート名・可視性・実体ファイルパスの「ルーティングプラン」を構築する。あわせて `xl/_rels/workbook.xml.rels` 内から `sharedStrings.xml` / `styles.xml` への関係を関係タイプ（`Relationship.rel_type`）で識別する（[relationships.md 含まない責務](parse/relationships.md) が「どの r:id がどのパーツ種別に対応するかの意味づけは呼び出し元の責務」としていた分担を実装する）。本フェーズでは `ParsedWorkbookXml::date1904`(Issue #40)も読み取り、ローカル変数として保持する——`Workbook` のフィールドには決してならず、`StyleSheet`(後述)と同じ「フェーズ間の一時値」として扱う
+- **フェーズ1**: `xl/_rels/workbook.xml.rels` と `xl/workbook.xml` を取得・パースし、シート名・可視性・実体ファイルパスの「ルーティングプラン」を構築する。あわせて `xl/_rels/workbook.xml.rels` 内から `sharedStrings.xml` / `styles.xml` への関係を関係タイプ（`Relationship.rel_type`）で識別する（[relationships.md 含まない責務](parse/relationships.md) が「どの r:id がどのパーツ種別に対応するかの意味づけは呼び出し元の責務」としていた分担を実装する）。いずれの関係も存在しない場合がありうる(`sharedStrings.xml` は以前から任意パーツ扱い、`styles.xml` もIssue #54でこれに合流した——詳細はエラー処理方針参照)。本フェーズでは `ParsedWorkbookXml::date1904`(Issue #40)も読み取り、ローカル変数として保持する——`Workbook` のフィールドには決してならず、`StyleSheet`(後述)と同じ「フェーズ間の一時値」として扱う
 - ルーティングプラン構築後、rels読み込みに使ったリーダーと [`parse::RelationshipMap`](parse/relationships.md) をスコープアウトさせ破棄する（architecture.md「フェーズ1完了時にルーティングマップ構築後、`_rels` の一時バッファを破棄する」の実装）
 - ルーティングプラン確定後、シートループに入る前に [`SharedStringTable`](parse/shared_strings.md) と [`StyleSheet`](model/style.md) を一度だけ構築する
 - シートごとに [`model::Sheet::new`](model/sheet.md) で空シートを構築し、対応するエントリを [`parse::parse_worksheet`](parse/worksheet.md) に渡してストリームでセルを挿入させ（フェーズ3）、その出力を [`resolve::resolve_sheet`](resolve/mod.md) へ渡して解決する（フェーズ4）
@@ -22,6 +22,7 @@ use crate::container::sanitize::SizeLimits;
 use crate::container::ZipContainer;
 use crate::error::Error;
 use crate::model::sheet::{Sheet, SheetVisibility};
+use crate::model::style::StyleSheet;
 use crate::model::workbook::Workbook;
 use crate::parse::shared_strings::SharedStringTable;
 use crate::{container, model, parse, resolve};
@@ -81,12 +82,15 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
         .values()
         .find(|r| r.rel_type.ends_with(SHARED_STRINGS_REL_TYPE_SUFFIX))
         .map(|r| r.target.clone());
-    // styles.xml は OOXML上必須パーツのため見つからない場合は Error::InvalidPackage とする。
+    // セルスタイルを一切使わないワークブックは、OOXML上 styles.xml
+    // パーツを持つことを要求されない(Issue #54)——実際にこれを完全に
+    // 省略する第三者製ツールが確認されており、Excel自身も他の読み込み
+    // ツールも、スタイルなしへフォールバックしてこの種のファイルを
+    // 受理する。
     let styles_path = relationships
         .values()
         .find(|r| r.rel_type.ends_with(STYLES_REL_TYPE_SUFFIX))
-        .map(|r| r.target.clone())
-        .ok_or_else(|| Error::InvalidPackage("styles relationship not found".to_string()))?;
+        .map(|r| r.target.clone());
 
     // rels読み込みに使ったリーダー・RelationshipMapはここでスコープアウトし破棄される
     // （architecture.md「フェーズ1完了時に_relsの一時バッファを破棄する」の実装）。
@@ -104,10 +108,20 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
         // 持たないブックでは省略されうる）。
         None => SharedStringTable::default(),
     };
-    let styles_reader = container
-        .get_entry(&styles_path)?
-        .ok_or_else(|| Error::InvalidPackage(styles_path.clone()))?;
-    let stylesheet = parse::parse_styles(styles_reader, &styles_path)?;
+    let stylesheet = match styles_path {
+        Some(path) => {
+            let reader = container
+                .get_entry(&path)?
+                .ok_or_else(|| Error::InvalidPackage(path.clone()))?;
+            parse::parse_styles(reader, &path)?
+        }
+        // リレーションシップ自体が存在しない——styles.xmlパーツが本当に
+        // 存在しないケース(上記の「リレーションシップは存在するが実体
+        // パーツが欠落」とは異なり、こちらは引き続きエラーのまま)。
+        // 存在しないStyleIdを参照できるセルは無いため、空のStyleSheet
+        // へグレースフルに縮退する(Issue #54)。
+        None => StyleSheet::new(),
+    };
 
     // --- シートごとにフェーズ3（ストリームパース）→フェーズ4（解決）---
     let mut sheets = Vec::with_capacity(routes.len());
@@ -148,9 +162,9 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
 - 各フェーズの失敗を `?` で早期リターンし、後続フェーズを実行しない（[resolve/mod.md](resolve/mod.md) の `resolve_sheet` と同じ fail closed の原則）。1シートでもパース・解決に失敗した場合、それまでに処理済みの他シートを含めて `Workbook` を返さない（部分的に壊れたブックを黙って返さない。オープンクエスチョン4参照）
 - `container::get_entry` が返す `Ok(None)`（エントリ不在）からどの `Error` バリアントを構築するかは、[container/mod.md](container/mod.md) が「呼び出し側の文脈でしか判断できない」としていたとおり本ファイルの責務とする:
   - `xl/_rels/workbook.xml.rels` 不在 → `Error::MissingRelationshipPart`（フェーズ1の必須パーツ）
-  - `xl/workbook.xml` 不在、または rels が指す `styles.xml` の実体パーツが不在 → `Error::InvalidPackage`（OPCパッケージとして必須のパーツを欠く）
+  - `xl/workbook.xml` 不在、または rels が指す `styles.xml`/`sharedStrings.xml` の実体パーツが不在 → `Error::InvalidPackage`(リレーションシップ自体は約束していたパーツが実際には無い——破損・切り詰められたパッケージ)
   - `workbook.xml` の `<sheet r:id="...">` が指す r:id が `RelationshipMap` に存在しない、または rels が指す worksheet の実体パーツが不在 → `Error::DanglingRelationship`
-- `sharedStrings.xml` に対応する関係が見つからない場合はエラーにせず `SharedStringTable::default()`（空テーブル）にフォールバックする（OOXML上の任意パーツであるため。`styles.xml` は必須パーツのため同様のフォールバックは行わない）
+- `sharedStrings.xml` *または* `styles.xml` に対応するリレーションシップ自体が全く見つからない場合(リレーションシップは存在するが対象の実体パーツが欠落している上記のケースとは異なる)はエラーにしない: `sharedStrings.xml` は `SharedStringTable::default()`(空テーブル)、`styles.xml` は `StyleSheet::new()`(空テーブル)へそれぞれフォールバックする——文字列セルを持たないブック/セルスタイルを一切使わないブックは、それぞれのパーツを持つ必要が元々ない。`styles.xml` はIssue #54でこのグレースフルデグラデーション方針に合流した——セルスタイルなしのブックに対してこのパーツを完全に省略する第三者製ツールが実際に確認されており(calamine自身のテストコーパスで検証済み)、有効なはずのパッケージを過度に厳格に拒否していたと判断した
 
 ## テスト方針
 
@@ -161,6 +175,7 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
 - rels 内の styles 関係が指す実体ファイルがZIP内に存在しない場合に `Error::InvalidPackage` を返すことの確認
 - rels 内に worksheet 関係の実体ファイルが存在しない場合に `Error::DanglingRelationship` を返すことの確認
 - `sharedStrings.xml` パーツ自体が存在しない（文字列セルを一切含まない）ブックでもエラーにならず、空の `SharedStringTable` で正常に完走することの確認
+- **`.../relationships/styles` タイプのリレーションシップ自体が全く存在しない(実体パーツが欠落しているのとは異なる)ZIPでも、空の `StyleSheet` へフォールバックして正常に完走することの確認**(Issue #54。直上の `Error::InvalidPackage` ケースとの対比)
 - 複数シートを持つブックで、各シートが `xl/workbook.xml` の `<sheets>` 定義順で `Workbook.sheets()` に格納されることの確認（[model/workbook.md](model/workbook.md) のソース順維持方針との結線）
 - 途中のシート（例: 2枚目）のパースが失敗する場合に、1枚目が正常に処理済みであっても `Workbook` 全体が返らず `Err` になることの確認（fail closed の回帰テスト）
 - 可視性が `Hidden`/`VeryHidden` のシートを含むブックでも、全シートが除外されずに `Workbook` へ含まれることの確認（[model/workbook.md オープンクエスチョン1](model/workbook.md) との結線）
