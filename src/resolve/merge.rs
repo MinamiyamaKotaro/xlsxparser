@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Phase 4: validates the `<mergeCells>` range list before registering it
 //! with `Sheet::insert_merge`.
 

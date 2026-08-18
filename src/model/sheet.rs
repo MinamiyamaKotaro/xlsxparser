@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! `Sheet`: the sparse-matrix data model for a single worksheet, including
 //! transparent merged-cell access.
 

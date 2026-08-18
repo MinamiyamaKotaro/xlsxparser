@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Parses `xl/sharedStrings.xml` into a `SharedStringTable` — the SST index
 //! order (source `<si>` order) is preserved, since `t="s"` cells reference
 //! entries by that index.

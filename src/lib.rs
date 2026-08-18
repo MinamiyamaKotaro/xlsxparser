@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! `xlsxparser` — a lightweight, high-performance `.xlsx` (OOXML) parser
 //! library, purpose-built for the kind of files common in Japanese business
 //! systems: sheets with an extreme number of rows/columns ("grid-paper

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Phase 5: serializes a fully resolved `model::Workbook` to JSON,
 //! streaming cell-by-cell rather than buffering a whole sheet in memory.
 

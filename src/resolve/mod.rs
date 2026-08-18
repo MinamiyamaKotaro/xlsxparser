@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Phase 4: analysis and deferred resolution. I/O-independent — operates
 //! purely on in-memory data (`model::Sheet` and the pending lists Phase 3
 //! built), per `docs/design/architecture.en.md` design principle 2.

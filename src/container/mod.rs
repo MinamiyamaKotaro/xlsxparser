@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! ZIP (OPC) extraction entry point: safe file retrieval guarded against
 //! Zip Slip / Zip Bomb (see [`sanitize`]).
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Orchestrates Phases 1-4 of the pipeline: wires together `container/`,
 //! `parse/`, `resolve/`, and `model/` in call order, and controls resource
 //! lifetimes (see `docs/design/architecture.en.md` design principle 3).

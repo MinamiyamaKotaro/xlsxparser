@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Phase 4: resolves `t="s"` cells' shared-string indices into the actual
 //! string, writing it back into `Sheet`.
 
