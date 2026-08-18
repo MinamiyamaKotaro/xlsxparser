@@ -17,6 +17,52 @@ use std::sync::Arc;
 /// not handled.
 const BUILTIN_DATE_TIME_NUMFMT_IDS: &[u32] = &[14, 15, 16, 17, 18, 19, 20, 21, 22, 45, 46, 47];
 
+/// The built-in format-code strings ECMA-376 Part 1 §18.8.30 defines for
+/// `numFmtId` values 1-49 (Issue #41). `0` ("General") is deliberately
+/// omitted — it resolves to `ResolvedStyle::number_format: None`, the same
+/// "nothing special to report" treatment as an unrecognized ID, rather than
+/// `Some("General")` (see [`resolve_number_format`]). IDs 23-36 and 50-163
+/// are reserved for application/international use with no format code
+/// defined by the spec itself, so they are absent from this table and also
+/// fall back to `None`.
+const BUILTIN_NUMFMT_CODES: &[(u32, &str)] = &[
+    (1, "0"),
+    (2, "0.00"),
+    (3, "#,##0"),
+    (4, "#,##0.00"),
+    (5, "$#,##0_);($#,##0)"),
+    (6, "$#,##0_);[Red]($#,##0)"),
+    (7, "$#,##0.00_);($#,##0.00)"),
+    (8, "$#,##0.00_);[Red]($#,##0.00)"),
+    (9, "0%"),
+    (10, "0.00%"),
+    (11, "0.00E+00"),
+    (12, "# ?/?"),
+    (13, "# ??/??"),
+    (14, "mm-dd-yy"),
+    (15, "d-mmm-yy"),
+    (16, "d-mmm"),
+    (17, "mmm-yy"),
+    (18, "h:mm AM/PM"),
+    (19, "h:mm:ss AM/PM"),
+    (20, "h:mm"),
+    (21, "h:mm:ss"),
+    (22, "m/d/yy h:mm"),
+    (37, "#,##0_);(#,##0)"),
+    (38, "#,##0_);[Red](#,##0)"),
+    (39, "#,##0.00_);(#,##0.00)"),
+    (40, "#,##0.00_);[Red](#,##0.00)"),
+    (41, "_(* #,##0_);_(* (#,##0);_(* \"-\"_);_(@_)"),
+    (42, "_($* #,##0_);_($* (#,##0);_($* \"-\"_);_(@_)"),
+    (43, "_(* #,##0.00_);_(* (#,##0.00);_(* \"-\"??_);_(@_)"),
+    (44, "_($* #,##0.00_);_($* (#,##0.00);_($* \"-\"??_);_(@_)"),
+    (45, "mm:ss"),
+    (46, "[h]:mm:ss"),
+    (47, "mm:ss.0"),
+    (48, "##0.0E+0"),
+    (49, "@"),
+];
+
 /// Parses `xl/styles.xml` and builds a `StyleSheet`. Per ECMA-376 Part 1
 /// §18.8.39 `CT_Stylesheet`'s `xsd:sequence`, `<numFmts>` and `<fonts>` both
 /// always precede `<cellXfs>` in a schema-valid file, so a single streaming
@@ -33,6 +79,10 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
     let mut num_fmts: HashMap<u32, String> = HashMap::new();
     let mut fonts: Vec<Font> = Vec::new();
     let mut stylesheet: StyleSheet = HashMap::new();
+    // Caches the resolved Arc<str> per numFmtId (Issue #41), so a format
+    // code shared by many <xf> entries is allocated at most once per unique
+    // numFmtId rather than once per StyleId.
+    let mut resolved_formats: HashMap<u32, Arc<str>> = HashMap::new();
     let mut in_fonts = false;
     let mut in_cell_xfs = false;
     let mut next_style_id: StyleId = 0;
@@ -130,6 +180,7 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
                     &mut next_style_id,
                     &num_fmts,
                     &fonts,
+                    &mut resolved_formats,
                     numfmt_id,
                     font_id,
                     false,
@@ -142,6 +193,7 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
                         &mut next_style_id,
                         &num_fmts,
                         &fonts,
+                        &mut resolved_formats,
                         xf.numfmt_id,
                         xf.font_id,
                         xf.wrap_text,
@@ -204,21 +256,58 @@ fn push_resolved_style(
     next_style_id: &mut StyleId,
     num_fmts: &HashMap<u32, String>,
     fonts: &[Font],
+    resolved_formats: &mut HashMap<u32, Arc<str>>,
     numfmt_id: u32,
     font_id: usize,
     wrap_text: bool,
 ) {
     let is_date_time = is_date_time_format(numfmt_id, num_fmts.get(&numfmt_id).map(String::as_str));
     let font = fonts.get(font_id).copied().unwrap_or_default();
+    let number_format = resolve_number_format(numfmt_id, num_fmts, resolved_formats);
     stylesheet.insert(
         *next_style_id,
         Arc::new(ResolvedStyle {
             is_date_time,
             font,
             wrap_text,
+            number_format,
         }),
     );
     *next_style_id += 1;
+}
+
+/// Resolves `numfmt_id` to its format-code string (Issue #41), same ID-range
+/// partition `is_date_time_format` already uses: `numfmt_id < 164` looks up
+/// [`BUILTIN_NUMFMT_CODES`], `numfmt_id >= 164` looks up `num_fmts` (built
+/// from `<numFmts>`) — per ECMA-376, a custom format is never assigned an ID
+/// below 164, so there is no precedence question between the two sources.
+/// `None` for `numFmtId=0` ("General") or any ID found in neither table
+/// (graceful degradation, matching `is_date_time_format`'s policy for an
+/// unresolvable ID).
+///
+/// `resolved_formats` caches the `Arc<str>` per `numfmt_id`, so a format
+/// code shared by many `<xf>` entries (and thus many `StyleId`s) is only
+/// ever allocated once per unique `numfmt_id` in the file, not once per
+/// `StyleId` — the performance requirement Issue #41 states explicitly.
+fn resolve_number_format(
+    numfmt_id: u32,
+    num_fmts: &HashMap<u32, String>,
+    resolved_formats: &mut HashMap<u32, Arc<str>>,
+) -> Option<Arc<str>> {
+    if let Some(cached) = resolved_formats.get(&numfmt_id) {
+        return Some(cached.clone());
+    }
+    let code = if numfmt_id < 164 {
+        BUILTIN_NUMFMT_CODES
+            .iter()
+            .find(|(id, _)| *id == numfmt_id)
+            .map(|(_, code)| *code)
+    } else {
+        num_fmts.get(&numfmt_id).map(String::as_str)
+    }?;
+    let arc: Arc<str> = Arc::from(code);
+    resolved_formats.insert(numfmt_id, arc.clone());
+    Some(arc)
 }
 
 /// Classifies whether the format identified by `numfmt_id` — and, for a
@@ -532,6 +621,58 @@ mod tests {
             }
         );
         assert!(sheet[&0].wrap_text);
+    }
+
+    #[test]
+    fn builtin_numfmt_resolves_expected_code() {
+        let xml = br#"<styleSheet><cellXfs><xf numFmtId="9"/></cellXfs></styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].number_format.as_deref(), Some("0%"));
+    }
+
+    #[test]
+    fn custom_numfmt_resolves_from_num_fmts() {
+        let xml = br##"<styleSheet>
+<numFmts><numFmt numFmtId="164" formatCode="#,##0.00"/></numFmts>
+<cellXfs><xf numFmtId="164"/></cellXfs>
+</styleSheet>"##;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].number_format.as_deref(), Some("#,##0.00"));
+    }
+
+    #[test]
+    fn general_and_missing_and_unknown_numfmt_id_resolve_to_none() {
+        let xml = br#"<styleSheet><cellXfs>
+<xf numFmtId="0"/>
+<xf/>
+<xf numFmtId="30"/>
+<xf numFmtId="999"/>
+</cellXfs></styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].number_format, None);
+        assert_eq!(sheet[&1].number_format, None);
+        assert_eq!(sheet[&2].number_format, None);
+        assert_eq!(sheet[&3].number_format, None);
+    }
+
+    #[test]
+    fn date_time_style_still_carries_its_number_format() {
+        let xml = br#"<styleSheet><cellXfs><xf numFmtId="14"/></cellXfs></styleSheet>"#;
+        let sheet = parse(xml);
+        assert!(sheet[&0].is_date_time);
+        assert_eq!(sheet[&0].number_format.as_deref(), Some("mm-dd-yy"));
+    }
+
+    #[test]
+    fn same_numfmt_id_across_styles_shares_the_arc() {
+        let xml = br#"<styleSheet>
+<fonts count="2"><font><sz val="11"/></font><font><b/><sz val="14"/></font></fonts>
+<cellXfs><xf numFmtId="9" fontId="0"/><xf numFmtId="9" fontId="1"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        let a = sheet[&0].number_format.as_ref().unwrap();
+        let b = sheet[&1].number_format.as_ref().unwrap();
+        assert!(Arc::ptr_eq(a, b));
     }
 
     #[test]

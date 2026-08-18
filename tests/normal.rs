@@ -43,6 +43,43 @@ fn wrap_text_resolves_per_cell_and_serializes_nested_under_style() {
 }
 
 #[test]
+fn number_format_resolves_per_cell_and_serializes_nested_under_style() {
+    let workbook = parse_workbook_reader(Cursor::new(normal::number_format_styles())).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    assert_eq!(
+        sheet
+            .get(CellRef { row: 1, col: 1 })
+            .unwrap()
+            .style
+            .as_ref()
+            .unwrap()
+            .number_format
+            .as_deref(),
+        Some("0%")
+    );
+    assert_eq!(
+        sheet
+            .get(CellRef { row: 1, col: 2 })
+            .unwrap()
+            .style
+            .as_ref()
+            .unwrap()
+            .number_format
+            .as_deref(),
+        Some("#,##0.00 \"円\"")
+    );
+
+    let json = to_json_string(&workbook).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let cells = parsed["sheets"][0]["cells"].as_array().unwrap();
+    let a1 = cells.iter().find(|c| c["col"] == 1).unwrap();
+    let b1 = cells.iter().find(|c| c["col"] == 2).unwrap();
+    assert_eq!(a1["style"]["numberFormat"], "0%");
+    assert_eq!(b1["style"]["numberFormat"], "#,##0.00 \"円\"");
+}
+
+#[test]
 fn font_size_and_bold_resolve_per_cell_and_serialize_nested_under_style() {
     let workbook = parse_workbook_reader(Cursor::new(normal::font_styles())).unwrap();
     let sheet = &workbook.sheets()[0];

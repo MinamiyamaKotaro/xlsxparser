@@ -111,6 +111,45 @@ pub fn font_styles() -> Vec<u8> {
     ])
 }
 
+/// Two cells: A1 styled with a built-in percentage format (`numFmtId="9"`,
+/// `"0%"`), B1 styled with a custom currency-ish format declared in
+/// `<numFmts>`. Verifies built-in and custom `numFmtId` resolution and the
+/// per-cell `style.numberFormat` JSON output end to end (Issue #41).
+pub fn number_format_styles() -> Vec<u8> {
+    let rows = r#"<row r="1">
+  <c r="A1" s="0"><v>0.5</v></c>
+  <c r="B1" s="1"><v>1234.5</v></c>
+</row>"#;
+
+    let styles = r##"<styleSheet>
+<numFmts><numFmt numFmtId="164" formatCode="#,##0.00 &quot;円&quot;"/></numFmts>
+<cellXfs>
+<xf numFmtId="9"/>
+<xf numFmtId="164"/>
+</cellXfs>
+</styleSheet>"##;
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "styles", "styles.xml"),
+            ])
+            .as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        ("xl/styles.xml", styles.as_bytes()),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(rows, "").as_bytes(),
+        ),
+    ])
+}
+
 /// A sheet with `<cols>` declaring two width ranges (one covering columns
 /// A-C, one covering just E) plus `<sheetFormatPr defaultColWidth="..">`
 /// for every other column, alongside a couple of populated cells. Verifies
