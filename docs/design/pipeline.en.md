@@ -8,7 +8,7 @@ Design doc for `src/pipeline.rs`. This is the orchestrator for the 5-phase pipel
 
 - Owns a [`container::ZipContainer`](container/mod.en.md) and calls `get_entry` sequentially throughout Phases 1–4 (fully consuming one entry before fetching the next — following the sequential-access pattern [container/mod.md](container/mod.en.md) already enforces via `get_entry`'s type signature)
 - Forwards the `SizeLimits` ([lib.md](lib.en.md)) received from the caller (`lib.rs`) into `with_max_entry_size` / `with_max_total_size` ([container/mod.md](container/mod.en.md)) right after `ZipContainer::open_reader`, so callers can override the Zip Bomb size caps (security review Finding 2, Issue [#14](https://github.com/MinamiyamaKotaro/xlsxparser/issues/14))
-- **Phase 1**: fetches and parses `xl/_rels/workbook.xml.rels` and `xl/workbook.xml`, building a "routing plan" of sheet names, visibility, and backing file paths. It also identifies the relationships to `sharedStrings.xml` / `styles.xml` within `xl/_rels/workbook.xml.rels` by relationship type (`Relationship.rel_type`) — implementing the division of labor [relationships.md Not Responsible For](parse/relationships.en.md) assigned to the caller: "which `r:id` corresponds to which part kind is the caller's job". This phase also reads `ParsedWorkbookXml::date1904` (Issue #40) and holds it in a local variable — it never becomes a field on `Workbook`, following the same "phase-transient value" treatment `StyleSheet` gets (see below)
+- **Phase 1**: fetches and parses `xl/_rels/workbook.xml.rels` and `xl/workbook.xml`, building a "routing plan" of sheet names, visibility, and backing file paths. It also identifies the relationships to `sharedStrings.xml` / `styles.xml` within `xl/_rels/workbook.xml.rels` by relationship type (`Relationship.rel_type`) — implementing the division of labor [relationships.md Not Responsible For](parse/relationships.en.md) assigned to the caller: "which `r:id` corresponds to which part kind is the caller's job". A workbook may have neither relationship (`sharedStrings.xml` has always been treated as optional; `styles.xml` joined it as of Issue #54 — see Error Handling Policy). This phase also reads `ParsedWorkbookXml::date1904` (Issue #40) and holds it in a local variable — it never becomes a field on `Workbook`, following the same "phase-transient value" treatment `StyleSheet` gets (see below)
 - Once the routing plan is built, lets the reader used for the rels read and the [`parse::RelationshipMap`](parse/relationships.en.md) go out of scope and be dropped (implements architecture.md's "dispose of the `_rels` scratch buffer immediately once the routing map is built at the end of Phase 1")
 - Once the routing plan is finalized, builds the [`SharedStringTable`](parse/shared_strings.en.md) and [`StyleSheet`](model/style.en.md) exactly once, before entering the per-sheet loop
 - For each sheet, builds an empty sheet via [`model::Sheet::new`](model/sheet.en.md), passes the corresponding entry to [`parse::parse_worksheet`](parse/worksheet.en.md) to stream cells into it (Phase 3), then passes that output to [`resolve::resolve_sheet`](resolve/mod.en.md) to resolve it (Phase 4)
@@ -22,6 +22,7 @@ use crate::container::sanitize::SizeLimits;
 use crate::container::ZipContainer;
 use crate::error::Error;
 use crate::model::sheet::{Sheet, SheetVisibility};
+use crate::model::style::StyleSheet;
 use crate::model::workbook::Workbook;
 use crate::parse::shared_strings::SharedStringTable;
 use crate::{container, model, parse, resolve};
@@ -83,12 +84,15 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
         .values()
         .find(|r| r.rel_type.ends_with(SHARED_STRINGS_REL_TYPE_SUFFIX))
         .map(|r| r.target.clone());
-    // styles.xml is a mandatory part in OOXML, so its absence is Error::InvalidPackage.
+    // A workbook that applies no cell styling at all is not required by
+    // OOXML to carry a styles.xml part (Issue #54) — real third-party
+    // writers have been observed to omit it entirely, and both Excel and
+    // other readers accept such files by falling back to no styling rather
+    // than rejecting the package.
     let styles_path = relationships
         .values()
         .find(|r| r.rel_type.ends_with(STYLES_REL_TYPE_SUFFIX))
-        .map(|r| r.target.clone())
-        .ok_or_else(|| Error::InvalidPackage("styles relationship not found".to_string()))?;
+        .map(|r| r.target.clone());
 
     // The reader used for the rels read, and the RelationshipMap, go out of
     // scope and are dropped here (implements architecture.md's "dispose of
@@ -107,10 +111,20 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
         // omitted for a workbook with no string cells at all).
         None => SharedStringTable::default(),
     };
-    let styles_reader = container
-        .get_entry(&styles_path)?
-        .ok_or_else(|| Error::InvalidPackage(styles_path.clone()))?;
-    let stylesheet = parse::parse_styles(styles_reader, &styles_path)?;
+    let stylesheet = match styles_path {
+        Some(path) => {
+            let reader = container
+                .get_entry(&path)?
+                .ok_or_else(|| Error::InvalidPackage(path.clone()))?;
+            parse::parse_styles(reader, &path)?
+        }
+        // The relationship itself is absent — genuinely no styles.xml part
+        // (as opposed to a relationship pointing at a missing entity, which
+        // stays Error::InvalidPackage above). No cell can reference a
+        // StyleId that was never assigned, so an empty StyleSheet degrades
+        // gracefully rather than erroring (Issue #54).
+        None => StyleSheet::new(),
+    };
 
     // --- Per sheet: Phase 3 (streaming parse) -> Phase 4 (resolution) ---
     let mut sheets = Vec::with_capacity(routes.len());
@@ -151,9 +165,9 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
 - Each phase's failure short-circuits via `?`; no later phase runs (the same fail-closed principle as [resolve/mod.md](resolve/mod.en.md)'s `resolve_sheet`). If even one sheet fails to parse or resolve, `run` never returns a `Workbook`, even a partial one covering the sheets already processed successfully (never silently returns a partially broken book — see Open Question 4)
 - Which `Error` variant to construct from `Ok(None)` (a missing entry) returned by `container::get_entry` is this file's responsibility, per [container/mod.md](container/mod.en.md)'s statement that "only the caller's context can tell":
   - `xl/_rels/workbook.xml.rels` absent → `Error::MissingRelationshipPart` (a mandatory Phase 1 part)
-  - `xl/workbook.xml` absent, or the `styles.xml` part a relationship points to is absent → `Error::InvalidPackage` (a mandatory OPC package part is missing)
+  - `xl/workbook.xml` absent, or the `styles.xml`/`sharedStrings.xml` part a *relationship* points to is absent → `Error::InvalidPackage` (the relationship promised a part that isn't there — a corrupt or truncated package)
   - the r:id a `workbook.xml` `<sheet r:id="...">` points to is not found in the `RelationshipMap`, or the worksheet part a relationship points to is absent → `Error::DanglingRelationship`
-- If no relationship for `sharedStrings.xml` is found, this is not an error — it falls back to `SharedStringTable::default()` (an empty table), since that part is optional in OOXML. `styles.xml` is mandatory, so no such fallback applies there
+- If no relationship for `sharedStrings.xml` *or* `styles.xml` is found at all — as opposed to a relationship existing but its target entity being missing, the case above — this is not an error: `sharedStrings.xml` falls back to `SharedStringTable::default()` (an empty table), and `styles.xml` falls back to `StyleSheet::new()` (an empty table), since both are optional OOXML parts a workbook with no string cells / no cell styling respectively is not required to carry. `styles.xml` joined this graceful-degradation treatment as of Issue #54 — real third-party `.xlsx` writers have been observed to omit it entirely for unstyled workbooks, and rejecting such an otherwise-valid package was an unnecessarily strict reading of the spec (verified against calamine's own real-file test corpus, which includes exactly this case)
 
 ## Testing Strategy
 
@@ -163,6 +177,7 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
 - Verify that returns `Error::DanglingRelationship` when a `workbook.xml` `<sheet r:id="...">`'s r:id is not found in the rels
 - Verify that returns `Error::InvalidPackage` when the entity file the styles relationship in rels points to is absent from the ZIP
 - Verify that returns `Error::DanglingRelationship` when the entity file a worksheet relationship points to is absent from the ZIP
+- **Verify that a ZIP with no relationship of type `.../relationships/styles` at all (as opposed to a relationship whose target entity is missing) still resolves successfully, falling back to an empty `StyleSheet`** (Issue #54 — distinct from the `Error::InvalidPackage` case immediately above)
 - Verify that a book with no `sharedStrings.xml` part at all (no string cells whatsoever) still completes successfully with an empty `SharedStringTable`, rather than erroring
 - Verify that for a book with multiple sheets, each ends up in `Workbook.sheets()` in the order `xl/workbook.xml`'s `<sheets>` defines them (wiring to [model/workbook.md](model/workbook.en.md)'s source-order policy)
 - Verify that if a later sheet (e.g. the second) fails to parse, the whole call returns `Err` rather than a `Workbook`, even though the first sheet was processed successfully (a regression test for fail-closed behavior)

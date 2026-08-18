@@ -16,7 +16,8 @@ Design doc for `src/parse/shared_strings.rs`. Per [architecture.md](../architect
 
 ```rust
 use crate::error::Error;
-use crate::parse::{concat_rich_text, convert_xml_error, create_secure_reader};
+use crate::parse::{concat_rich_text, create_secure_reader, read_event};
+use quick_xml::events::Event;
 use std::io::BufRead;
 use std::sync::Arc;
 
@@ -40,23 +41,37 @@ impl SharedStringTable {
     }
 }
 
-/// Parses `xl/sharedStrings.xml` and builds a `SharedStringTable`.
+/// Parses `xl/sharedStrings.xml` and builds a `SharedStringTable`. Each
+/// `<si>` under `<sst>` resolves to a single string via `concat_rich_text`
+/// (plain `<t>`, rich-text runs, or empty for a bare `<si/>`).
 pub(crate) fn parse_shared_strings(reader: impl BufRead, path: &str) -> Result<SharedStringTable, Error> {
     let mut xml_reader = create_secure_reader(reader);
     let mut buf = Vec::new();
     let mut strings = Vec::new();
-    // Implementation plan: for each <si> start event directly under <sst>,
-    // call concat_rich_text and push the resulting string onto `strings` via
-    // Arc::from(). An <si> may be rich text with multiple <r>, a single
-    // <t>, or hold no text at all (an empty <si/>).
-    let _ = (&mut xml_reader, path, &mut buf, &mut strings);
-    unimplemented!()
+    loop {
+        let event = read_event(&mut xml_reader, &mut buf, path)?;
+        match &event {
+            Event::Start(e) if e.local_name().as_ref() == b"si" => {
+                buf.clear();
+                let text = concat_rich_text(&mut xml_reader, path)?;
+                strings.push(Arc::from(text));
+                continue;
+            }
+            Event::Empty(e) if e.local_name().as_ref() == b"si" => {
+                strings.push(Arc::from(""));
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(SharedStringTable { strings })
 }
 ```
 
 ## Dependencies
 
-- Depends on: [`parse/mod.rs`](mod.en.md) (`create_secure_reader`, `convert_xml_error`, `concat_rich_text`), [`error.rs`](../error.en.md). No dependency on `model/` — `SharedStringTable` is a `parse/`-internal intermediate data structure; converting to `model::CellValue::Text` is [`resolve/shared_strings.rs`](../resolve/shared_strings.en.md)'s job
+- Depends on: [`parse/mod.rs`](mod.en.md) (`create_secure_reader`, `read_event`, `concat_rich_text`), [`error.rs`](../error.en.md). No dependency on `model/` — `SharedStringTable` is a `parse/`-internal intermediate data structure; converting to `model::CellValue::Text` is [`resolve/shared_strings.rs`](../resolve/shared_strings.en.md)'s job
 - Depended on by: [`resolve/shared_strings.rs`](../resolve/shared_strings.en.md) (`SharedStringTable::get`), [`resolve/mod.rs`](../resolve/mod.en.md) (passed through as an argument to `resolve_sheet`), `pipeline.rs` (built once between Phases 1–3 and passed into every `resolve_sheet` call; per architecture.md — "`SharedStringTable` and `StyleSheet` are discarded once Phase 4 completes" — it is dropped once every sheet has finished resolving)
 
 `resolve/shared_strings.rs` importing `SharedStringTable` directly from `parse::shared_strings` (bypassing `model/`) is exactly the implementation of what [resolve/mod.md Dependencies](../resolve/mod.en.md) had already reasoned through: "the dependency on `parse::shared_strings::SharedStringTable` is not the 'dependency on I/O' that architecture.md design policy 2 forbids — it's a dependency on structured, in-memory data that Phase 3 has already built."
@@ -79,6 +94,6 @@ pub(crate) fn parse_shared_strings(reader: impl BufRead, path: &str) -> Result<S
 
 ## Open Questions
 
-1. **Soundness of always preserving whitespace instead of branching on the `xml:space` attribute's value**: because [`parse/mod.rs`](mod.en.md)'s `create_secure_reader` defaults to `trim_text(false)`, this file preserves whitespace unconditionally regardless of `xml:space`'s value. Given the requirements only explicitly call for honoring `xml:space="preserve"`, this unconditional-preserve simplification is judged sufficient — but it may need revisiting if selective trimming under `xml:space="default"` turns out to be required.
+1. ~~Soundness of always preserving whitespace instead of branching on the `xml:space` attribute's value~~ — **Resolved (Issue #56).** [`parse/mod.rs`](mod.en.md)'s `create_secure_reader` still defaults to `trim_text(false)` (quick-xml never sees whitespace-only text nodes as insignificant), but `concat_rich_text` itself now branches per-`<t>` element: it trims each run's leading/trailing whitespace in place unless that specific `<t>` carries `xml:space="preserve"`, matching Excel's own convention. See [parse/mod.md](mod.en.md)'s `concat_rich_text`/`trim_tail_in_place` for the implementation.
 2. **Memory-allocation strategy for a large `sharedStrings.xml`** (e.g. a "grid-paper Excel" file with a very large `uniqueCount`): whether to pre-read the `<sst count="N" uniqueCount="M">` element's `uniqueCount` attribute and pre-allocate via `Vec::with_capacity(M)` is to be settled together with performance requirements.
 3. **Namespace handling**: same topic as [parse/mod.md Open Question 4](mod.en.md). `<t>` / `<r>` / `<rPh>` themselves carry no prefix, so this file is expected to be affected minimally.
