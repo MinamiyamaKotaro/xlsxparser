@@ -402,6 +402,21 @@ mod tests {
     }
 
     #[test]
+    fn alignment_tag_covers_every_variant() {
+        assert_eq!(alignment_tag(Alignment::General), "general");
+        assert_eq!(alignment_tag(Alignment::Left), "left");
+        assert_eq!(alignment_tag(Alignment::Center), "center");
+        assert_eq!(alignment_tag(Alignment::Right), "right");
+        assert_eq!(alignment_tag(Alignment::Fill), "fill");
+        assert_eq!(alignment_tag(Alignment::Justify), "justify");
+        assert_eq!(
+            alignment_tag(Alignment::CenterContinuous),
+            "centerContinuous"
+        );
+        assert_eq!(alignment_tag(Alignment::Distributed), "distributed");
+    }
+
+    #[test]
     fn unstyled_cell_omits_the_style_field_entirely() {
         let sheet = sheet_with_one_cell("Sheet1", Some(CellValue::Number(1.0)));
         let workbook = Workbook::new(vec![sheet]);
