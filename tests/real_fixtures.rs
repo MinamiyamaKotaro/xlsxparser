@@ -255,3 +255,34 @@ fn real_extreme_sparse_xlsx_registers_only_the_two_populated_cells() {
     );
     assert_eq!(sheet.iter_cells().count(), 2);
 }
+
+#[test]
+fn real_styled_fill_color_xlsx_resolves_rgb_and_theme_fills() {
+    use xlsxparser::ColorRef;
+
+    let workbook = parse_workbook(fixture_path("complex/styled_fill_color.xlsx")).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    // scripts/generate_real_fixtures.py's styled_fill_color(): A1 an RGB
+    // solid fill, A2 a theme+tint solid fill, A3 no fill at all.
+    let a1 = sheet.get(CellRef { row: 1, col: 1 }).unwrap();
+    assert_eq!(
+        a1.style.as_ref().unwrap().fill_fg_color,
+        Some(ColorRef::Rgb(Arc::from("FFFF0000")))
+    );
+
+    let a2 = sheet.get(CellRef { row: 2, col: 1 }).unwrap();
+    assert_eq!(
+        a2.style.as_ref().unwrap().fill_fg_color,
+        Some(ColorRef::Theme {
+            index: 4,
+            tint: Some(-0.25)
+        })
+    );
+
+    let a3 = sheet.get(CellRef { row: 3, col: 1 }).unwrap();
+    // A3 carries no explicit style at all (openpyxl omits the `s` attribute
+    // for the default style), so it has no fill color to report either.
+    let a3_fill_fg = a3.style.as_ref().and_then(|s| s.fill_fg_color.clone());
+    assert_eq!(a3_fill_fg, None);
+}
