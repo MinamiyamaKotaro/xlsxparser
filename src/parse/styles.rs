@@ -1,14 +1,16 @@
 // SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Parses `xl/styles.xml`'s `<numFmts>`/`<fonts>`/`<cellXfs>` into a
-//! `StyleSheet` (`cellXfs` index -> `ResolvedStyle`), classifying each
-//! format as date/time or not and resolving each `<xf>`'s font/wrap-text.
+//! Parses `xl/styles.xml`'s `<numFmts>`/`<fonts>`/`<fills>`/`<cellXfs>` into
+//! a `StyleSheet` (`cellXfs` index -> `ResolvedStyle`), classifying each
+//! format as date/time or not and resolving each `<xf>`'s font/wrap-text/
+//! fill color.
 
 use crate::error::Error;
-use crate::model::{Alignment, Font, ResolvedStyle, StyleId, StyleSheet};
+use crate::model::{Alignment, ColorRef, Font, ResolvedStyle, StyleId, StyleSheet};
 use crate::parse::{create_secure_reader, optional_attr, read_event, required_attr};
 use quick_xml::events::{BytesStart, Event};
+use quick_xml::Reader;
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::sync::Arc;
@@ -81,12 +83,14 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
     let mut buf = Vec::new();
     let mut num_fmts: HashMap<u32, String> = HashMap::new();
     let mut fonts: Vec<Font> = Vec::new();
+    let mut fills: Vec<Fill> = Vec::new();
     let mut stylesheet: StyleSheet = HashMap::new();
     // Caches the resolved Arc<str> per numFmtId (Issue #41), so a format
     // code shared by many <xf> entries is allocated at most once per unique
     // numFmtId rather than once per StyleId.
     let mut resolved_formats: HashMap<u32, Arc<str>> = HashMap::new();
     let mut in_fonts = false;
+    let mut in_fills = false;
     let mut in_cell_xfs = false;
     let mut next_style_id: StyleId = 0;
 
@@ -124,6 +128,21 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
                 if let Some(font) = cur_font.take() {
                     fonts.push(font);
                 }
+            }
+            Event::Start(e) if e.local_name().as_ref() == b"fills" => {
+                in_fills = true;
+            }
+            Event::End(e) if e.local_name().as_ref() == b"fills" => {
+                in_fills = false;
+            }
+            // <fill> always wraps a <patternFill> (or <gradientFill>, not
+            // handled here — Issue #75's stated scope is patternFill's
+            // solid fgColor/bgColor only) per ECMA-376's CT_Fill, so it
+            // never self-closes in practice; only the Start form is
+            // handled, the same "Start always has children" assumption
+            // <font>'s own Empty-vs-Start split already makes explicit.
+            Event::Start(e) if in_fills && e.local_name().as_ref() == b"fill" => {
+                fills.push(parse_fill_body(&mut xml_reader, path)?);
             }
             Event::Start(e) | Event::Empty(e)
                 if cur_font.is_some() && e.local_name().as_ref() == b"sz" =>
@@ -169,24 +188,27 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
             // ResolvedStyle itself is only built at End (or immediately for
             // the self-closing form, where no child could follow).
             Event::Start(e) if in_cell_xfs && e.local_name().as_ref() == b"xf" => {
-                let (numfmt_id, font_id) = read_xf_ids(e, path)?;
+                let (numfmt_id, font_id, fill_id) = read_xf_ids(e, path)?;
                 cur_xf = Some(CurXf {
                     numfmt_id,
                     font_id,
+                    fill_id,
                     wrap_text: false,
                     horizontal_alignment: Alignment::General,
                 });
             }
             Event::Empty(e) if in_cell_xfs && e.local_name().as_ref() == b"xf" => {
-                let (numfmt_id, font_id) = read_xf_ids(e, path)?;
+                let (numfmt_id, font_id, fill_id) = read_xf_ids(e, path)?;
                 push_resolved_style(
                     &mut stylesheet,
                     &mut next_style_id,
                     &num_fmts,
                     &fonts,
+                    &fills,
                     &mut resolved_formats,
                     numfmt_id,
                     font_id,
+                    fill_id,
                     false,
                     Alignment::General,
                 );
@@ -198,9 +220,11 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
                         &mut next_style_id,
                         &num_fmts,
                         &fonts,
+                        &fills,
                         &mut resolved_formats,
                         xf.numfmt_id,
                         xf.font_id,
+                        xf.fill_id,
                         xf.wrap_text,
                         xf.horizontal_alignment,
                     );
@@ -245,27 +269,100 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
     Ok(stylesheet)
 }
 
+/// One `<fill>` entry (Issue #75) — its `<patternFill>`'s `fgColor`/
+/// `bgColor`, in the same raw/unresolved form `model::ColorRef` keeps them
+/// in. Not exposed outside this module: `ResolvedStyle` holds `fg`/`bg`
+/// flattened directly rather than nesting a `Fill` type, the same choice
+/// `Font`/`Alignment` already made over exposing `<xf>`'s own shape.
+#[derive(Debug, Clone, Default)]
+struct Fill {
+    fg_color: Option<ColorRef>,
+    bg_color: Option<ColorRef>,
+}
+
+/// Parses one `<fill>...</fill>` body (after its start tag has already
+/// been consumed by the caller) into its `fgColor`/`bgColor`, mirroring
+/// `parse/drawing.rs::parse_marker`'s "own local buffer, read until my own
+/// closing tag" pattern for a sub-element scan nested inside the outer
+/// streaming loop.
+fn parse_fill_body(reader: &mut Reader<impl BufRead>, path: &str) -> Result<Fill, Error> {
+    let mut buf = Vec::new();
+    let mut fg_color = None;
+    let mut bg_color = None;
+    loop {
+        match read_event(reader, &mut buf, path)? {
+            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"fgColor" => {
+                fg_color = parse_color(&e, path)?;
+            }
+            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"bgColor" => {
+                bg_color = parse_color(&e, path)?;
+            }
+            Event::End(e) if e.local_name().as_ref() == b"fill" => break,
+            Event::Eof => {
+                return Err(Error::MissingRequiredElement {
+                    path: path.to_string(),
+                    name: "closing fill tag",
+                })
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(Fill { fg_color, bg_color })
+}
+
+/// Parses a `<fgColor>`/`<bgColor>` element into a `ColorRef`, per its
+/// three mutually-exclusive representations (ECMA-376 Part 1 §18.3.1.15
+/// `CT_Color`): `rgb` is checked first since it needs no further
+/// resolution, then `theme` (with `tint` read off the same start tag if
+/// present), then `indexed`. `None` when the element carries none of the
+/// three (e.g. an `auto="1"` color, which this library doesn't resolve —
+/// there is no concrete value to keep).
+fn parse_color(e: &BytesStart<'_>, path: &str) -> Result<Option<ColorRef>, Error> {
+    if let Some(rgb) = optional_attr(e, path, "rgb")? {
+        return Ok(Some(ColorRef::Rgb(Arc::from(rgb.as_str()))));
+    }
+    if let Some(theme_str) = optional_attr(e, path, "theme")? {
+        let Ok(index) = theme_str.parse() else {
+            return Ok(None);
+        };
+        let tint = optional_attr(e, path, "tint")?.and_then(|t| t.parse().ok());
+        return Ok(Some(ColorRef::Theme { index, tint }));
+    }
+    if let Some(indexed_str) = optional_attr(e, path, "indexed")? {
+        let Ok(index) = indexed_str.parse() else {
+            return Ok(None);
+        };
+        return Ok(Some(ColorRef::Indexed(index)));
+    }
+    Ok(None)
+}
+
 /// The `<xf>` currently being read (between its start and end tag, when it
 /// isn't self-closing) — mirrors `cur_font`'s pattern.
 struct CurXf {
     numfmt_id: u32,
     font_id: usize,
+    fill_id: usize,
     wrap_text: bool,
     horizontal_alignment: Alignment,
 }
 
-/// Reads `numFmtId`/`fontId` off an `<xf>` start tag. Both are optional;
-/// absent, unparseable, or (for `fontId`) out of range against the parsed
-/// `<fonts>` list all degrade gracefully rather than erroring — resolved
-/// by `push_resolved_style`.
-fn read_xf_ids(e: &BytesStart<'_>, path: &str) -> Result<(u32, usize), Error> {
+/// Reads `numFmtId`/`fontId`/`fillId` off an `<xf>` start tag. All three are
+/// optional; absent, unparseable, or (for `fontId`/`fillId`) out of range
+/// against the parsed `<fonts>`/`<fills>` list all degrade gracefully
+/// rather than erroring — resolved by `push_resolved_style`.
+fn read_xf_ids(e: &BytesStart<'_>, path: &str) -> Result<(u32, usize, usize), Error> {
     let numfmt_id = optional_attr(e, path, "numFmtId")?
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
     let font_id = optional_attr(e, path, "fontId")?
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
-    Ok((numfmt_id, font_id))
+    let fill_id = optional_attr(e, path, "fillId")?
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    Ok((numfmt_id, font_id, fill_id))
 }
 
 /// Resolves one `<xf>`'s `ResolvedStyle` and inserts it at `next_style_id`
@@ -277,15 +374,22 @@ fn push_resolved_style(
     next_style_id: &mut StyleId,
     num_fmts: &HashMap<u32, String>,
     fonts: &[Font],
+    fills: &[Fill],
     resolved_formats: &mut HashMap<u32, Arc<str>>,
     numfmt_id: u32,
     font_id: usize,
+    fill_id: usize,
     wrap_text: bool,
     horizontal_alignment: Alignment,
 ) {
     let is_date_time = is_date_time_format(numfmt_id, num_fmts.get(&numfmt_id).map(String::as_str));
     let font = fonts.get(font_id).copied().unwrap_or_default();
     let number_format = resolve_number_format(numfmt_id, num_fmts, resolved_formats);
+    // fills is indexed directly by fillId, the same as fonts is by fontId —
+    // no separate resolved_formats-style cache is needed here, since
+    // ColorRef::Rgb's Arc<str> already makes this clone a refcount bump
+    // rather than a fresh allocation (Issue #75 review discussion).
+    let fill = fills.get(fill_id).cloned().unwrap_or_default();
     stylesheet.insert(
         *next_style_id,
         Arc::new(ResolvedStyle {
@@ -294,6 +398,8 @@ fn push_resolved_style(
             wrap_text,
             horizontal_alignment,
             number_format,
+            fill_fg_color: fill.fg_color,
+            fill_bg_color: fill.bg_color,
         }),
     );
     *next_style_id += 1;
@@ -766,5 +872,198 @@ mod tests {
         assert!(!sheet[&0].wrap_text);
         assert!(sheet[&1].wrap_text);
         assert!(!sheet[&2].wrap_text);
+    }
+
+    #[test]
+    fn fill_with_no_pattern_color_resolves_to_no_fill_color() {
+        // patternType="none"/"gray125" with no fgColor/bgColor children at
+        // all — real writers (openpyxl, Excel) always emit fillId 0/1 this
+        // way for "no fill"/the default hatching swatch.
+        let xml = br#"<styleSheet>
+<fills count="2">
+<fill><patternFill patternType="none"/></fill>
+<fill><patternFill patternType="gray125"/></fill>
+</fills>
+<cellXfs><xf numFmtId="0" fillId="0"/><xf numFmtId="0" fillId="1"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].fill_fg_color, None);
+        assert_eq!(sheet[&0].fill_bg_color, None);
+        assert_eq!(sheet[&1].fill_fg_color, None);
+        assert_eq!(sheet[&1].fill_bg_color, None);
+    }
+
+    #[test]
+    fn fg_color_with_none_of_rgb_theme_indexed_resolves_to_none() {
+        // <fgColor auto="1"/> (ECMA-376 CT_Color's fourth, "automatic"
+        // form) — this library doesn't resolve automatic colors to a
+        // concrete value, so it degrades to "no color" the same way an
+        // absent fgColor entirely does.
+        let xml = br#"<styleSheet>
+<fills count="1">
+<fill><patternFill patternType="solid"><fgColor auto="1"/></patternFill></fill>
+</fills>
+<cellXfs><xf numFmtId="0" fillId="0"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].fill_fg_color, None);
+    }
+
+    #[test]
+    fn fg_color_with_non_numeric_theme_index_resolves_to_none() {
+        // Graceful degradation, matching read_xf_ids's policy for a
+        // malformed numFmtId/fontId/fillId — an unparseable theme index is
+        // treated as "nothing to report" rather than an XML parse error.
+        let xml = br#"<styleSheet>
+<fills count="1">
+<fill><patternFill patternType="solid"><fgColor theme="not-a-number"/></patternFill></fill>
+</fills>
+<cellXfs><xf numFmtId="0" fillId="0"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].fill_fg_color, None);
+    }
+
+    #[test]
+    fn fg_color_with_non_numeric_indexed_value_resolves_to_none() {
+        let xml = br#"<styleSheet>
+<fills count="1">
+<fill><patternFill patternType="solid"><fgColor indexed="not-a-number"/></patternFill></fill>
+</fills>
+<cellXfs><xf numFmtId="0" fillId="0"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].fill_fg_color, None);
+    }
+
+    #[test]
+    fn fill_eof_before_closing_tag_is_missing_required_element() {
+        let xml = br#"<styleSheet>
+<fills count="1">
+<fill><patternFill patternType="solid"><fgColor rgb="FFFF0000"/>"#;
+        let err = parse_styles(xml.as_slice(), "xl/styles.xml").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MissingRequiredElement {
+                name: "closing fill tag",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn solid_fill_with_rgb_resolves_fg_and_bg() {
+        let xml = br#"<styleSheet>
+<fills count="1">
+<fill><patternFill patternType="solid"><fgColor rgb="FFFF0000"/><bgColor rgb="FF00FF00"/></patternFill></fill>
+</fills>
+<cellXfs><xf numFmtId="0" fillId="0"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(
+            sheet[&0].fill_fg_color,
+            Some(ColorRef::Rgb(Arc::from("FFFF0000")))
+        );
+        assert_eq!(
+            sheet[&0].fill_bg_color,
+            Some(ColorRef::Rgb(Arc::from("FF00FF00")))
+        );
+    }
+
+    #[test]
+    fn solid_fill_with_theme_and_tint_resolves() {
+        let xml = br#"<styleSheet>
+<fills count="1">
+<fill><patternFill patternType="solid"><fgColor theme="4" tint="-0.25"/></patternFill></fill>
+</fills>
+<cellXfs><xf numFmtId="0" fillId="0"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(
+            sheet[&0].fill_fg_color,
+            Some(ColorRef::Theme {
+                index: 4,
+                tint: Some(-0.25)
+            })
+        );
+    }
+
+    #[test]
+    fn solid_fill_with_theme_and_no_tint_resolves_tint_none() {
+        // Absent `tint` must resolve to `None`, distinct from an explicit
+        // `tint="0"` — theme1.xml itself never carries tint at all; it is
+        // always attached (or not) per reference site.
+        let xml = br#"<styleSheet>
+<fills count="1">
+<fill><patternFill patternType="solid"><fgColor theme="1"/></patternFill></fill>
+</fills>
+<cellXfs><xf numFmtId="0" fillId="0"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(
+            sheet[&0].fill_fg_color,
+            Some(ColorRef::Theme {
+                index: 1,
+                tint: None
+            })
+        );
+    }
+
+    #[test]
+    fn solid_fill_with_indexed_resolves() {
+        let xml = br#"<styleSheet>
+<fills count="1">
+<fill><patternFill patternType="solid"><fgColor indexed="64"/></patternFill></fill>
+</fills>
+<cellXfs><xf numFmtId="0" fillId="0"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].fill_fg_color, Some(ColorRef::Indexed(64)));
+    }
+
+    #[test]
+    fn xf_without_fill_id_defaults_to_first_fill() {
+        let xml = br#"<styleSheet>
+<fills count="1">
+<fill><patternFill patternType="solid"><fgColor rgb="FFABCDEF"/></patternFill></fill>
+</fills>
+<cellXfs><xf numFmtId="0"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(
+            sheet[&0].fill_fg_color,
+            Some(ColorRef::Rgb(Arc::from("FFABCDEF")))
+        );
+    }
+
+    #[test]
+    fn many_styles_sharing_the_same_fill_id_all_resolve_and_share_the_arc_data() {
+        let xml = br#"<styleSheet>
+<fonts count="2"><font><sz val="11"/></font><font><b/><sz val="11"/></font></fonts>
+<fills count="2">
+<fill><patternFill patternType="none"/></fill>
+<fill><patternFill patternType="solid"><fgColor rgb="FFAABBCC"/></patternFill></fill>
+</fills>
+<cellXfs>
+<xf numFmtId="0" fontId="0" fillId="1"/>
+<xf numFmtId="0" fontId="1" fillId="1"/>
+</cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        fn as_rgb(color: &Option<ColorRef>) -> Option<Arc<str>> {
+            match color {
+                Some(ColorRef::Rgb(s)) => Some(s.clone()),
+                _ => None,
+            }
+        }
+        let a = as_rgb(&sheet[&0].fill_fg_color).expect("style 0's fill_fg_color is Rgb");
+        let b = as_rgb(&sheet[&1].fill_fg_color).expect("style 1's fill_fg_color is Rgb");
+        assert_eq!(a.as_ref(), "FFAABBCC");
+        // Arc::from(&str) makes an independent allocation per fgColor
+        // parse, but both styles resolve from the very same Fill entry
+        // (fillId=1, parsed once into `fills[1]`) via `.cloned()`, so the
+        // Arc pointers must be equal — the refcount-bump behavior the
+        // Issue #75 review verified in PoC/issue75-poc-v2.
+        assert!(Arc::ptr_eq(&a, &b));
     }
 }
