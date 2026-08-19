@@ -130,6 +130,14 @@ sheet with a single merged region, `A1:C3`, holding one text cell):
     `"yyyy-mm-dd"`), covering both the built-in numFmtId table
     (ECMA-376 §18.8.30) and custom `<numFmt>` codes. Omitted when the
     format is `"General"` (no special formatting to report).
+  - `fillFgColor`/`fillBgColor`: the cell's fill color, tagged by `type`
+    exactly as `<fgColor>`/`<bgColor>` specify it — `{"type": "rgb",
+    "value": "FFFF0000"}` | `{"type": "theme", "value": {"index": 4,
+    "tint": -0.25}}` | `{"type": "indexed", "value": 64}`. Kept in this
+    raw, unresolved form rather than converted to a final displayed RGB
+    value: xlsxparser's output is for diffing, so knowing *that* a fill
+    color changed doesn't require knowing what it actually renders as.
+    Omitted when the fill has no foreground/background color at all.
 
 A second real example — every `CellValue` variant in one row
 (`tests/fixtures/normal/basic_types.xlsx`; cells re-ordered by column here
@@ -251,9 +259,10 @@ src/
   system)
 - `xl/sharedStrings.xml` (rich-text run concatenation, `xml:space="preserve"`
   handling, CDATA runs, and the `_x000D_` escape Excel uses for a literal CR)
-- `xl/styles.xml` (font size/bold, horizontal alignment, wrap text, and
+- `xl/styles.xml` (font size/bold, horizontal alignment, wrap text,
   number format — both the built-in numFmtId table (ECMA-376 §18.8.30) and
-  custom `<numFmt>` codes)
+  custom `<numFmt>` codes — and fill color, kept in its raw `rgb`/
+  `theme`+`tint`/`indexed` form rather than resolved to a final RGB value)
 - `xl/worksheets/sheetX.xml` (`<sheetData>`, `<mergeCells>`)
 
 `[Content_Types].xml` is not read; fixed paths such as `xl/workbook.xml`
