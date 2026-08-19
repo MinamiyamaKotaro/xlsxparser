@@ -8,6 +8,7 @@ pub mod sanitize;
 
 use crate::error::Error;
 use sanitize::{BoundedReader, DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE, DEFAULT_MAX_UNCOMPRESSED_SIZE};
+use std::cell::OnceCell;
 use std::collections::HashSet;
 use std::io::{Read, Seek};
 
@@ -31,14 +32,17 @@ pub struct ZipContainer<R> {
     /// Running total of bytes decompressed so far via `get_entry`.
     /// `get_entry` lends this out to `BoundedReader` as `&mut`.
     total_read: u64,
-    /// Every entry name in the archive, captured once at `open_reader` time
-    /// (the same pass that already runs `validate_entry_path` over
-    /// `archive.file_names()`) so `has_entry` can answer an existence-only
-    /// query in O(1) without going through `get_entry`'s local-file-header
-    /// read and `BoundedReader` construction (Issue #65 PR review: image
-    /// anchor resolution only ever needs to know whether a target exists,
-    /// never its bytes).
-    entry_name_set: HashSet<String>,
+    /// Every entry name in the archive, for `has_entry` to answer an
+    /// existence-only query in O(1) without going through `get_entry`'s
+    /// local-file-header read and `BoundedReader` construction (Issue #65
+    /// PR review: image anchor resolution only ever needs to know whether a
+    /// target exists, never its bytes). Built lazily on the first
+    /// `has_entry` call rather than eagerly in `open_reader`: benchmarking
+    /// showed eager construction added a measurable (~3-5%) `open_reader`
+    /// regression on an entry-heavy archive (`thousand_sheets.xlsx`, 1008
+    /// entries) — a cost every caller would pay even though most workbooks
+    /// have no images and never call `has_entry` at all.
+    entry_name_set: OnceCell<HashSet<String>>,
 }
 
 impl<R: Read + Seek> ZipContainer<R> {
@@ -52,17 +56,15 @@ impl<R: Read + Seek> ZipContainer<R> {
     pub fn open_reader(reader: R) -> Result<Self, Error> {
         let archive =
             zip::ZipArchive::new(reader).map_err(|e| Error::InvalidPackage(e.to_string()))?;
-        let mut entry_name_set = HashSet::with_capacity(archive.len());
         for name in archive.file_names() {
             sanitize::validate_entry_path(name)?;
-            entry_name_set.insert(name.to_string());
         }
         Ok(Self {
             archive,
             max_entry_size: DEFAULT_MAX_UNCOMPRESSED_SIZE,
             max_total_size: DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE,
             total_read: 0,
-            entry_name_set,
+            entry_name_set: OnceCell::new(),
         })
     }
 
@@ -130,7 +132,10 @@ impl<R: Read + Seek> ZipContainer<R> {
     /// .is_some()` followed by immediately dropping the reader.
     pub fn has_entry(&self, name: &str) -> Result<bool, Error> {
         sanitize::validate_entry_path(name)?;
-        Ok(self.entry_name_set.contains(name))
+        let set = self
+            .entry_name_set
+            .get_or_init(|| self.archive.file_names().map(str::to_string).collect());
+        Ok(set.contains(name))
     }
 
     /// Lists all entry names in the archive (already validated at open

@@ -9,7 +9,7 @@
 - ZIP(OPC)アーカイブを開き、中央ディレクトリから全エントリ名を読み取る
 - オープン時点で全エントリ名を [`container/sanitize.rs`](sanitize.md) の `validate_entry_path` で一括検証し、不正なエントリ名を含むアーカイブを即座に拒否する（fail closed）
 - 個々のエントリの展開済みストリームを、Zip Bomb対策の `BoundedReader`（[sanitize.md](sanitize.md)）で包んだ状態でのみ払い出す「安全なファイル取得」窓口 `get_entry` を提供する
-- `open_reader` 時点で一度だけ構築する `HashSet<String>` を裏付けとした、存在確認専用の `has_entry` を提供する。中身ではなく存在の有無だけが必要な呼び出し元にとって、`get_entry` のローカルファイルヘッダ読み込みや `BoundedReader` 構築を回避できる(Issue #65のPRレビュー。`pipeline.rs` の画像アンカー解決が最初の利用者)
+- `HashSet<String>` を裏付けとした、存在確認専用の `has_entry` を提供する。中身ではなく存在の有無だけが必要な呼び出し元にとって、`get_entry` のローカルファイルヘッダ読み込みや `BoundedReader` 構築を回避できる(Issue #65のPRレビュー。`pipeline.rs` の画像アンカー解決が最初の利用者)。このセットは `open_reader` 時点で即座に構築するのではなく、最初の `has_entry` 呼び出し時に遅延構築する — 即時構築だとエントリ数の多いアーカイブで `open_reader` に無視できない(約3〜5%)速度低下が生じ、画像アンカー解決でしか使わない機能のコストをほぼ全ての呼び出し元が負担することになると計測でわかったため
 - **含まない責務**: Zip Bomb/Zip Slipの検知ロジックそのもの（`container/sanitize.rs`）、XMLの構文解釈・XXE対策（`parse/`）、`_rels` の内容解釈やシートIDとファイルパスの紐付け（`parse/relationships.rs`）、`[Content_Types].xml` / `xl/workbook.xml` など特定パーツの必須性判断（呼び出し元。本ファイルは「名前を指定されたエントリを安全に取得できるか」のみを扱い、どのパーツが必須かは知らない）
 
 ## 主要な型（案）
