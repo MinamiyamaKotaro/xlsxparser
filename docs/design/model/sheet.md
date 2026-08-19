@@ -268,10 +268,12 @@ impl Sheet {
 
 `column_width(col) -> Option<f64>` は `col_widths` を二分探索する——`partition_point` で `min <= col` を満たす最後の範囲を求め、その範囲の `max` が実際に `col` まで届くか確認する——ファイルが範囲をどう配置してもO(log R)になる(RはRの上限 `resolve::column_width::MAX_COLUMN_WIDTH_RANGES` = 2,000でキャップ)。`col` を覆う範囲も `defaultColWidth` も無い場合はExcelの一般的な既定値(「Calibri 11 ≈ 8.43文字」など)を推測で埋めるのではなく `None` を返す: そのフォールバックはこのライブラリが計算していないフォントメトリクスに依存するため、誤った数値より明示的な不在の方が望ましい。`col_width_ranges()` は生のソート済み `Vec` を公開し、`json.rs` がシート単位の `columns` 配列としてシリアライズする——意図的に**セルごとに引いてセルのJSONオブジェクトへ埋め込まない**: 列単位の値をその列の全ての実在セルに繰り返すと、このライブラリの存在意義である疎な出力設計に何の利益も無く反する(列幅専用のサブIssueができる前、Issue #36のレビュー議論で提起された)。
 
+**機能: 画像(Issue #65)。** `Sheet` は `images: Vec<Image>` も保持し、`pipeline.rs` のフェーズ3.5が `Sheet::set_images` を通じて一度だけ登録する——`set_col_widths` と同じ「他所で解決し、一度だけ登録する」という分担。`merged_regions` と異なり、画像はいかなるセル座標にも紐付けられない: `ImageAnchor::TwoCell`/`OneCell` のマーカーはセル内のEMU単位オフセットを持つため、アンカーの位置は `MergedRegion` のように常にセル境界に一致するとは限らず、画像が自然に「所属する」単一のセルというものが存在しない。`images()` は生の `Vec` を公開し、`json.rs` がシート単位の `images` 配列としてシリアライズする——`col_width_ranges`(上記)と同じ疎な出力設計の理由に加え、セルごとの複製が望ましい場合であってもそもそも画像を紐付けるセルが存在しないという点が加わる。
+
 ## 依存関係
 
 - 依存先: [`model/cell.rs`](cell.md)（`Cell`, `CellRef`）
-- 依存元: `model::Workbook`（複数シートを保持）、[`pipeline.rs`](../pipeline.md)（`Sheet::new` でシートを構築する）、`resolve/merge.rs`（`insert_merge` を呼び出して結合セルを登録し、全件登録後に `finalize_merges` を呼ぶ）、`resolve/shared_strings.rs` / `resolve/style.rs`（`get_mut` を通じてセルの値・スタイルを解決済みデータへ書き換える）、`resolve/column_width.rs`（検証後に `set_col_widths` を呼ぶ）、[`json.rs`](../json.md)（`iter_cells`・`merged_region_at`・`col_width_ranges`・`default_col_width` からJSONを組み立てる）、`parse/worksheet.rs`（`insert_cell` でパース結果を挿入する）
+- 依存元: `model::Workbook`（複数シートを保持）、[`pipeline.rs`](../pipeline.md)（`Sheet::new` でシートを構築する。フェーズ3.5が `set_images` を呼ぶ——[parse/drawing.md](../parse/drawing.md) 参照）、`resolve/merge.rs`（`insert_merge` を呼び出して結合セルを登録し、全件登録後に `finalize_merges` を呼ぶ）、`resolve/shared_strings.rs` / `resolve/style.rs`（`get_mut` を通じてセルの値・スタイルを解決済みデータへ書き換える）、`resolve/column_width.rs`（検証後に `set_col_widths` を呼ぶ）、[`json.rs`](../json.md)（`iter_cells`・`merged_region_at`・`col_width_ranges`・`default_col_width`・`images` からJSONを組み立てる）、`parse/worksheet.rs`（`insert_cell` でパース結果を挿入する）
 
 `cells` / `merged_regions` フィールド自体は `pub(crate)` にも公開せず完全に非公開のままとし、これらの内部データ構造への書き込みは `insert_cell` / `insert_merge` / `get_mut` / `finalize_merges` に限定する。フィールドを直接 `pub(crate)` にする案（初回レビューでの提案）も検討したが、その場合 `max_row`/`max_col` の更新漏れや結合起点セルの補完漏れを各呼び出し元（`resolve/` 配下の複数モジュール）が個別に守る必要があり、不変条件がクレート全体に分散してしまう。メソッド経由に限定することで不変条件を `Sheet` 自身に閉じ込め、呼び出し側は正しさを気にせず利用できる。
 
@@ -299,6 +301,7 @@ impl Sheet {
 - **`finalize_merges` が、行範囲の重ならない複数の結合範囲にまたがって正しく解決できることの確認**（単一範囲だけでなく、どの範囲にも属さないセルも含めてスイープラインのStart/End管理を検証する）
 - **エンドツーエンド回帰テスト: `MAX_MERGE_REGIONS` 件の結合セルを`merge_bounds`が最大化するよう配置(対角に2個配置)し、さらに無関係なセルを数十万件加えたファイルが、修正前に実測した数秒単位の停止なしにJSON生成を完了できることの確認**（`tests/security.rs` の `sparse_merge_bounding_box_does_not_amplify_json_generation_cost`、`sparse_merge_bounding_box_amplification` フィクスチャを使用。意図的な配置によるDoS懸念であるため、`zip_bomb`/`zip_slip`/`xxe_attack` と同じくCategory 4（負荷）ではなくCategory 5（セキュリティ）に分類）
 - **`column_width` が範囲なし・`defaultColWidth` なしで `None` を返すことの確認**、**複数範囲にまたがる二分探索の正当性の確認**（範囲内・範囲間の隙間・`defaultColWidth`へのフォールバックの境界値を含む）、**`col_width_ranges`/`default_col_width` がJSON出力用に生の値を公開することの確認**（Issue #39。詳細な検証は `resolve::column_width` のテスト群が担う）
+- **`images()` が `set_images` で設定された生の `Vec` をそのまま公開することの確認**（Issue #65。アンカーごとの解決の正当性は `parse::drawing` と `pipeline.rs` それぞれのテスト群が担う）
 
 ## 未決事項 / オープンクエスチョン
 

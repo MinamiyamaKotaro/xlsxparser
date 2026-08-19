@@ -106,6 +106,84 @@ fn real_multi_sheet_states_xlsx_enumerates_every_visibility() {
 }
 
 #[test]
+fn real_embedded_image_xlsx_resolves_anchor_embed_and_hyperlink() {
+    use xlsxparser::ImageAnchor;
+
+    let workbook = parse_workbook(fixture_path("complex/embedded_image.xlsx")).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    let images = sheet.images();
+    assert_eq!(images.len(), 1);
+    let image = &images[0];
+
+    assert_eq!(image.target, "xl/media/image1.png");
+    assert_eq!(
+        image.hyperlink.as_deref(),
+        Some("https://example.com/sample-image")
+    );
+    // scripts/generate_real_fixtures.py's embedded_image() anchors
+    // B2:E9 with a 10000/20000 EMU offset on the origin corner — 0-based
+    // xdr:col=1/xdr:row=1 becomes 1-based CellRef { row: 2, col: 2 }.
+    match image.anchor {
+        ImageAnchor::TwoCell { from, to } => {
+            assert_eq!(from.cell, CellRef { row: 2, col: 2 });
+            assert_eq!(from.col_off, 10000);
+            assert_eq!(from.row_off, 20000);
+            assert_eq!(to.cell, CellRef { row: 9, col: 5 });
+        }
+        ImageAnchor::OneCell { .. } => panic!("expected a TwoCell anchor"),
+    }
+
+    // The embedded media's real bytes are never read into the model.
+    let json = xlsxparser::to_json_string(&workbook).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let json_image = &parsed["sheets"][0]["images"][0];
+    assert_eq!(json_image["target"], "xl/media/image1.png");
+    assert_eq!(json_image["anchor"]["type"], "twoCell");
+}
+
+#[test]
+fn real_embedded_image_one_cell_xlsx_resolves_a_single_cell_confined_anchor() {
+    use xlsxparser::{AnchorMarker, ImageAnchor, ImageExtent};
+
+    let workbook = parse_workbook(fixture_path("complex/embedded_image_one_cell.xlsx")).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    let images = sheet.images();
+    assert_eq!(images.len(), 1);
+    let image = &images[0];
+
+    assert_eq!(image.target, "xl/media/image1.png");
+    // No <a:hlinkClick> on this fixture's <xdr:pic>.
+    assert_eq!(image.hyperlink, None);
+    // scripts/generate_real_fixtures.py's embedded_image_one_cell() anchors
+    // at 0-based xdr:col=2/xdr:row=4 -> 1-based CellRef { row: 5, col: 3 }
+    // (C5), sized well under a default cell's EMU dimensions.
+    assert_eq!(
+        image.anchor,
+        ImageAnchor::OneCell {
+            from: AnchorMarker {
+                cell: CellRef { row: 5, col: 3 },
+                col_off: 5000,
+                row_off: 5000,
+            },
+            ext: ImageExtent {
+                cx: 400_000,
+                cy: 150_000,
+            },
+        }
+    );
+
+    let json = xlsxparser::to_json_string(&workbook).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let json_image = &parsed["sheets"][0]["images"][0];
+    assert_eq!(json_image["anchor"]["type"], "oneCell");
+    assert_eq!(json_image["anchor"]["ext"]["cx"], 400_000);
+    // hyperlink is omitted entirely (not null) when the image has none.
+    assert!(json_image.get("hyperlink").is_none());
+}
+
+#[test]
 fn real_extreme_sparse_xlsx_registers_only_the_two_populated_cells() {
     let workbook = parse_workbook(fixture_path("complex/extreme_sparse.xlsx")).unwrap();
     let sheet = &workbook.sheets()[0];

@@ -30,6 +30,7 @@ src/
     shared_strings.rs     # sharedStrings.xml のパース（SSTの構造化データ抽出）
     styles.rs             # styles.xml のパース（fonts/fills/borders/numFmts/cellXfs）
     worksheet.rs          # フェーズ3: sheetX.xml の SAXストリームパース（行単位の破棄はここで完結）
+    drawing.rs             # フェーズ3.5: drawingN.xml の画像アンカー解析（Issue #65）
 
   model/                    # 純粋なドメインモデル（XMLパースや解決ロジックに依存しない）
     mod.rs

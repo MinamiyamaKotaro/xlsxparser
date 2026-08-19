@@ -6,8 +6,8 @@
 
 use crate::error::Error;
 use crate::model::{
-    Alignment, Cell, CellRef, CellValue, ColWidthRange, DateTimeValue, Sheet, SheetVisibility,
-    Workbook,
+    Alignment, AnchorMarker, Cell, CellRef, CellValue, ColWidthRange, DateTimeValue, Image,
+    ImageAnchor, Sheet, SheetVisibility, Workbook,
 };
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Serialize, Serializer};
@@ -82,7 +82,7 @@ struct JsonSheet<'a> {
 
 impl Serialize for JsonSheet<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("Sheet", 7)?;
+        let mut state = serializer.serialize_struct("Sheet", 8)?;
         state.serialize_field("name", &self.sheet.name)?;
         state.serialize_field("visibility", visibility_tag(self.sheet.visibility))?;
         state.serialize_field("maxRow", &self.sheet.max_row)?;
@@ -90,6 +90,7 @@ impl Serialize for JsonSheet<'_> {
         state.serialize_field("defaultColumnWidth", &self.sheet.default_col_width())?;
         state.serialize_field("columns", &ColumnSeq { sheet: self.sheet })?;
         state.serialize_field("cells", &CellSeq { sheet: self.sheet })?;
+        state.serialize_field("images", &ImageSeq { sheet: self.sheet })?;
         state.end()
     }
 }
@@ -292,6 +293,102 @@ fn visibility_tag(v: SheetVisibility) -> &'static str {
     }
 }
 
+/// Emits `Sheet::images` as a sheet-level array, for the same reason
+/// `ColumnSeq` does: an image isn't owned by any one cell (its anchor
+/// markers don't always align to a cell boundary), so there is no cell to
+/// attach it to even if duplication were otherwise desirable (Issue #65).
+struct ImageSeq<'a> {
+    sheet: &'a Sheet,
+}
+
+impl Serialize for ImageSeq<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let images = self.sheet.images();
+        let mut seq = serializer.serialize_seq(Some(images.len()))?;
+        for image in images {
+            seq.serialize_element(&image_to_json(image))?;
+        }
+        seq.end()
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonImage {
+    anchor: JsonAnchor,
+    target: String,
+    /// Omitted entirely when the image carries no hyperlink of its own —
+    /// same "no empty placeholder" convention as `JsonCell::style`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hyperlink: Option<String>,
+}
+
+/// Internally tagged (`{"type": "twoCell", "from": ..., "to": ...}` /
+/// `{"type": "oneCell", "from": ..., "ext": ...}`) rather than the
+/// `{"type": ..., "value": ...}` shape `JsonCellValue` uses: each variant
+/// here has more than one field of its own, so there is no single `value`
+/// to nest them under.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum JsonAnchor {
+    TwoCell { from: JsonMarker, to: JsonMarker },
+    OneCell { from: JsonMarker, ext: JsonExtent },
+}
+
+/// A `<xdr:from>`/`<xdr:to>` marker. `row`/`col` are 1-based, matching every
+/// other cell coordinate this crate emits (`JsonCell::row`/`col`) — the
+/// 0-based `xdr:col`/`xdr:row` from the source XML is already converted by
+/// `parse::drawing::zero_based_to_cell_ref` before this type ever sees it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonMarker {
+    row: u32,
+    col: u32,
+    col_off: i64,
+    row_off: i64,
+}
+
+/// `xdr:ext`: an image's width/height in EMU (English Metric Units),
+/// present only on a `oneCell` anchor.
+#[derive(Debug, Serialize)]
+struct JsonExtent {
+    cx: i64,
+    cy: i64,
+}
+
+fn image_to_json(image: &Image) -> JsonImage {
+    JsonImage {
+        anchor: anchor_to_json(&image.anchor),
+        target: image.target.clone(),
+        hyperlink: image.hyperlink.clone(),
+    }
+}
+
+fn anchor_to_json(anchor: &ImageAnchor) -> JsonAnchor {
+    match anchor {
+        ImageAnchor::TwoCell { from, to } => JsonAnchor::TwoCell {
+            from: marker_to_json(from),
+            to: marker_to_json(to),
+        },
+        ImageAnchor::OneCell { from, ext } => JsonAnchor::OneCell {
+            from: marker_to_json(from),
+            ext: JsonExtent {
+                cx: ext.cx,
+                cy: ext.cy,
+            },
+        },
+    }
+}
+
+fn marker_to_json(marker: &AnchorMarker) -> JsonMarker {
+    JsonMarker {
+        row: marker.cell.row,
+        col: marker.cell.col,
+        col_off: marker.col_off,
+        row_off: marker.row_off,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,7 +420,8 @@ mod tests {
                     "columns": [],
                     "cells": [
                         {"row": 1, "col": 1, "value": {"type": "number", "value": 42.0}}
-                    ]
+                    ],
+                    "images": []
                 }]
             })
         );

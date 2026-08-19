@@ -9,6 +9,7 @@
 - ZIP(OPC)アーカイブを開き、中央ディレクトリから全エントリ名を読み取る
 - オープン時点で全エントリ名を [`container/sanitize.rs`](sanitize.md) の `validate_entry_path` で一括検証し、不正なエントリ名を含むアーカイブを即座に拒否する（fail closed）
 - 個々のエントリの展開済みストリームを、Zip Bomb対策の `BoundedReader`（[sanitize.md](sanitize.md)）で包んだ状態でのみ払い出す「安全なファイル取得」窓口 `get_entry` を提供する
+- `HashSet<String>` を裏付けとした、存在確認専用の `has_entry` を提供する。中身ではなく存在の有無だけが必要な呼び出し元にとって、`get_entry` のローカルファイルヘッダ読み込みや `BoundedReader` 構築を回避できる(Issue #65のPRレビュー。`pipeline.rs` の画像アンカー解決が最初の利用者)。このセットは `open_reader` 時点で即座に構築するのではなく、最初の `has_entry` 呼び出し時に遅延構築する — 即時構築だとエントリ数の多いアーカイブで `open_reader` に無視できない(約3〜5%)速度低下が生じ、画像アンカー解決でしか使わない機能のコストをほぼ全ての呼び出し元が負担することになると計測でわかったため
 - **含まない責務**: Zip Bomb/Zip Slipの検知ロジックそのもの（`container/sanitize.rs`）、XMLの構文解釈・XXE対策（`parse/`）、`_rels` の内容解釈やシートIDとファイルパスの紐付け（`parse/relationships.rs`）、`[Content_Types].xml` / `xl/workbook.xml` など特定パーツの必須性判断（呼び出し元。本ファイルは「名前を指定されたエントリを安全に取得できるか」のみを扱い、どのパーツが必須かは知らない）
 
 ## 主要な型（案）
@@ -128,7 +129,7 @@ impl<R> ZipContainer<R> {
 
 - `open` / `open_reader` は、ZIPアーカイブとして破損している場合に `Error::InvalidPackage` を返す。使用するZIP操作クレートのエラー型をそのまま `String` 化するか、`error.md` の `XmlParse` と同様に `Box<dyn Error>` として型消去した専用フィールドを持たせるかは、クレート選定後に見直す（オープンクエスチョン1、[error.md オープンクエスチョン1](../error.md) と連動）。
 - `open_reader` は、中央ディレクトリ内のいずれかのエントリ名が `validate_entry_path` に失敗した場合、`Error::ZipSlipDetected` を返しアーカイブ全体を拒否する（部分的に安全なエントリのみを使う、という妥協はしない）。
-- `get_entry` はエントリ不在を `Result` ではなく `Ok(None)` として表現する（`model::Sheet::get` が空白セルを `None` で表すのと同じ設計原則。[model/sheet.md](../model/sheet.md) 参照）。
+- `get_entry` はエントリ不在を `Result` ではなく `Ok(None)` として表現する（`model::Sheet::get` が空白セルを `None` で表すのと同じ設計原則。[model/sheet.md](../model/sheet.md) 参照）。`has_entry` も同様に `Ok` の中身を素の `bool` として表現する — `Result` で包んでいるのは `validate_entry_path` 自体の失敗(動的に計算された信頼できない `name` がZip Slip検証に落ちるケース)のためであり、「該当エントリが無い」とは別の関心事である。
 - 必須パーツ（`[Content_Types].xml` / `xl/workbook.xml` 等）が存在しない場合のエラー構築は本ファイルの責務としない。`ZipContainer` は「安全なファイル取得」のみを扱う汎用コンテナ層に徹し、どのパーツが必須かというOPC特有のセマンティクスを持たない（PR #7 レビュー指摘を反映してオープンクエスチョン5を解決）。`get_entry` が返す `Ok(None)` を見て `Error::InvalidPackage` や `Error::DanglingRelationship` のいずれを構築するかは `pipeline.rs` / `parse/relationships.rs` 側の判断とする。
 - `get_entry` が返す `BoundedReader` からの読み込み中に上限超過が発生した場合の `io::Error` → `Error::ZipBombDetected` への変換は、`parse/` が `quick_xml::Error` を `crate::error::Error` へ変換する境界で行う（[sanitize.md エラー処理方針](sanitize.md) 参照。オープンクエスチョン3は解決済み）。
 
@@ -139,7 +140,8 @@ impl<R> ZipContainer<R> {
 - 中央ディレクトリに `../evil` のような不正なエントリ名を含むZIPを `open_reader` した場合、`Error::ZipSlipDetected` を返しアーカイブ全体が拒否されることの確認（1件でも不正なら全体拒否）
 - `get_entry` に実在するエントリ名を渡した場合に `Ok(Some(..))` を返し、中身のバイト列が期待通りであることの確認
 - `get_entry` に実在しないエントリ名を渡した場合に `Ok(None)` を返すことの確認（エラーにならないこと）
-- `get_entry` に `"../etc/passwd"` のような不正な形の `name` を渡した場合、アーカイブ内の実在有無に関わらず `Error::ZipSlipDetected` を返すことの確認（オープン時検証をすり抜けた想定の多層防御テスト）
+- `get_entry` に `"../etc/passwd"` のような不正な形の `name` を渡した場合、アーカイブ内の実在有無に関わらず `Error::ZipSlipDetected` を返すことの確認(オープン時検証をすり抜けた想定の多層防御テスト)
+- `has_entry` が実在/不在のエントリ名それぞれに対して `Ok(true)`/`Ok(false)` を返すこと、不正な形の `name` に対しては存在有無に関わらず `Err(Error::ZipSlipDetected)` を返すこと(`get_entry` と同じ多層防御の性質)の確認
 - `get_entry` が返すストリームが `max_entry_size` を超えて読まれた場合にエラーとなることの確認（`sanitize::BoundedReader` との結線テスト。`BoundedReader` 自体のロジック検証は [sanitize.md](sanitize.md) 側の責務）
 - 複数の `get_entry` 呼び出しにまたがって `total_read` が正しく累積し、`max_total_size` を超えた時点でエラーとなることの確認（`ZipContainer` が `BoundedReader` へ渡す累積カウンタの結線テスト）
 

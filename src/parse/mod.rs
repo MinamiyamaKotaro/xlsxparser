@@ -6,13 +6,15 @@
 //! submodule live here; each submodule interprets one OOXML part's
 //! structure.
 
+mod drawing;
 mod relationships;
 mod shared_strings;
 mod styles;
 mod workbook;
 mod worksheet;
 
-pub(crate) use relationships::parse_relationships;
+pub(crate) use drawing::parse_drawing;
+pub(crate) use relationships::{parse_relationships, TargetMode};
 pub(crate) use shared_strings::{parse_shared_strings, SharedStringTable};
 pub(crate) use styles::parse_styles;
 pub(crate) use workbook::parse_workbook_xml;
@@ -369,6 +371,44 @@ fn normalize_line_endings(s: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// Reads the text content of a leaf element (`<v>...</v>`, `<f>...</f>`,
+/// `<xdr:col>...</xdr:col>`) — no nested elements are expected — resolving
+/// any `Event::GeneralRef` entities along the way. Called with the reader
+/// positioned just after the element's opening tag; consumes events up to
+/// and including its closing tag. Shared by `worksheet.rs` and
+/// `drawing.rs`, the two modules whose leaf elements carry plain numeric/
+/// text content rather than a nested run structure (contrast
+/// `concat_rich_text`, which handles `<si>`/`<is>`'s richer `<r><t>` shape).
+pub(crate) fn read_leaf_text(
+    reader: &mut Reader<impl BufRead>,
+    path: &str,
+) -> Result<String, Error> {
+    let mut text = String::new();
+    let mut buf = Vec::new();
+    loop {
+        match read_event(reader, &mut buf, path)? {
+            Event::Text(e) => {
+                let decoded = e.decode().map_err(|err| Error::XmlParse {
+                    path: path.to_string(),
+                    source: Box::new(err),
+                })?;
+                text.push_str(&decoded);
+            }
+            Event::GeneralRef(e) => push_general_ref(&mut text, &e, path)?,
+            Event::End(_) => break,
+            Event::Eof => {
+                return Err(Error::MissingRequiredElement {
+                    path: path.to_string(),
+                    name: "closing tag",
+                })
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,6 +658,49 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn parse_leaf_text_result(xml: &[u8]) -> Result<String, Error> {
+        let mut reader = create_secure_reader(xml);
+        let mut buf = Vec::new();
+        // Advance past the opening <v> tag.
+        loop {
+            match reader.read_event_into(&mut buf).unwrap() {
+                Event::Start(e) if e.local_name().as_ref() == b"v" => break,
+                Event::Eof => panic!("no <v> start tag found"),
+                _ => {}
+            }
+            buf.clear();
+        }
+        buf.clear();
+        read_leaf_text(&mut reader, "xl/worksheets/sheet1.xml")
+    }
+
+    #[test]
+    fn read_leaf_text_resolves_a_general_ref_entity() {
+        // &#38; is the numeric character reference for '&', tokenized by
+        // quick-xml as Event::GeneralRef rather than folded into
+        // Event::Text.
+        let text = parse_leaf_text_result(b"<v>4&#38;2</v>").unwrap();
+        assert_eq!(text, "4&2");
+    }
+
+    #[test]
+    fn read_leaf_text_eof_before_closing_tag_is_missing_required_element() {
+        let err = parse_leaf_text_result(b"<v>unterminated").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MissingRequiredElement {
+                name: "closing tag",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn read_leaf_text_ignores_a_comment_and_still_captures_surrounding_text() {
+        let text = parse_leaf_text_result(b"<v>4<!-- note -->2</v>").unwrap();
+        assert_eq!(text, "42");
     }
 
     #[test]

@@ -9,11 +9,10 @@
 use crate::error::Error;
 use crate::model::{Cell, CellRef, CellValue, ColWidthRange, MergedRegion, Sheet, StyleId};
 use crate::parse::{
-    concat_rich_text, create_secure_reader, optional_attr, push_general_ref, read_event,
+    concat_rich_text, create_secure_reader, optional_attr, read_event, read_leaf_text,
     required_attr,
 };
 use quick_xml::events::Event;
-use quick_xml::Reader;
 use std::io::BufRead;
 use std::sync::Arc;
 
@@ -48,6 +47,11 @@ pub(crate) struct WorksheetParseOutput {
     pub col_width_ranges: Vec<ColWidthRange>,
     pub default_col_width: Option<f64>,
     pub merge_regions: Vec<MergedRegion>,
+    /// The `r:id` from `<drawing r:id="rIdX"/>`, if this worksheet has one.
+    /// `pipeline.rs` resolves it against `xl/worksheets/_rels/sheetN.xml.rels`
+    /// to locate the `drawingN.xml` part (Issue #65); `None` means this
+    /// sheet has no images at all, so no `_rels` lookup is attempted for it.
+    pub drawing_r_id: Option<String>,
 }
 
 /// Phase 3's entry function. `sheet` is received already constructed by
@@ -78,6 +82,7 @@ pub(crate) fn parse_worksheet(
     let mut col_width_ranges = Vec::new();
     let mut default_col_width = None;
     let mut merge_regions = Vec::new();
+    let mut drawing_r_id = None;
 
     // State for the `<c>` currently being read (between its start and end
     // tag). `cur_ref` doubles as "are we inside a <c>?".
@@ -160,6 +165,9 @@ pub(crate) fn parse_worksheet(
                     col_width_ranges.push(ColWidthRange { min, max, width });
                 }
             }
+            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"drawing" => {
+                drawing_r_id = Some(required_attr(e, path, "r:id")?);
+            }
             Event::Eof => break,
             _ => {}
         }
@@ -172,6 +180,7 @@ pub(crate) fn parse_worksheet(
         col_width_ranges,
         default_col_width,
         merge_regions,
+        drawing_r_id,
     })
 }
 
@@ -283,38 +292,6 @@ fn parse_merge_ref(cell_range: &str) -> Result<MergedRegion, Error> {
         start: CellRef::from_a1(start_str)?,
         end: CellRef::from_a1(end_str)?,
     })
-}
-
-/// Reads the text content of a leaf element (`<v>...</v>`, `<f>...</f>`) —
-/// no nested elements are expected — resolving any `Event::GeneralRef`
-/// entities along the way. Called with the reader positioned just after the
-/// element's opening tag; consumes events up to and including its closing
-/// tag.
-fn read_leaf_text(reader: &mut Reader<impl BufRead>, path: &str) -> Result<String, Error> {
-    let mut text = String::new();
-    let mut buf = Vec::new();
-    loop {
-        match read_event(reader, &mut buf, path)? {
-            Event::Text(e) => {
-                let decoded = e.decode().map_err(|err| Error::XmlParse {
-                    path: path.to_string(),
-                    source: Box::new(err),
-                })?;
-                text.push_str(&decoded);
-            }
-            Event::GeneralRef(e) => push_general_ref(&mut text, &e, path)?,
-            Event::End(_) => break,
-            Event::Eof => {
-                return Err(Error::MissingRequiredElement {
-                    path: path.to_string(),
-                    name: "closing tag",
-                })
-            }
-            _ => {}
-        }
-        buf.clear();
-    }
-    Ok(text)
 }
 
 #[cfg(test)]
