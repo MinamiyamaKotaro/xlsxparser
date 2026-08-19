@@ -55,6 +55,12 @@ DrawingML's `xdr:col`/`xdr:row` are 0-based (ECMA-376 Part 1's `ST_ColumnRow` �
 - `read_leaf_text` was promoted from a `parse/worksheet.rs`-private helper to a shared `parse/mod.rs` function specifically to serve this module too — both modules read plain numeric/text leaf elements (`<v>`, `<xdr:col>`, etc.) with the same "no nested elements expected" shape, distinct from `concat_rich_text`'s richer `<r><t>` run structure
 - Depended on by: `pipeline.rs`'s Phase 3.5 (see [pipeline.md](../pipeline.en.md)), which resolves `PendingImage`'s relationship IDs against `drawingN.xml.rels` and builds the final `Vec<model::Image>`
 
+### Local-name collision between `<xdr:ext>` and `<a:ext>` (Issue #65 follow-up)
+
+`parse_anchor_body`'s flat, prefix-agnostic event scan (see Dependencies/parse/mod.md's namespace policy) means `<xdr:ext>` (a `OneCell` anchor's own displayed size, a direct child of `oneCellAnchor`) and `<a:ext>` (inside a `<xdr:pic>`'s own `<xdr:spPr><a:xfrm>`, describing the shape's internal geometry) are indistinguishable by local name alone — both are just "ext" once the prefix is stripped. Real writers (confirmed against actual LibreOffice output, not just a hypothetical) emit `<xdr:spPr><a:xfrm><a:ext>` even on a plain, non-grouped `<xdr:pic>`, and it appears *after* the anchor's own `<xdr:ext>` in document order (`from, ext, pic` per the `CT_OneCellAnchor` schema) — so without a guard, the pic's internal, generally-unrelated size would silently overwrite the anchor's actually-displayed size. Since `<xdr:ext>` is exactly the value a diff-oriented consumer cares about (what's shown on the sheet), this was a real correctness bug, not a cosmetic one.
+
+Fixed via a plain `bool` (`in_pic`, not a depth counter — `<xdr:pic>` never nests inside itself) set on entering `<xdr:pic>`, gating the `<xdr:ext>` match to only fire while `!in_pic`. This is the same category of scoping problem `<xdr:grpSp>` support (Issue #67) will need more generally, once a `<xdr:pic>`'s own `off`/`ext` genuinely needs to be read (for grouped-image position resolution) alongside the anchor-level values that must stay untouched.
+
 ## Error Handling Policy
 
 - A required element (`xdr:from`/`xdr:to` on a `TwoCell` anchor, `xdr:from`/`xdr:ext` on a `OneCell` one, `r:embed` on a `<xdr:pic>`'s `<a:blip>`) missing from an anchor that does have a `<xdr:pic>` is `Error::MissingRequiredElement` — fail-fast, following the same policy `parse/worksheet.rs` applies to a `<c>` missing its `r` attribute
@@ -72,6 +78,7 @@ DrawingML's `xdr:col`/`xdr:row` are 0-based (ECMA-376 Part 1's `ST_ColumnRow` �
 - A `<xdr:pic>` missing `<a:blip r:embed>` is `Error::MissingRequiredElement { name: "r:embed", .. }`
 - An `xdr:row`/`xdr:col` value that overflows `u32` or exceeds `CellRef::MAX_ROW`/`MAX_COL` once converted to 1-based is `Error::InvalidCellRef`
 - A malformed `xdr:ext` attribute (non-numeric `cx`/`cy`) is `Error::InvalidPackage`
+- A `oneCellAnchor` whose `<xdr:pic>` carries its own `<xdr:spPr><a:xfrm><a:ext>` with a *different* `cx`/`cy` than the anchor's own `<xdr:ext>` resolves to the anchor's value, not the pic's internal one (Issue #65 follow-up — see the local-name collision note above)
 - An empty `<xdr:wsDr>` (no anchors at all) produces an empty `Vec`
 
 ## Open Questions

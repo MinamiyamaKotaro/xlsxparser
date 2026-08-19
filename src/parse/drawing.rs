@@ -84,6 +84,18 @@ fn parse_anchor_body(
     let mut ext: Option<ImageExtent> = None;
     let mut embed_r_id: Option<String> = None;
     let mut hyperlink_r_id: Option<String> = None;
+    // Tracks whether the cursor is currently inside the anchor's <xdr:pic>
+    // (never self-nesting, so a plain bool suffices — unlike
+    // twoCellAnchor/oneCellAnchor or grpSp). Needed because <xdr:pic>'s own
+    // <xdr:spPr><a:xfrm><a:ext .../></a:xfrm></xdr:spPr> — real writers
+    // emit this even for a plain, non-grouped picture — shares the same
+    // local name "ext" as the OneCell anchor's own size-defining
+    // <xdr:ext>. Without this guard, a `oneCellAnchor`'s <xdr:pic> (which
+    // is read *after* <xdr:ext> in document order) would silently
+    // overwrite the anchor's declared size with the shape's internal one —
+    // a real discrepancy for a diff-oriented tool, since <xdr:ext> is the
+    // size actually displayed on the sheet (Issue #65 follow-up).
+    let mut in_pic = false;
 
     loop {
         match read_event(reader, &mut buf, path)? {
@@ -93,7 +105,10 @@ fn parse_anchor_body(
             Event::Start(e) if e.local_name().as_ref() == b"to" => {
                 to = Some(parse_marker(reader, path)?);
             }
-            Event::Empty(e) if e.local_name().as_ref() == b"ext" => {
+            Event::Start(e) if e.local_name().as_ref() == b"pic" => {
+                in_pic = true;
+            }
+            Event::Empty(e) if e.local_name().as_ref() == b"ext" && !in_pic => {
                 let cx = parse_attr_i64(&e, path, "cx")?;
                 let cy = parse_attr_i64(&e, path, "cy")?;
                 ext = Some(ImageExtent { cx, cy });
@@ -455,6 +470,42 @@ mod tests {
         let xml = format!(r#"<xdr:wsDr {NS}></xdr:wsDr>"#);
         let images = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap();
         assert!(images.is_empty());
+    }
+
+    #[test]
+    fn one_cell_anchor_ext_is_not_overwritten_by_pics_own_sppr_xfrm_ext() {
+        // Real writers (confirmed against actual LibreOffice output) emit
+        // a <xdr:pic><xdr:spPr><a:xfrm><a:ext .../></a:xfrm></xdr:spPr>
+        // even for a plain, non-grouped picture — sharing the local name
+        // "ext" with the OneCell anchor's own size-defining <xdr:ext>,
+        // which appears earlier in document order. The anchor's declared
+        // size (100, 200) must win over the shape's internal one
+        // (999, 888), since it's what's actually displayed on the sheet
+        // (Issue #65 follow-up).
+        let xml = format!(
+            r#"<xdr:wsDr {NS}>
+  <xdr:oneCellAnchor>
+    {from}
+    <xdr:ext cx="100" cy="200"/>
+    <xdr:pic>
+      <xdr:spPr>
+        <a:xfrm><a:off x="1" y="2"/><a:ext cx="999" cy="888"/></a:xfrm>
+      </xdr:spPr>
+      <xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill>
+    </xdr:pic>
+  </xdr:oneCellAnchor>
+</xdr:wsDr>"#,
+            from = marker_xml("from", 0, 0, 0, 0),
+        );
+
+        let images = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap();
+        assert_eq!(images.len(), 1);
+        match images[0].anchor {
+            ImageAnchor::OneCell { ext, .. } => {
+                assert_eq!(ext, ImageExtent { cx: 100, cy: 200 });
+            }
+            ImageAnchor::TwoCell { .. } => panic!("expected a OneCell anchor"),
+        }
     }
 
     #[test]
