@@ -101,6 +101,47 @@ fn embedded_image_resolves_anchor_embed_and_hyperlink() {
 }
 
 #[test]
+fn embedded_image_one_cell_resolves_a_single_cell_confined_anchor() {
+    use xlsxparser::{AnchorMarker, ImageAnchor, ImageExtent};
+
+    let workbook = parse_workbook_reader(Cursor::new(complex::embedded_image_one_cell())).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    let images = sheet.images();
+    assert_eq!(images.len(), 1);
+    let image = &images[0];
+
+    assert_eq!(image.target, "xl/media/image1.png");
+    assert_eq!(image.hyperlink, None);
+    assert_eq!(
+        image.anchor,
+        ImageAnchor::OneCell {
+            from: AnchorMarker {
+                cell: CellRef { row: 5, col: 3 },
+                col_off: 5000,
+                row_off: 5000,
+            },
+            ext: ImageExtent {
+                cx: 400_000,
+                cy: 150_000,
+            },
+        }
+    );
+
+    let json = xlsxparser::to_json_string(&workbook).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let json_image = &parsed["sheets"][0]["images"][0];
+    assert_eq!(json_image["anchor"]["type"], "oneCell");
+    assert_eq!(json_image["anchor"]["from"]["row"], 5);
+    assert_eq!(json_image["anchor"]["from"]["col"], 3);
+    assert_eq!(json_image["anchor"]["ext"]["cx"], 400_000);
+    assert_eq!(json_image["anchor"]["ext"]["cy"], 150_000);
+    // to/hyperlink are both absent for a hyperlink-less OneCell anchor.
+    assert!(json_image["anchor"].get("to").is_none());
+    assert!(json_image.get("hyperlink").is_none());
+}
+
+#[test]
 fn extreme_sparse_coordinates_register_only_the_populated_cells() {
     let workbook = parse_workbook_reader(Cursor::new(complex::extreme_sparse())).unwrap();
     let sheet = &workbook.sheets()[0];

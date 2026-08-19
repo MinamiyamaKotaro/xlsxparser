@@ -148,6 +148,61 @@ pub fn embedded_image() -> Vec<u8> {
     ])
 }
 
+/// A picture anchored at `C5` via `oneCellAnchor` (Issue #65), sized well
+/// under a default cell's EMU dimensions — confined *within* a single cell,
+/// contrasting `embedded_image`'s `twoCellAnchor` spanning `B2:E9`. Carries
+/// no hyperlink, so `Image::hyperlink` should resolve to `None`.
+pub fn embedded_image_one_cell() -> Vec<u8> {
+    let rows = r#"<row r="1"><c r="A1" t="str"><v>icon</v></c></row>"#;
+    let worksheet = worksheet_xml(rows, "").replace(
+        "</worksheet>",
+        r#"<drawing r:id="rIdDrawing"/></worksheet>"#,
+    );
+    let worksheet_rels = rels_xml(&[("rIdDrawing", "drawing", "../drawings/drawing1.xml")]);
+    let drawing_xml = br#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <xdr:oneCellAnchor>
+    <xdr:from><xdr:col>2</xdr:col><xdr:colOff>5000</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>5000</xdr:rowOff></xdr:from>
+    <xdr:ext cx="400000" cy="150000"/>
+    <xdr:pic>
+      <xdr:nvPicPr>
+        <xdr:cNvPr id="2" name="Picture 1"/>
+        <xdr:cNvPicPr/>
+      </xdr:nvPicPr>
+      <xdr:blipFill><a:blip r:embed="rIdEmbed"/></xdr:blipFill>
+    </xdr:pic>
+    <xdr:clientData/>
+  </xdr:oneCellAnchor>
+</xdr:wsDr>"#;
+    let drawing_rels: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdEmbed" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+</Relationships>"#;
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "styles", "styles.xml"),
+            ])
+            .as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        ("xl/styles.xml", DEFAULT_STYLES_XML),
+        ("xl/worksheets/sheet1.xml", worksheet.as_bytes()),
+        (
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            worksheet_rels.as_bytes(),
+        ),
+        ("xl/drawings/drawing1.xml", drawing_xml),
+        ("xl/drawings/_rels/drawing1.xml.rels", drawing_rels),
+        // Content doesn't matter — xlsxparser never reads image bytes.
+        ("xl/media/image1.png", b"\x89PNG\r\n\x1a\n" as &[u8]),
+    ])
+}
+
 /// `A1` holds a value, and the next (and only other) populated cell is
 /// `XFD1048576` — Excel's absolute bottom-right corner (column 16384, row
 /// 1,048,576). Verifies the sparse `HashMap<CellRef, Cell>` storage means

@@ -78,18 +78,75 @@ def _mutate_zip_entries(path, mutate_fn):
     _write_zip_entries(path, entries)
 
 
-def _add_drawing_with_image(entries, image_path):
+def _two_cell_anchor_xml(with_hyperlink):
+    """A `twoCellAnchor` spanning B2:E9 — an image explicitly sized to (and
+    resized with) a multi-cell range, i.e. placed *across* several cells
+    rather than confined to one.
+    """
+    hlink = '<a:hlinkClick r:id="rIdHyperlink"/>' if with_hyperlink else ""
+    return (
+        "<xdr:twoCellAnchor>"
+        "<xdr:from><xdr:col>1</xdr:col><xdr:colOff>10000</xdr:colOff>"
+        "<xdr:row>1</xdr:row><xdr:rowOff>20000</xdr:rowOff></xdr:from>"
+        "<xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff>"
+        "<xdr:row>8</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>"
+        "<xdr:pic>"
+        "<xdr:nvPicPr>"
+        f'<xdr:cNvPr id="2" name="Picture 1">{hlink}</xdr:cNvPr>'
+        "<xdr:cNvPicPr/>"
+        "</xdr:nvPicPr>"
+        '<xdr:blipFill><a:blip r:embed="rIdEmbed"/></xdr:blipFill>'
+        "<xdr:spPr/>"
+        "</xdr:pic>"
+        "<xdr:clientData/>"
+        "</xdr:twoCellAnchor>"
+    )
+
+
+def _one_cell_anchor_xml():
+    """A `oneCellAnchor` at C5, sized (`xdr:ext`) well under a default
+    column width (609,600 EMU) / row height (190,500 EMU) — an image
+    confined *within* a single cell, as opposed to `_two_cell_anchor_xml`'s
+    multi-cell span. No hyperlink, to also cover that `hyperlink_r_id`/
+    `PendingImage.hyperlink_r_id` genuinely stays `None` when `a:hlinkClick`
+    is absent, not just when the drawing type differs.
+    """
+    return (
+        "<xdr:oneCellAnchor>"
+        "<xdr:from><xdr:col>2</xdr:col><xdr:colOff>5000</xdr:colOff>"
+        "<xdr:row>4</xdr:row><xdr:rowOff>5000</xdr:rowOff></xdr:from>"
+        '<xdr:ext cx="400000" cy="150000"/>'
+        "<xdr:pic>"
+        "<xdr:nvPicPr>"
+        '<xdr:cNvPr id="2" name="Picture 1"/>'
+        "<xdr:cNvPicPr/>"
+        "</xdr:nvPicPr>"
+        '<xdr:blipFill><a:blip r:embed="rIdEmbed"/></xdr:blipFill>'
+        "<xdr:spPr/>"
+        "</xdr:pic>"
+        "<xdr:clientData/>"
+        "</xdr:oneCellAnchor>"
+    )
+
+
+def _add_drawing_with_image(entries, image_path, anchor_xml, with_hyperlink):
     """Splices a `<drawing>`-anchored image onto sheet1, the same way
     `_add_shared_strings_part` splices in a part openpyxl's high-level API
     doesn't write directly — openpyxl *can* insert images via
     `openpyxl.drawing.image.Image`, but only by shelling out to Pillow to
     read the file, which this repository doesn't want as a fixture-generation
     dependency. Hand-building the four OOXML parts a real image insertion
-    produces (`xl/media/image1.png`, `xl/drawings/drawing1.xml` with a
-    `twoCellAnchor`, `xl/drawings/_rels/drawing1.xml.rels`, and
+    produces (`xl/media/image1.png`, `xl/drawings/drawing1.xml` — its
+    anchor supplied by the caller as `anchor_xml`, either
+    `_two_cell_anchor_xml` or `_one_cell_anchor_xml` — plus
+    `xl/drawings/_rels/drawing1.xml.rels` and
     `xl/worksheets/_rels/sheet1.xml.rels`) sidesteps that while still
     exercising the genuine `<drawing r:id="...">` cross-reference a real
-    writer emits (Issue #65).
+    writer emits (Issue #65). `drawing1.xml.rels`'s hyperlink relationship is
+    only registered when `with_hyperlink` is set — an unreferenced
+    relationship would still resolve fine, but omitting it keeps the "no
+    hyperlink" fixture from implying one exists that nothing in
+    `drawing1.xml` actually points at.
     """
     with open(image_path, "rb") as f:
         entries["xl/media/image1.png"] = f.read()
@@ -98,36 +155,25 @@ def _add_drawing_with_image(entries, image_path):
         '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
         'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        "<xdr:twoCellAnchor>"
-        "<xdr:from><xdr:col>1</xdr:col><xdr:colOff>10000</xdr:colOff>"
-        "<xdr:row>1</xdr:row><xdr:rowOff>20000</xdr:rowOff></xdr:from>"
-        "<xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff>"
-        "<xdr:row>8</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>"
-        "<xdr:pic>"
-        "<xdr:nvPicPr>"
-        '<xdr:cNvPr id="2" name="Picture 1">'
-        '<a:hlinkClick r:id="rIdHyperlink"/>'
-        "</xdr:cNvPr>"
-        "<xdr:cNvPicPr/>"
-        "</xdr:nvPicPr>"
-        '<xdr:blipFill><a:blip r:embed="rIdEmbed"/></xdr:blipFill>'
-        "<xdr:spPr/>"
-        "</xdr:pic>"
-        "<xdr:clientData/>"
-        "</xdr:twoCellAnchor>"
-        "</xdr:wsDr>"
+        + anchor_xml
+        + "</xdr:wsDr>"
     ).encode("utf-8")
 
+    hyperlink_rel = (
+        '<Relationship Id="rIdHyperlink" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" '
+        'Target="https://example.com/sample-image" TargetMode="External"/>'
+        if with_hyperlink
+        else ""
+    )
     entries["xl/drawings/_rels/drawing1.xml.rels"] = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
         '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
         '<Relationship Id="rIdEmbed" '
         'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
         'Target="../media/image1.png"/>'
-        '<Relationship Id="rIdHyperlink" '
-        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" '
-        'Target="https://example.com/sample-image" TargetMode="External"/>'
-        "</Relationships>"
+        + hyperlink_rel
+        + "</Relationships>"
     ).encode("utf-8")
 
     entries["xl/worksheets/_rels/sheet1.xml.rels"] = (
@@ -252,13 +298,15 @@ def multi_sheet_states():
 
 
 def embedded_image():
-    """A picture anchored to B2:E9 (Issue #65), carrying both an embedded
-    media relationship and the image's own (External) hyperlink — the two
-    relationship kinds `pipeline.rs`'s Phase 3.5 resolves against
-    `drawing1.xml.rels`. Uses the checked-in
+    """A picture anchored to B2:E9 via `twoCellAnchor` (Issue #65) — placed
+    *across* a multi-cell range rather than confined to one, carrying both
+    an embedded media relationship and the image's own (External)
+    hyperlink, the two relationship kinds `pipeline.rs`'s Phase 3.5 resolves
+    against `drawing1.xml.rels`. Uses the checked-in
     `scripts/fixtures_assets/sample_image.png` as the embedded media's real
     bytes, even though xlsxparser itself never reads them (Issue #65's
-    stated scope stops at the anchor position and target *path*).
+    stated scope stops at the anchor position and target *path*). Contrast
+    `embedded_image_one_cell`, the single-cell-confined counterpart.
     """
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -268,7 +316,35 @@ def embedded_image():
     wb.save(path)
 
     image_path = os.path.join(ROOT, "scripts", "fixtures_assets", "sample_image.png")
-    _mutate_zip_entries(path, lambda entries: _add_drawing_with_image(entries, image_path))
+    _mutate_zip_entries(
+        path,
+        lambda entries: _add_drawing_with_image(
+            entries, image_path, _two_cell_anchor_xml(with_hyperlink=True), with_hyperlink=True
+        ),
+    )
+    return path
+
+
+def embedded_image_one_cell():
+    """A picture anchored at C5 via `oneCellAnchor` (Issue #65), sized well
+    under a default cell's dimensions — confined *within* a single cell,
+    unlike `embedded_image`'s multi-cell `twoCellAnchor` span. Has no
+    hyperlink, so `Image::hyperlink` should resolve to `None`.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws["A1"] = "icon"
+    path = os.path.join(COMPLEX_DIR, "embedded_image_one_cell.xlsx")
+    wb.save(path)
+
+    image_path = os.path.join(ROOT, "scripts", "fixtures_assets", "sample_image.png")
+    _mutate_zip_entries(
+        path,
+        lambda entries: _add_drawing_with_image(
+            entries, image_path, _one_cell_anchor_xml(), with_hyperlink=False
+        ),
+    )
     return path
 
 
@@ -471,6 +547,7 @@ def main():
         houganshi_merged,
         multi_sheet_states,
         embedded_image,
+        embedded_image_one_cell,
         extreme_sparse,
         corrupted_xml,
         missing_relations,
