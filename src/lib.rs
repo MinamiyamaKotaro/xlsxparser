@@ -35,8 +35,9 @@ pub use container::sanitize::SizeLimits;
 pub use error::{Error, Result};
 pub use json::{to_json_string, to_json_writer};
 pub use model::{
-    Alignment, Cell, CellRef, CellValue, ColWidthRange, DateTimeValue, Font, MergedRegion,
-    ResolvedStyle, Sheet, SheetVisibility, StyleId, Workbook,
+    Alignment, AnchorMarker, Cell, CellRef, CellValue, ColWidthRange, DateTimeValue, Font, Image,
+    ImageAnchor, ImageExtent, MergedRegion, ResolvedStyle, Sheet, SheetVisibility, StyleId,
+    Workbook,
 };
 
 use std::fs::File;

@@ -124,6 +124,17 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
         })?;
         let output =
             parse::parse_worksheet(BufReader::new(reader), &route.worksheet_path, &mut sheet)?;
+
+        // --- Phase 3.5: image anchor resolution (Issue #65), only if this
+        // sheet declared a <drawing r:id>. Kept in pipeline.rs rather than
+        // resolve/, since every step here does ZIP I/O and resolve/'s
+        // I/O-independence (architecture.md design principle 2) must not be
+        // compromised. ---
+        if let Some(drawing_r_id) = &output.drawing_r_id {
+            let images = resolve_sheet_images(&mut container, &route.worksheet_path, drawing_r_id)?;
+            sheet.set_images(images);
+        }
+
         resolve::resolve_sheet(
             &mut sheet,
             &output.pending_shared_strings,
@@ -142,6 +153,145 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
     // StyleSheet once Phase 4 completes").
 
     Ok(Workbook::new(sheets))
+}
+
+/// Computes the `_rels` part path for a given OPC part (e.g.
+/// `"xl/worksheets/sheet1.xml"` -> `"xl/worksheets/_rels/sheet1.xml.rels"`),
+/// alongside the part's own directory (`"xl/worksheets"`) — the anchor
+/// `parse::parse_relationships` needs to resolve that rels part's relative
+/// `Target` paths. Generalizes the pattern `WORKBOOK_RELS_PATH`/`"xl"`
+/// already hard-codes for the one workbook-level rels file, to any per-part
+/// rels file (Issue #65: needed for both the worksheet's own rels, which
+/// locates `drawingN.xml`, and that drawing's rels, which locates the
+/// embedded media).
+fn rels_path_for(part_path: &str) -> (String, &str) {
+    match part_path.rfind('/') {
+        Some(idx) => {
+            let dir = &part_path[..idx];
+            let file_name = &part_path[idx + 1..];
+            (format!("{dir}/_rels/{file_name}.rels"), dir)
+        }
+        None => (format!("_rels/{part_path}.rels"), ""),
+    }
+}
+
+/// Phase 3.5: resolves a worksheet's `<drawing r:id>` all the way down to a
+/// `Vec<model::Image>` — locating `drawingN.xml` via the worksheet's own
+/// `_rels`, parsing it (`parse::parse_drawing`), then resolving each
+/// `<xdr:pic>`'s `r:embed`/hyperlink `r:id` against `drawingN.xml`'s own
+/// `_rels`.
+///
+/// Error handling mirrors how `route.worksheet_path` itself is resolved
+/// above: any `r:id` referenced by the XML that fails to resolve — whether
+/// because the `_rels` part doesn't exist at all, the `r:id` isn't in it, or
+/// the target it resolves to has no matching ZIP entry — is
+/// `Error::DanglingRelationship`, fail-fast. This sheet already declared
+/// `<drawing r:id="...">`, so an unresolvable reference here means a
+/// genuinely broken package, not an absent optional feature (contrast the
+/// sharedStrings/styles relationship-type-absent case above, which
+/// legitimately falls back to an empty default instead).
+///
+/// Only an `Internal` (in-package) target's existence is verified against
+/// the ZIP; an `External` one (a hyperlink URL, most commonly) is kept
+/// as-is without a filesystem check, since this library never fetches
+/// external resources. Neither branch ever reads the target's bytes — only
+/// `get_entry`'s `Option` is inspected — so resolving images costs O(image
+/// count), never O(image size).
+fn resolve_sheet_images<R: Read + Seek>(
+    container: &mut ZipContainer<R>,
+    worksheet_path: &str,
+    drawing_r_id: &str,
+) -> Result<Vec<crate::model::Image>, Error> {
+    let (worksheet_rels_path, worksheet_dir) = rels_path_for(worksheet_path);
+    let worksheet_rels_reader =
+        container
+            .get_entry(&worksheet_rels_path)?
+            .ok_or_else(|| Error::DanglingRelationship {
+                r_id: drawing_r_id.to_string(),
+            })?;
+    let worksheet_rels = parse::parse_relationships(
+        BufReader::new(worksheet_rels_reader),
+        worksheet_dir,
+        &worksheet_rels_path,
+    )?;
+    let drawing_path = worksheet_rels
+        .get(drawing_r_id)
+        .ok_or_else(|| Error::DanglingRelationship {
+            r_id: drawing_r_id.to_string(),
+        })?
+        .target
+        .clone();
+
+    let drawing_reader =
+        container
+            .get_entry(&drawing_path)?
+            .ok_or_else(|| Error::DanglingRelationship {
+                r_id: drawing_path.clone(),
+            })?;
+    let pending_images = parse::parse_drawing(BufReader::new(drawing_reader), &drawing_path)?;
+    if pending_images.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (drawing_rels_path, drawing_dir) = rels_path_for(&drawing_path);
+    let drawing_rels = match container.get_entry(&drawing_rels_path)? {
+        Some(reader) => Some(parse::parse_relationships(
+            BufReader::new(reader),
+            drawing_dir,
+            &drawing_rels_path,
+        )?),
+        None => None,
+    };
+
+    let mut images = Vec::with_capacity(pending_images.len());
+    for pending in pending_images {
+        let rels = drawing_rels
+            .as_ref()
+            .ok_or_else(|| Error::DanglingRelationship {
+                r_id: pending.embed_r_id.clone(),
+            })?;
+
+        let embed_rel =
+            rels.get(&pending.embed_r_id)
+                .ok_or_else(|| Error::DanglingRelationship {
+                    r_id: pending.embed_r_id.clone(),
+                })?;
+        if embed_rel.target_mode == parse::TargetMode::Internal
+            && container.get_entry(&embed_rel.target)?.is_none()
+        {
+            return Err(Error::DanglingRelationship {
+                r_id: pending.embed_r_id.clone(),
+            });
+        }
+        let target = embed_rel.target.clone();
+
+        let hyperlink = match &pending.hyperlink_r_id {
+            Some(hyperlink_r_id) => {
+                let hyperlink_rel =
+                    rels.get(hyperlink_r_id)
+                        .ok_or_else(|| Error::DanglingRelationship {
+                            r_id: hyperlink_r_id.clone(),
+                        })?;
+                if hyperlink_rel.target_mode == parse::TargetMode::Internal
+                    && container.get_entry(&hyperlink_rel.target)?.is_none()
+                {
+                    return Err(Error::DanglingRelationship {
+                        r_id: hyperlink_r_id.clone(),
+                    });
+                }
+                Some(hyperlink_rel.target.clone())
+            }
+            None => None,
+        };
+
+        images.push(crate::model::Image {
+            anchor: pending.anchor,
+            target,
+            hyperlink,
+        });
+    }
+
+    Ok(images)
 }
 
 #[cfg(test)]
@@ -564,5 +714,154 @@ mod tests {
         ]);
         let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
         assert_eq!(workbook.sheets().len(), 3);
+    }
+
+    const WORKSHEET_WITH_DRAWING_XML: &[u8] =
+        br#"<worksheet><sheetData></sheetData><drawing r:id="rIdDrawing"/></worksheet>"#;
+
+    const WORKSHEET_RELS_WITH_DRAWING: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdDrawing" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>
+</Relationships>"#;
+
+    const DRAWING1_XML: &[u8] = br#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <xdr:twoCellAnchor>
+    <xdr:from><xdr:col>1</xdr:col><xdr:colOff>10</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>20</xdr:rowOff></xdr:from>
+    <xdr:to><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>10</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+    <xdr:pic>
+      <xdr:nvPicPr>
+        <xdr:cNvPr id="2" name="Picture 1">
+          <a:hlinkClick r:id="rIdHyperlink"/>
+        </xdr:cNvPr>
+        <xdr:cNvPicPr/>
+      </xdr:nvPicPr>
+      <xdr:blipFill><a:blip r:embed="rIdEmbed"/></xdr:blipFill>
+    </xdr:pic>
+    <xdr:clientData/>
+  </xdr:twoCellAnchor>
+</xdr:wsDr>"#;
+
+    const DRAWING1_RELS_XML: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdEmbed" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+  <Relationship Id="rIdHyperlink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com" TargetMode="External"/>
+</Relationships>"#;
+
+    fn xlsx_with_drawing_entries() -> Vec<(&'static str, &'static [u8])> {
+        vec![
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            ("xl/worksheets/sheet1.xml", WORKSHEET_WITH_DRAWING_XML),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                WORKSHEET_RELS_WITH_DRAWING,
+            ),
+            ("xl/drawings/drawing1.xml", DRAWING1_XML),
+            ("xl/drawings/_rels/drawing1.xml.rels", DRAWING1_RELS_XML),
+            ("xl/media/image1.png", b"\x89PNG\r\n\x1a\n" as &[u8]),
+        ]
+    }
+
+    #[test]
+    fn image_anchor_resolves_end_to_end_with_embed_and_hyperlink() {
+        use crate::model::{AnchorMarker, ImageAnchor};
+
+        let zip = build_zip(&xlsx_with_drawing_entries());
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+        let images = workbook.sheets()[0].images();
+        assert_eq!(images.len(), 1);
+        let image = &images[0];
+        assert_eq!(image.target, "xl/media/image1.png");
+        assert_eq!(image.hyperlink.as_deref(), Some("https://example.com"));
+        assert_eq!(
+            image.anchor,
+            ImageAnchor::TwoCell {
+                from: AnchorMarker {
+                    cell: CellRef { row: 3, col: 2 },
+                    col_off: 10,
+                    row_off: 20,
+                },
+                to: AnchorMarker {
+                    cell: CellRef { row: 11, col: 6 },
+                    col_off: 0,
+                    row_off: 0,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn sheet_without_drawing_element_has_no_images() {
+        let zip = build_zip(&minimal_xlsx_entries());
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+        assert!(workbook.sheets()[0].images().is_empty());
+    }
+
+    fn minimal_xlsx_entries() -> Vec<(&'static str, &'static [u8])> {
+        vec![
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            ("xl/worksheets/sheet1.xml", WORKSHEET_XML),
+        ]
+    }
+
+    #[test]
+    fn drawing_r_id_with_no_worksheet_rels_part_is_dangling_relationship() {
+        // <drawing r:id> is present in the worksheet XML, but no
+        // xl/worksheets/_rels/sheet1.xml.rels part exists at all — a
+        // genuinely broken package, not the "optional feature absent" case
+        // (contrast missing_styles_relationship_falls_back_to_empty_stylesheet).
+        let mut entries = xlsx_with_drawing_entries();
+        entries.retain(|(name, _)| *name != "xl/worksheets/_rels/sheet1.xml.rels");
+        let zip = build_zip(&entries);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::DanglingRelationship { .. }));
+    }
+
+    #[test]
+    fn drawing_r_id_not_in_worksheet_rels_is_dangling_relationship() {
+        let rels_without_the_drawing_id: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>"#;
+        let mut entries = xlsx_with_drawing_entries();
+        for entry in &mut entries {
+            if entry.0 == "xl/worksheets/_rels/sheet1.xml.rels" {
+                entry.1 = rels_without_the_drawing_id;
+            }
+        }
+        let zip = build_zip(&entries);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::DanglingRelationship { .. }));
+    }
+
+    #[test]
+    fn missing_drawing_entity_is_dangling_relationship() {
+        let mut entries = xlsx_with_drawing_entries();
+        entries.retain(|(name, _)| *name != "xl/drawings/drawing1.xml");
+        let zip = build_zip(&entries);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::DanglingRelationship { .. }));
+    }
+
+    #[test]
+    fn missing_embedded_media_entity_is_dangling_relationship() {
+        // The rels correctly point to xl/media/image1.png, but the entry
+        // itself doesn't exist in the ZIP.
+        let mut entries = xlsx_with_drawing_entries();
+        entries.retain(|(name, _)| *name != "xl/media/image1.png");
+        let zip = build_zip(&entries);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::DanglingRelationship { .. }));
+    }
+
+    #[test]
+    fn missing_drawing_rels_part_is_dangling_relationship() {
+        // drawing1.xml itself parses fine (it has a <xdr:pic>), but there is
+        // no xl/drawings/_rels/drawing1.xml.rels to resolve r:embed against.
+        let mut entries = xlsx_with_drawing_entries();
+        entries.retain(|(name, _)| *name != "xl/drawings/_rels/drawing1.xml.rels");
+        let zip = build_zip(&entries);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::DanglingRelationship { .. }));
     }
 }

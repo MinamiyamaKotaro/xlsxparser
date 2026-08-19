@@ -6,13 +6,15 @@
 //! submodule live here; each submodule interprets one OOXML part's
 //! structure.
 
+mod drawing;
 mod relationships;
 mod shared_strings;
 mod styles;
 mod workbook;
 mod worksheet;
 
-pub(crate) use relationships::parse_relationships;
+pub(crate) use drawing::parse_drawing;
+pub(crate) use relationships::{parse_relationships, TargetMode};
 pub(crate) use shared_strings::{parse_shared_strings, SharedStringTable};
 pub(crate) use styles::parse_styles;
 pub(crate) use workbook::parse_workbook_xml;
@@ -367,6 +369,44 @@ fn normalize_line_endings(s: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     std::borrow::Cow::Owned(out)
+}
+
+/// Reads the text content of a leaf element (`<v>...</v>`, `<f>...</f>`,
+/// `<xdr:col>...</xdr:col>`) — no nested elements are expected — resolving
+/// any `Event::GeneralRef` entities along the way. Called with the reader
+/// positioned just after the element's opening tag; consumes events up to
+/// and including its closing tag. Shared by `worksheet.rs` and
+/// `drawing.rs`, the two modules whose leaf elements carry plain numeric/
+/// text content rather than a nested run structure (contrast
+/// `concat_rich_text`, which handles `<si>`/`<is>`'s richer `<r><t>` shape).
+pub(crate) fn read_leaf_text(
+    reader: &mut Reader<impl BufRead>,
+    path: &str,
+) -> Result<String, Error> {
+    let mut text = String::new();
+    let mut buf = Vec::new();
+    loop {
+        match read_event(reader, &mut buf, path)? {
+            Event::Text(e) => {
+                let decoded = e.decode().map_err(|err| Error::XmlParse {
+                    path: path.to_string(),
+                    source: Box::new(err),
+                })?;
+                text.push_str(&decoded);
+            }
+            Event::GeneralRef(e) => push_general_ref(&mut text, &e, path)?,
+            Event::End(_) => break,
+            Event::Eof => {
+                return Err(Error::MissingRequiredElement {
+                    path: path.to_string(),
+                    name: "closing tag",
+                })
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(text)
 }
 
 #[cfg(test)]

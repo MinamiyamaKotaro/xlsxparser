@@ -45,6 +45,61 @@ pub struct ColWidthRange {
     pub width: f64,
 }
 
+/// A cell-anchored image reference (Issue #65). Holds only the anchor
+/// geometry and the resolved target path of the embedded media part — never
+/// the image's own bytes, which stay out of scope (a diff-oriented tool has
+/// no use for pixel data, and reading it would scale memory use with image
+/// count rather than cell count).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Image {
+    pub anchor: ImageAnchor,
+    /// Resolved path to the embedded media part (e.g. "xl/media/image1.png").
+    pub target: String,
+    /// The image's own hyperlink target (`xdr:cNvPr/a:hlinkClick`), if any —
+    /// distinct from a cell hyperlink, which this library does not parse.
+    /// An `Internal` relationship resolves to a ZIP-entry-name-equivalent
+    /// path like `target`; an `External` one keeps the URI verbatim.
+    pub hyperlink: Option<String>,
+}
+
+/// The two anchor shapes DrawingML defines (`xdr:twoCellAnchor` /
+/// `xdr:oneCellAnchor`), modeled as an enum rather than a struct with
+/// `Option` fields so an invalid combination (e.g. a `TwoCell` anchor
+/// missing its `to` marker) cannot be constructed (Issue #65 design
+/// discussion).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageAnchor {
+    TwoCell {
+        from: AnchorMarker,
+        to: AnchorMarker,
+    },
+    OneCell {
+        from: AnchorMarker,
+        ext: ImageExtent,
+    },
+}
+
+/// One `xdr:from`/`xdr:to` marker: a cell plus its EMU-unit offset within
+/// that cell. Keeping the offset (rather than rounding to the containing
+/// cell, the way `MergedRegion` works) is what lets a diff distinguish an
+/// image nudged a few pixels within the same cell from one that hasn't
+/// moved at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnchorMarker {
+    pub cell: CellRef,
+    pub col_off: i64,
+    pub row_off: i64,
+}
+
+/// `xdr:ext`: an image's width/height in EMU (English Metric Units), used
+/// only by `ImageAnchor::OneCell` — a `TwoCell` anchor's size is already
+/// implicit in its `from`/`to` markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageExtent {
+    pub cx: i64,
+    pub cy: i64,
+}
+
 /// A sheet's visibility (`workbook.xml`'s `<sheet state="...">`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SheetVisibility {
@@ -97,6 +152,11 @@ pub struct Sheet {
     /// itself falls back to a font-metric-derived default in that case,
     /// which this library does not compute — see `column_width`'s doc).
     default_col_width: Option<f64>,
+    /// Images anchored to this sheet (Issue #65). Not keyed by cell — an
+    /// anchor's position doesn't always align to a single cell's
+    /// boundaries, and unlike a merged region's data, an image isn't
+    /// "owned" by whichever cell it happens to overlap.
+    images: Vec<Image>,
 }
 
 impl Sheet {
@@ -113,6 +173,7 @@ impl Sheet {
             max_col: 0,
             col_widths: Vec::new(),
             default_col_width: None,
+            images: Vec::new(),
         }
     }
 
@@ -374,6 +435,19 @@ impl Sheet {
 
     pub fn default_col_width(&self) -> Option<f64> {
         self.default_col_width
+    }
+
+    /// Registers this sheet's images (Issue #65). Called once by
+    /// `pipeline::run` after resolving every `<xdr:pic>`'s `r:embed`/
+    /// hyperlink relationship against `drawingN.xml.rels`.
+    pub(crate) fn set_images(&mut self, images: Vec<Image>) {
+        self.images = images;
+    }
+
+    /// The sheet's images, for JSON output as a sheet-level `images` array —
+    /// the same sparse-output rationale as `col_width_ranges`.
+    pub fn images(&self) -> &[Image] {
+        &self.images
     }
 }
 

@@ -114,7 +114,7 @@ fn resolve_target_path(base_dir: &str, target: &str) -> String {
 
 ## 未決事項 / オープンクエスチョン
 
-1. **本ファイルが解析対象とする `_rels` パーツの範囲**: 現状は特定パーツに限定しない汎用的な `_rels` パーサーとして設計しているが、本Issueのスコープが必要とするのは `xl/_rels/workbook.xml.rels`（シート・共有文字列・スタイルへのルーティング）のみである。メディア埋め込み（画像等）や `[Content_Types].xml` に対応する rels など、要求仕様書のスコープ外の関係タイプへの対応要否は未確定。
+1. ~~本ファイルが解析対象とする `_rels` パーツの範囲~~ → **解決**: 元々は特定パーツに限定しない汎用的な `_rels` パーサーとして設計しており、メディア埋め込み対応の要否は未確定だった。Issue [#65](https://github.com/MinamiyamaKotaro/xlsxparser/issues/65) がこれに回答した: `xl/worksheets/_rels/sheetN.xml.rels` と `xl/drawings/_rels/drawingN.xml.rels` にも既存の汎用パーサーをそのまま再利用し、本ファイルへの変更は不要だった([drawing.md](drawing.md) 参照)。`[Content_Types].xml` のrels対応は依然として未確定。
 2. **`resolve_target_path` の過剰な `..` に対する扱い**: 現状は本関数自身ではエラーにせず、最終防御を `container::get_entry` の再検証に委ねる設計（多層防御）とした。`segments` が空になった、または `base_dir` の外側へ抜けたことが本関数の時点で明確に判定できるケースについて、ここで早期に `Error::ZipSlipDetected` 相当として拒否すべきかは、多層防御の各層の責務分担として要検討。
 3. **`Relationship.rel_type` の型**: 現状フルURI文字列（`String`）のまま保持しているが、呼び出し元（`pipeline.rs`）が既知の関係タイプ（worksheet/sharedStrings/styles等）を判定する際に文字列比較を都度行うことになる。既知タイプを表す `enum` を事前定義し変換するかは、`pipeline.rs` の設計時にあわせて確定させる。
 4. ~~名前空間の扱い~~ → **解決**: [parse/mod.md オープンクエスチョン4](mod.md) で確定した「`quick_xml::NsReader` は採用せず文字列前方一致で簡略化する」方針に従う。`_rels` XML自体は固定の名前空間（`http://schemas.openxmlformats.org/package/2006/relationships`）を持つが、要素名・属性名（`Relationship`, `Id`, `Type`, `Target`, `TargetMode`）に接頭辞は付かないため、本ファイルへの影響は他モジュールに比べ限定的である。

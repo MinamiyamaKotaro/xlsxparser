@@ -30,6 +30,7 @@ src/
     shared_strings.rs     # Parsing of sharedStrings.xml (extracting structured SST data)
     styles.rs             # Parsing of styles.xml (fonts/fills/borders/numFmts/cellXfs)
     worksheet.rs          # Phase 3: SAX-style stream parse of sheetX.xml (per-row disposal completes here)
+    drawing.rs             # Phase 3.5: parses drawingN.xml's image anchors (Issue #65)
 
   model/                    # Pure domain model (no dependency on XML parsing or resolution logic)
     mod.rs

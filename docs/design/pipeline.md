@@ -12,6 +12,7 @@
 - ルーティングプラン構築後、rels読み込みに使ったリーダーと [`parse::RelationshipMap`](parse/relationships.md) をスコープアウトさせ破棄する（architecture.md「フェーズ1完了時にルーティングマップ構築後、`_rels` の一時バッファを破棄する」の実装）
 - ルーティングプラン確定後、シートループに入る前に [`SharedStringTable`](parse/shared_strings.md) と [`StyleSheet`](model/style.md) を一度だけ構築する
 - シートごとに [`model::Sheet::new`](model/sheet.md) で空シートを構築し、対応するエントリを [`parse::parse_worksheet`](parse/worksheet.md) に渡してストリームでセルを挿入させ（フェーズ3）、その出力を [`resolve::resolve_sheet`](resolve/mod.md) へ渡して解決する（フェーズ4）
+- **フェーズ3.5**(Issue [#65](https://github.com/MinamiyamaKotaro/xlsxparser/issues/65)): フェーズ3が当該シートの `<drawing r:id="...">` を収集していれば、それを `Vec<model::Image>` まで解決する — ワークシート自身の `_rels` を読んで `drawingN.xml` を特定し、[`parse::parse_drawing`](parse/drawing.md) でパースした上で、`drawingN.xml` 自身の `_rels` を読んで各 `<xdr:pic>` の `r:embed`/ハイパーリンク `r:id` をターゲットパスへ解決する。`Internal` なターゲットはバイト列を一切読まずZIP内の存在のみ検証する。全ステップがZIP I/Oを伴うため `resolve/` ではなくここに置く([drawing.md](parse/drawing.md) の依存関係参照)。フェーズ3とフェーズ4の間で実行するが、どちらともデータ依存はない(`resolve_sheet` は `Sheet::images` に一切触れない)ため、実行順序自体は本質的ではない
 - 全シートの処理完了後、[`SharedStringTable`](parse/shared_strings.md) と [`StyleSheet`](model/style.md) をスコープアウトさせ破棄し、[`model::Workbook::new`](model/workbook.md) で最終モデルを構築して返す
 - **含まない責務**: 各フェーズそのもののロジック（ZIP展開・サニタイズは `container/`、XML構造の解釈は `parse/`、意味解決は `resolve/`）、行単位のXMLノード破棄（フェーズ3の内部詳細であり `parse/worksheet.rs` が担う。architecture.md「`pipeline.rs` はこれを制御しない」）、JSON生成そのもの（[`json.rs`](json.md)。呼び出すかどうかの設計上の位置づけはオープンクエスチョン1参照）
 
