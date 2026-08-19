@@ -51,6 +51,8 @@ import zipfile
 import zlib
 
 import openpyxl
+from openpyxl.styles import PatternFill
+from openpyxl.styles.colors import Color
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NORMAL_DIR = os.path.join(ROOT, "tests", "fixtures", "normal")
@@ -592,6 +594,30 @@ def grouped_images():
     return path
 
 
+def styled_fill_color():
+    """Three cells with a `solid` pattern fill (Issue #75): A1 an RGB
+    direct-specification fill, A2 a theme+tint fill, A3 a plain (no-fill)
+    cell for contrast. Unlike `embedded_image`, openpyxl's own
+    `PatternFill`/`Color` API covers this natively — no manual OOXML
+    part-splicing is needed.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws["A1"] = "rgb fill"
+    ws["A1"].fill = PatternFill(
+        start_color="FFFF0000", end_color="FFFF0000", fill_type="solid"
+    )
+    ws["A2"] = "theme fill"
+    ws["A2"].fill = PatternFill(
+        fgColor=Color(theme=4, tint=-0.25), fill_type="solid"
+    )
+    ws["A3"] = "no fill"
+    path = os.path.join(COMPLEX_DIR, "styled_fill_color.xlsx")
+    wb.save(path)
+    return path
+
+
 def extreme_sparse():
     """A1 and Excel's absolute bottom-right corner, XFD1048576, populated —
     nothing in between.
@@ -815,6 +841,7 @@ def main():
         embedded_image,
         embedded_image_one_cell,
         grouped_images,
+        styled_fill_color,
         extreme_sparse,
         corrupted_xml,
         missing_relations,

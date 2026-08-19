@@ -15,5 +15,5 @@ pub use sheet::{
     AnchorMarker, ColWidthRange, Image, ImageAnchor, ImageExtent, MergedRegion, Sheet,
     SheetVisibility,
 };
-pub use style::{Alignment, Font, ResolvedStyle, StyleId, StyleSheet};
+pub use style::{Alignment, ColorRef, Font, ResolvedStyle, StyleId, StyleSheet};
 pub use workbook::Workbook;

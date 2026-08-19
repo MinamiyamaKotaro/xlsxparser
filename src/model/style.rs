@@ -39,6 +39,38 @@ impl Default for Font {
     }
 }
 
+/// A cell fill's foreground/background color, exactly as `<fgColor>`/
+/// `<bgColor>` specify it (Issue #75) — kept in its raw, unresolved form
+/// rather than converted to a final displayed RGB value. xlsxparser's
+/// output is for diffing, not rendering: comparing two `ColorRef`s directly
+/// (`PartialEq`) already answers "did this cell's fill color change?"
+/// without ever needing to know what color it actually displays as.
+/// Resolving `Theme`/`Indexed` to a real RGB value — parsing `theme{N}.xml`,
+/// applying the `tint` luminance adjustment, looking up the legacy 64-color
+/// palette — is Issue #76's separate concern, needed only by a display use
+/// case, not a diff one.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColorRef {
+    /// `rgb="FFFF0000"` — an 8-hex-digit ARGB string, kept verbatim.
+    /// `Arc<str>` for the same reason `number_format` uses it: many
+    /// `StyleId`s commonly share the same `fillId` (and thus the same
+    /// color), so cloning it per-style should be a refcount bump, not a
+    /// fresh heap allocation.
+    Rgb(Arc<str>),
+    /// `theme="4" tint="-0.25"` — an index into the workbook's
+    /// `theme{N}.xml` `<clrScheme>` (12 slots: dk1/lt1/dk2/lt2/accent1-6/
+    /// hlink/folHlink), plus an optional luminance adjustment. `tint` is
+    /// never present in `theme{N}.xml` itself — it's attached per
+    /// reference site (here, in `styles.xml`) — so `None` means "no
+    /// `tint` attribute at all" (distinct from an explicit `tint="0"`).
+    Theme { index: u32, tint: Option<f64> },
+    /// `indexed="64"` — an index into the legacy, pre-OOXML 64-color
+    /// palette (64 = "System Foreground", 65 = "System Background" are the
+    /// two special values). Real-world writers rarely emit this for a
+    /// cell's own fill color today, but it remains part of the schema.
+    Indexed(u32),
+}
+
 /// `<xf><alignment horizontal=".."/></xf>`'s horizontal alignment (ECMA-376
 /// `ST_HorizontalAlignmentValues`), Issue #42. An `enum` rather than a
 /// string so it stays a cheap `Copy` value (Issue #42's stated performance
@@ -87,8 +119,20 @@ pub struct ResolvedStyle {
     /// string across every `StyleId` that shares the same `numFmtId`, the
     /// same reasoning `CellValue::Text` already applies.
     pub number_format: Option<Arc<str>>,
-    // Concrete fields for fill/border etc. are added as their own
-    // sub-issues land (see docs/design/model/style.en.md Open Question 1).
+    /// `<fill><patternFill><fgColor .../></patternFill></fill>` (Issue
+    /// #75), raw/unresolved — see [`ColorRef`]. `None` when the `<fill>`
+    /// has no `<fgColor>` at all (e.g. `patternType="none"`/`"gray125"`
+    /// with no color children), not just when `fillId` is absent/0.
+    pub fill_fg_color: Option<ColorRef>,
+    /// Same as `fill_fg_color`, for `<bgColor>`. For a `solid` pattern fill
+    /// (the only pattern this library's callers have needed so far),
+    /// `fgColor` is what Excel actually paints the cell with — `bgColor` is
+    /// a secondary layer only visible through non-solid hatching patterns
+    /// — but both are kept since either can independently change between
+    /// two versions of a file, which is what a diff cares about.
+    pub fill_bg_color: Option<ColorRef>,
+    // Concrete fields for border etc. are added as their own sub-issues
+    // land (see docs/design/model/style.en.md Open Question 1).
 }
 
 /// A table looking up `ResolvedStyle` by `cellXfs` index. Built by

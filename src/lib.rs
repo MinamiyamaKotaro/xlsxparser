@@ -35,9 +35,9 @@ pub use container::sanitize::SizeLimits;
 pub use error::{Error, Result};
 pub use json::{to_json_string, to_json_writer};
 pub use model::{
-    Alignment, AnchorMarker, Cell, CellRef, CellValue, ColWidthRange, DateTimeValue, Font, Image,
-    ImageAnchor, ImageExtent, MergedRegion, ResolvedStyle, Sheet, SheetVisibility, StyleId,
-    Workbook,
+    Alignment, AnchorMarker, Cell, CellRef, CellValue, ColWidthRange, ColorRef, DateTimeValue,
+    Font, Image, ImageAnchor, ImageExtent, MergedRegion, ResolvedStyle, Sheet, SheetVisibility,
+    StyleId, Workbook,
 };
 
 use std::fs::File;
@@ -324,6 +324,7 @@ mod tests {
         assert_reachable::<crate::ResolvedStyle>();
         assert_reachable::<crate::StyleId>();
         assert_reachable::<crate::Alignment>();
+        assert_reachable::<crate::ColorRef>();
         assert_reachable::<crate::DateTimeValue>();
         assert_reachable::<crate::SizeLimits>();
         assert_reachable::<crate::Error>();

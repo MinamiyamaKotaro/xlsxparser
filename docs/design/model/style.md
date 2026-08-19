@@ -88,8 +88,37 @@ pub struct ResolvedStyle {
     /// `Arc<str>` を採用する理由は `CellValue::Text` と同じ: 同一の
     /// 書式コードが多数の `StyleId` 間で共有されることが多いため。
     pub number_format: Option<Arc<str>>,
-    // fill/border等その他のプロパティは、各サブIssueの実装が進むにつれて
+    /// `<fill><patternFill><fgColor .../></patternFill></fill>`
+    /// (Issue #75)、生の指定のまま——下記の`ColorRef`参照。
+    pub fill_fg_color: Option<ColorRef>,
+    /// `fill_fg_color`と同様、`<bgColor>`用。
+    pub fill_bg_color: Option<ColorRef>,
+    // border等その他のプロパティは、各サブIssueの実装が進むにつれて
     // 追加する(オープンクエスチョン1参照)。
+}
+
+/// セル塗りつぶしの前景色/背景色を、`<fgColor>`/`<bgColor>`が指定する
+/// そのままの形で保持する(Issue #75)——最終的な表示RGB値へは変換
+/// しない。xlsxparserの出力はレンダリング用ではなくdiff用途であり、
+/// 「塗りつぶし色が変わったこと」の検出には`ColorRef`同士を直接比較
+/// (`PartialEq`)すれば十分で、実際に何色として表示されるかを知る
+/// 必要はない。`Theme`/`Indexed`を実RGB値へ解決するのは別の
+/// 表示用途の関心事(Issue #76)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColorRef {
+    /// `rgb="FFFF0000"`、そのまま保持。`Arc<str>`を使う理由は
+    /// `number_format`と同じ——多数の`StyleId`が同一`fillId`を
+    /// 共有することが多いため。
+    Rgb(Arc<str>),
+    /// `theme="4" tint="-0.25"`——ワークブックの`theme{N}.xml`の
+    /// `<clrScheme>`へのインデックスと、任意の輝度補正値。`tint`は
+    /// `theme{N}.xml`自体には存在せず、参照側に個別に付与される
+    /// ため、`None`は「`tint`属性が全く無い」ことを表す(明示的な
+    /// `tint="0"`とは区別される)。
+    Theme { index: u32, tint: Option<f64> },
+    /// `indexed="64"`——OOXML以前のレガシーな64色パレットへの
+    /// インデックス。
+    Indexed(u32),
 }
 
 /// `cellXfs` インデックスから `ResolvedStyle` を引くテーブル。
@@ -116,5 +145,5 @@ pub type StyleSheet = HashMap<StyleId, Arc<ResolvedStyle>>;
 
 ## 未決事項 / オープンクエスチョン
 
-1. **塗りつぶし/罫線/折返し/配置などの具体的なスタイル要素**: さらに解決が進んだ——`font: Font { size_pt, bold }`(Issue #38)、`wrap_text: bool`(Issue #37、はみ出し判定のゲート条件)、`number_format: Option<Arc<str>>`(Issue #41)、`horizontal_alignment: Alignment`(Issue #42)をいずれも実装済み。[Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36) 配下のサブIssueは全て解決済み。フォント色・塗りつぶし・罫線・斜体・下線などその他の `CT_Font`/`CT_Fill`/`CT_Border` プロパティ、および `wrapText`/`horizontal` 以外の `CT_CellAlignment` の属性(垂直方向配置、インデント、テキスト回転等)は、具体的な下流ユースケースが現れるまでスコープ外のまま(`Font` が既に採用している「完全な転写はしない」方針と同じ)。
+1. **塗りつぶし/罫線/折返し/配置などの具体的なスタイル要素**: さらに解決が進んだ——`font: Font { size_pt, bold }`(Issue #38)、`wrap_text: bool`(Issue #37、はみ出し判定のゲート条件)、`number_format: Option<Arc<str>>`(Issue #41)、`horizontal_alignment: Alignment`(Issue #42)、`fill_fg_color`/`fill_bg_color: Option<ColorRef>`(Issue #75)をいずれも実装済み。[Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36) 配下のサブIssueに加え、派生の塗りつぶし色Issueも解決済み。`ColorRef`は実RGB値ではなく生の指定(`Rgb`/`Theme{index,tint}`/`Indexed`)のまま保持する——実際の表示色への解決は別の表示用途の関心事(Issue #76)であり、本ファイルのdiff指向のスコープには不要。フォント色・罫線・斜体・下線などその他の `CT_Font`/`CT_Border` プロパティ、および `wrapText`/`horizontal` 以外の `CT_CellAlignment` の属性(垂直方向配置、インデント、テキスト回転等)は、具体的な下流ユースケースが現れるまでスコープ外のまま(`Font` が既に採用している「完全な転写はしない」方針と同じ)。
 2. ~~日付/時刻書式の判定ロジックの置き場所~~ → **解決**: [`parse/styles.rs`](../parse/styles.md) が `numFmtId`/`formatCode` から `ResolvedStyle::is_date_time` を判定するロジックを持つ（[resolve/style.md オープンクエスチョン2](../resolve/style.md) と同一の論点）。判定ヒューリスティックの精度自体は [parse/styles.md オープンクエスチョン2](../parse/styles.md) として引き続き未解決。

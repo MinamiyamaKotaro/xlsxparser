@@ -6,8 +6,8 @@
 
 use crate::error::Error;
 use crate::model::{
-    Alignment, AnchorMarker, Cell, CellRef, CellValue, ColWidthRange, DateTimeValue, Image,
-    ImageAnchor, Sheet, SheetVisibility, Workbook,
+    Alignment, AnchorMarker, Cell, CellRef, CellValue, ColWidthRange, ColorRef, DateTimeValue,
+    Image, ImageAnchor, Sheet, SheetVisibility, Workbook,
 };
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Serialize, Serializer};
@@ -190,6 +190,36 @@ struct JsonStyle {
     /// `style` object exists at all (Issue #41).
     #[serde(skip_serializing_if = "Option::is_none")]
     number_format: Option<String>,
+    /// Omitted when the `<fill>` carries no `<fgColor>`/`<bgColor>` at all
+    /// (Issue #75) — same "nothing to report" treatment as `number_format`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fill_fg_color: Option<JsonColorRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fill_bg_color: Option<JsonColorRef>,
+}
+
+/// `ColorRef`'s JSON form (Issue #75), tagged the same way `JsonCellValue`
+/// is (`#[serde(tag = "type", content = "value")]`) for consistency across
+/// this module's every kind-tagged value — e.g. `{"type":"theme","value":
+/// {"index":4,"tint":-0.25}}`. Kept in its raw/unresolved form, same as
+/// `model::ColorRef` itself (see that type's doc comment for why).
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(tag = "type", content = "value", rename_all = "camelCase")]
+enum JsonColorRef {
+    Rgb(String),
+    Theme { index: u32, tint: Option<f64> },
+    Indexed(u32),
+}
+
+fn color_ref_to_json(c: &ColorRef) -> JsonColorRef {
+    match c {
+        ColorRef::Rgb(s) => JsonColorRef::Rgb(s.to_string()),
+        ColorRef::Theme { index, tint } => JsonColorRef::Theme {
+            index: *index,
+            tint: *tint,
+        },
+        ColorRef::Indexed(i) => JsonColorRef::Indexed(*i),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -238,6 +268,8 @@ fn cell_to_json(sheet: &Sheet, cell_ref: CellRef, cell: &Cell) -> JsonCell {
             wrap_text: s.wrap_text,
             alignment: alignment_tag(s.horizontal_alignment),
             number_format: s.number_format.as_deref().map(str::to_string),
+            fill_fg_color: s.fill_fg_color.as_ref().map(color_ref_to_json),
+            fill_bg_color: s.fill_bg_color.as_ref().map(color_ref_to_json),
         }),
     }
 }
@@ -500,6 +532,137 @@ mod tests {
         let cell_json = &parsed["sheets"][0]["cells"][0];
 
         assert!(cell_json["style"].get("numberFormat").is_none());
+    }
+
+    #[test]
+    fn styled_cell_with_rgb_fill_reports_it_tagged_under_style() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.insert_cell(
+            CellRef { row: 1, col: 1 },
+            Cell {
+                value: Some(CellValue::Number(1.0)),
+                style: Some(Arc::new(ResolvedStyle {
+                    fill_fg_color: Some(ColorRef::Rgb(Arc::from("FFFF0000"))),
+                    fill_bg_color: Some(ColorRef::Rgb(Arc::from("FF00FF00"))),
+                    ..Default::default()
+                })),
+            },
+        );
+        let workbook = Workbook::new(vec![sheet]);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cell_json = &parsed["sheets"][0]["cells"][0];
+
+        assert_eq!(
+            cell_json["style"]["fillFgColor"],
+            serde_json::json!({ "type": "rgb", "value": "FFFF0000" })
+        );
+        assert_eq!(
+            cell_json["style"]["fillBgColor"],
+            serde_json::json!({ "type": "rgb", "value": "FF00FF00" })
+        );
+    }
+
+    #[test]
+    fn styled_cell_with_theme_and_tint_fill_reports_both() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.insert_cell(
+            CellRef { row: 1, col: 1 },
+            Cell {
+                value: Some(CellValue::Number(1.0)),
+                style: Some(Arc::new(ResolvedStyle {
+                    fill_fg_color: Some(ColorRef::Theme {
+                        index: 4,
+                        tint: Some(-0.25),
+                    }),
+                    ..Default::default()
+                })),
+            },
+        );
+        let workbook = Workbook::new(vec![sheet]);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cell_json = &parsed["sheets"][0]["cells"][0];
+
+        assert_eq!(
+            cell_json["style"]["fillFgColor"],
+            serde_json::json!({ "type": "theme", "value": { "index": 4, "tint": -0.25 } })
+        );
+    }
+
+    #[test]
+    fn styled_cell_with_theme_fill_and_no_tint_reports_tint_as_null() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.insert_cell(
+            CellRef { row: 1, col: 1 },
+            Cell {
+                value: Some(CellValue::Number(1.0)),
+                style: Some(Arc::new(ResolvedStyle {
+                    fill_fg_color: Some(ColorRef::Theme {
+                        index: 1,
+                        tint: None,
+                    }),
+                    ..Default::default()
+                })),
+            },
+        );
+        let workbook = Workbook::new(vec![sheet]);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cell_json = &parsed["sheets"][0]["cells"][0];
+
+        assert_eq!(
+            cell_json["style"]["fillFgColor"],
+            serde_json::json!({ "type": "theme", "value": { "index": 1, "tint": null } })
+        );
+    }
+
+    #[test]
+    fn styled_cell_with_indexed_fill_reports_it() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.insert_cell(
+            CellRef { row: 1, col: 1 },
+            Cell {
+                value: Some(CellValue::Number(1.0)),
+                style: Some(Arc::new(ResolvedStyle {
+                    fill_fg_color: Some(ColorRef::Indexed(64)),
+                    ..Default::default()
+                })),
+            },
+        );
+        let workbook = Workbook::new(vec![sheet]);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cell_json = &parsed["sheets"][0]["cells"][0];
+
+        assert_eq!(
+            cell_json["style"]["fillFgColor"],
+            serde_json::json!({ "type": "indexed", "value": 64 })
+        );
+    }
+
+    #[test]
+    fn styled_cell_without_fill_color_omits_both_fields_entirely() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.insert_cell(
+            CellRef { row: 1, col: 1 },
+            Cell {
+                value: Some(CellValue::Number(1.0)),
+                style: Some(Arc::new(ResolvedStyle::default())),
+            },
+        );
+        let workbook = Workbook::new(vec![sheet]);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cell_json = &parsed["sheets"][0]["cells"][0];
+
+        assert!(cell_json["style"].get("fillFgColor").is_none());
+        assert!(cell_json["style"].get("fillBgColor").is_none());
     }
 
     #[test]
