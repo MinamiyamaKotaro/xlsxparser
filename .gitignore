@@ -20,5 +20,8 @@ Thumbs.db
 tests/fixtures/other
 
 # Throwaway proof-of-concept code (design exploration, not meant to be
-# merged) — see e.g. Issue #67's grouped-image transform PoC.
-/PoC/
+# merged) — see e.g. Issue #67's grouped-image transform PoC. The folder's
+# own README (rules for this directory) stays tracked; everything else
+# under it does not.
+/PoC/*
+!/PoC/README.md
