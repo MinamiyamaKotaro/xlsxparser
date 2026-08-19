@@ -8,7 +8,7 @@ Design doc for `src/pipeline.rs`. This is the orchestrator for the 5-phase pipel
 
 - Owns a [`container::ZipContainer`](container/mod.en.md) and calls `get_entry` sequentially throughout Phases 1–4 (fully consuming one entry before fetching the next — following the sequential-access pattern [container/mod.md](container/mod.en.md) already enforces via `get_entry`'s type signature)
 - Forwards the `SizeLimits` ([lib.md](lib.en.md)) received from the caller (`lib.rs`) into `with_max_entry_size` / `with_max_total_size` ([container/mod.md](container/mod.en.md)) right after `ZipContainer::open_reader`, so callers can override the Zip Bomb size caps (security review Finding 2, Issue [#14](https://github.com/MinamiyamaKotaro/xlsxparser/issues/14))
-- **Phase 1**: fetches and parses `xl/_rels/workbook.xml.rels` and `xl/workbook.xml`, building a "routing plan" of sheet names, visibility, and backing file paths. It also identifies the relationships to `sharedStrings.xml` / `styles.xml` within `xl/_rels/workbook.xml.rels` by relationship type (`Relationship.rel_type`) — implementing the division of labor [relationships.md Not Responsible For](parse/relationships.en.md) assigned to the caller: "which `r:id` corresponds to which part kind is the caller's job". A workbook may have neither relationship (`sharedStrings.xml` has always been treated as optional; `styles.xml` joined it as of Issue #54 — see Error Handling Policy). This phase also reads `ParsedWorkbookXml::date1904` (Issue #40) and holds it in a local variable — it never becomes a field on `Workbook`, following the same "phase-transient value" treatment `StyleSheet` gets (see below)
+- **Phase 1**: first fetches and parses the package root's own relationship part, `_rels/.rels` (the one path OPC itself fixes, unlike `xl/_rels/workbook.xml.rels`), and resolves the actual workbook part path from whatever the `officeDocument` relationship type targets (Issue [#55](https://github.com/MinamiyamaKotaro/xlsxparser/issues/55)). This used to read `xl/workbook.xml` as a hardcoded path; but that fixedness is not an OPC guarantee, and a real file was found (`tests/fixtures/other/minimal_package.xlsx`, from calamine's test corpus) whose workbook part is discoverable only via `_rels/.rels`, so resolution was changed to go through `_rels/.rels` → `officeDocument` relationship → workbook part, as OPC intends. The workbook part's own `_rels` path (the `xl/_rels/workbook.xml.rels`-equivalent) is likewise derived from this resolved workbook part path via [`rels_path_for`](#key-types--functions-draft) — it no longer depends on the literal string `xl/workbook.xml`. It then fetches and parses that workbook part's `_rels` and its `workbook.xml` body, building a "routing plan" of sheet names, visibility, and backing file paths. It also identifies the relationships to `sharedStrings.xml` / `styles.xml` within the workbook part's `_rels` by relationship type (`Relationship.rel_type`) — implementing the division of labor [relationships.md Not Responsible For](parse/relationships.en.md) assigned to the caller: "which `r:id` corresponds to which part kind is the caller's job". A workbook may have neither relationship (`sharedStrings.xml` has always been treated as optional; `styles.xml` joined it as of Issue #54 — see Error Handling Policy). This phase also reads `ParsedWorkbookXml::date1904` (Issue #40) and holds it in a local variable — it never becomes a field on `Workbook`, following the same "phase-transient value" treatment `StyleSheet` gets (see below)
 - Once the routing plan is built, lets the reader used for the rels read and the [`parse::RelationshipMap`](parse/relationships.en.md) go out of scope and be dropped (implements architecture.md's "dispose of the `_rels` scratch buffer immediately once the routing map is built at the end of Phase 1")
 - Once the routing plan is finalized, builds the [`SharedStringTable`](parse/shared_strings.en.md) and [`StyleSheet`](model/style.en.md) exactly once, before entering the per-sheet loop
 - For each sheet, builds an empty sheet via [`model::Sheet::new`](model/sheet.en.md), passes the corresponding entry to [`parse::parse_worksheet`](parse/worksheet.en.md) to stream cells into it (Phase 3), then passes that output to [`resolve::resolve_sheet`](resolve/mod.en.md) to resolve it (Phase 4)
@@ -29,8 +29,10 @@ use crate::parse::shared_strings::SharedStringTable;
 use crate::{container, model, parse, resolve};
 use std::io::{Read, Seek};
 
-const WORKBOOK_RELS_PATH: &str = "xl/_rels/workbook.xml.rels";
-const WORKBOOK_PATH: &str = "xl/workbook.xml";
+// The package root's own relationship part. Unlike xl/workbook.xml, this is
+// the one path OPC itself fixes (Issue #55).
+const PACKAGE_RELS_PATH: &str = "_rels/.rels";
+const OFFICE_DOCUMENT_REL_TYPE_SUFFIX: &str = "/relationships/officeDocument";
 const SHARED_STRINGS_REL_TYPE_SUFFIX: &str = "/relationships/sharedStrings";
 const STYLES_REL_TYPE_SUFFIX: &str = "/relationships/styles";
 
@@ -59,15 +61,32 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
         .with_max_total_size(limits.max_total_size);
 
     // --- Phase 1: relationship resolution and building the routing plan ---
+    // First read the package root's own _rels/.rels, and resolve the
+    // workbook part's actual path from its officeDocument relationship
+    // (Issue #55 — see body for details).
+    let package_rels_reader = container
+        .get_entry(PACKAGE_RELS_PATH)?
+        .ok_or_else(|| Error::MissingRelationshipPart(PACKAGE_RELS_PATH.to_string()))?;
+    let package_relationships =
+        parse::parse_relationships(package_rels_reader, "", PACKAGE_RELS_PATH)?;
+    let workbook_path = package_relationships
+        .values()
+        .find(|r| r.rel_type.ends_with(OFFICE_DOCUMENT_REL_TYPE_SUFFIX))
+        .map(|r| r.target.clone())
+        .ok_or_else(|| Error::InvalidPackage(PACKAGE_RELS_PATH.to_string()))?;
+    drop(package_relationships);
+
+    let (workbook_rels_path, workbook_dir) = rels_path_for(&workbook_path);
     let rels_reader = container
-        .get_entry(WORKBOOK_RELS_PATH)?
-        .ok_or_else(|| Error::MissingRelationshipPart(WORKBOOK_RELS_PATH.to_string()))?;
-    let relationships = parse::parse_relationships(rels_reader, "xl", WORKBOOK_RELS_PATH)?;
+        .get_entry(&workbook_rels_path)?
+        .ok_or_else(|| Error::MissingRelationshipPart(workbook_rels_path.clone()))?;
+    let relationships =
+        parse::parse_relationships(rels_reader, workbook_dir, &workbook_rels_path)?;
 
     let workbook_reader = container
-        .get_entry(WORKBOOK_PATH)?
-        .ok_or_else(|| Error::InvalidPackage(WORKBOOK_PATH.to_string()))?;
-    let parsed_workbook = parse::parse_workbook_xml(workbook_reader, WORKBOOK_PATH)?;
+        .get_entry(&workbook_path)?
+        .ok_or_else(|| Error::InvalidPackage(workbook_path.clone()))?;
+    let parsed_workbook = parse::parse_workbook_xml(workbook_reader, &workbook_path)?;
     let date1904 = parsed_workbook.date1904;
 
     let mut routes = Vec::with_capacity(parsed_workbook.sheets.len());
@@ -165,14 +184,19 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
 
 - Each phase's failure short-circuits via `?`; no later phase runs (the same fail-closed principle as [resolve/mod.md](resolve/mod.en.md)'s `resolve_sheet`). If even one sheet fails to parse or resolve, `run` never returns a `Workbook`, even a partial one covering the sheets already processed successfully (never silently returns a partially broken book — see Open Question 4)
 - Which `Error` variant to construct from `Ok(None)` (a missing entry) returned by `container::get_entry` is this file's responsibility, per [container/mod.md](container/mod.en.md)'s statement that "only the caller's context can tell":
-  - `xl/_rels/workbook.xml.rels` absent → `Error::MissingRelationshipPart` (a mandatory Phase 1 part)
-  - `xl/workbook.xml` absent, or the `styles.xml`/`sharedStrings.xml` part a *relationship* points to is absent → `Error::InvalidPackage` (the relationship promised a part that isn't there — a corrupt or truncated package)
+  - `_rels/.rels` (the package root's own relationship part) absent → `Error::MissingRelationshipPart` (the first mandatory part Phase 1 reads. Issue #55)
+  - `_rels/.rels` exists but carries no `officeDocument`-typed relationship → `Error::InvalidPackage` (the workbook part's path cannot be resolved at all. Issue #55)
+  - the workbook part's `_rels` (path derived from the `officeDocument` relationship's target) absent → `Error::MissingRelationshipPart`
+  - the workbook part itself (same derived path) absent, or the `styles.xml`/`sharedStrings.xml` part a *relationship* points to is absent → `Error::InvalidPackage` (the relationship promised a part that isn't there — a corrupt or truncated package)
   - the r:id a `workbook.xml` `<sheet r:id="...">` points to is not found in the `RelationshipMap`, or the worksheet part a relationship points to is absent → `Error::DanglingRelationship`
 - If no relationship for `sharedStrings.xml` *or* `styles.xml` is found at all — as opposed to a relationship existing but its target entity being missing, the case above — this is not an error: `sharedStrings.xml` falls back to `SharedStringTable::default()` (an empty table), and `styles.xml` falls back to `StyleSheet::new()` (an empty table), since both are optional OOXML parts a workbook with no string cells / no cell styling respectively is not required to carry. `styles.xml` joined this graceful-degradation treatment as of Issue #54 — real third-party `.xlsx` writers have been observed to omit it entirely for unstyled workbooks, and rejecting such an otherwise-valid package was an unnecessarily strict reading of the spec (verified against calamine's own real-file test corpus, which includes exactly this case)
 
 ## Testing Strategy
 
 - Verify that a minimal, valid `.xlsx`-shaped ZIP (one sheet, containing numbers, shared-string references, and a merged cell) passed to `run` returns `Ok` with the expected `Workbook` (an integration test)
+- Verify that a ZIP with no `_rels/.rels` returns `Error::MissingRelationshipPart` (Issue #55)
+- Verify that a ZIP whose `_rels/.rels` carries no `officeDocument`-typed relationship returns `Error::InvalidPackage` (Issue #55)
+- Verify that `run` still resolves correctly when the workbook part lives at the package root (`workbook.xml`) rather than `xl/workbook.xml`, discoverable only via `_rels/.rels` — `tests/fixtures/other/minimal_package.xlsx` (from calamine's test corpus) is a real-world example of exactly this (Issue #55)
 - Verify that a ZIP with no `xl/_rels/workbook.xml.rels` returns `Error::MissingRelationshipPart`
 - Verify that a ZIP with no `xl/workbook.xml` returns `Error::InvalidPackage`
 - Verify that returns `Error::DanglingRelationship` when a `workbook.xml` `<sheet r:id="...">`'s r:id is not found in the rels
@@ -189,7 +213,7 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
 
 1. **Whether `json.rs` is called from within `run`**: [architecture.md](architecture.en.md)'s `pipeline.rs` section describes the full 5-phase flow as "serializing the result resolved by `resolve` via `json.rs`," while [model/workbook.md](model/workbook.en.md) already explicitly states that `Workbook` (structured data, not JSON) "is exactly what the public API in `lib.rs` (`parse_workbook(path) -> Result<Workbook>`) returns." This design resolves that tension by reading architecture.md's description as a conceptual summary of "the 5-phase capability the crate provides as a whole," rather than a literal claim that a single function chains all five phases. `run` itself owns Phases 1–4 (returning `Workbook`); Phase 5 (JSON conversion) is a separate function provided by [`json.rs`](json.en.md), explicitly invoked on a `Workbook` — a two-step design. How `lib.rs` (not yet designed) exposes this two-step flow (separate `parse_workbook` and `parse_workbook_json` functions, a `to_json` method on `Workbook`, etc.) is to be settled when `lib.rs` is designed.
 2. **Wiring with `lib.rs`**: `run` is `pub(crate)`, with a thin wrapper in `lib.rs`'s public API assumed to open a `std::fs::File` from a path string and pass it in. How far `lib.rs`'s public API should accept arbitrary `Read + Seek` input (e.g. an in-memory buffer) beyond file paths is to be settled when `lib.rs` is designed.
-3. **Whether `[Content_Types].xml` needs validation**: currently `[Content_Types].xml`'s content is never referenced at all; fixed paths such as `xl/workbook.xml` and `xl/_rels/workbook.xml.rels` are accessed directly. In practice, Excel-generated files use these paths as effectively fixed, but there is a case that strict OPC conformance should resolve parts via `[Content_Types].xml`'s Content-Type declarations instead.
+3. ~~Reliance on hardcoded `xl/workbook.xml` / `xl/_rels/workbook.xml.rels` paths~~ → **Partially resolved** (Issue [#55](https://github.com/MinamiyamaKotaro/xlsxparser/issues/55)): the workbook part's path is now resolved from `_rels/.rels`'s `officeDocument` relationship (see body). That resolution, however, relies solely on `Relationship.rel_type` (a prefix match on the relationship-type string) and still never references `[Content_Types].xml`'s Content-Type declarations at all. Strict OPC conformance could argue for cross-checking via `[Content_Types].xml` too (confirming a part's declared Content-Type matches what's expected), but relationship-type-based resolution alone has proven sufficient in practice — it resolves every case observed so far, including `minimal_package.xlsx` — so this remains low priority.
 4. **Resilience to an individual sheet's parse failure**: currently, if even one sheet errors, the whole `run` call returns `Err` (fail closed). The requirements have no "skip broken sheets and return the rest" requirement, so this design was adopted, but it would need revisiting if an error-tolerant mode (returning whatever could be read) is ever required.
 5. **Concurrency**: currently processes sheets one at a time, sequentially (naturally matching `container::get_entry`'s sequential-access constraint, as discussed under Dependencies). The requirements have no parallelism requirement, but there may be room, as a performance optimization for large multi-sheet books, to read every sheet's bytes into memory up front and process them in parallel via a thread pool (which would trade off against the streaming policy) — to be reconsidered based on post-implementation profiling.
 6. ~~`BufRead` requirement vs. `container::get_entry`'s return type~~ → **Resolved at implementation time**: every `parse::parse_*` function requires `impl BufRead` (quick-xml's `Reader::read_event_into` needs it), but `container::get_entry` returns `BoundedReader<'_, impl Read + '_>`, which only implements `Read`. `run` wraps every reader it gets from `get_entry` in `std::io::BufReader::new(..)` before passing it to a `parse::parse_*` call. The draft code block above predates this and omits the wrapping — not because it was an open design question, but simply because `container/` and `parse/` were designed independently and this seam wasn't exercised until `pipeline.rs` actually compiled them together.

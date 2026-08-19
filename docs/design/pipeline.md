@@ -8,7 +8,7 @@
 
 - [`container::ZipContainer`](container/mod.md) を所有し、フェーズ1〜4を通じて `get_entry` を逐次呼び出す（1エントリを読み切ってから次のエントリを取得する。[container/mod.md](container/mod.md) が `get_entry` の型シグネチャで既に強制している逐次アクセスパターンに従う）
 - 呼び出し元（`lib.rs`）から受け取った `SizeLimits`（[lib.md](lib.md)）を `ZipContainer::open_reader` 直後に `with_max_entry_size` / `with_max_total_size`（[container/mod.md](container/mod.md)）へ橋渡しし、Zip Bombサイズ上限を呼び出し側が上書きできるようにする（セキュリティレビュー Finding 2、Issue [#14](https://github.com/MinamiyamaKotaro/xlsxparser/issues/14)）
-- **フェーズ1**: `xl/_rels/workbook.xml.rels` と `xl/workbook.xml` を取得・パースし、シート名・可視性・実体ファイルパスの「ルーティングプラン」を構築する。あわせて `xl/_rels/workbook.xml.rels` 内から `sharedStrings.xml` / `styles.xml` への関係を関係タイプ（`Relationship.rel_type`）で識別する（[relationships.md 含まない責務](parse/relationships.md) が「どの r:id がどのパーツ種別に対応するかの意味づけは呼び出し元の責務」としていた分担を実装する）。いずれの関係も存在しない場合がありうる(`sharedStrings.xml` は以前から任意パーツ扱い、`styles.xml` もIssue #54でこれに合流した——詳細はエラー処理方針参照)。本フェーズでは `ParsedWorkbookXml::date1904`(Issue #40)も読み取り、ローカル変数として保持する——`Workbook` のフィールドには決してならず、`StyleSheet`(後述)と同じ「フェーズ間の一時値」として扱う
+- **フェーズ1**: まずパッケージルート自身の関係パーツ `_rels/.rels`(OPC仕様でパスが固定される、`xl/_rels/workbook.xml.rels`とは異なる唯一の例外)を取得・パースし、`officeDocument` 関係タイプが指すターゲットをworkbookパーツの実際のパスとして解決する(Issue [#55](https://github.com/MinamiyamaKotaro/xlsxparser/issues/55))。以前は `xl/workbook.xml` を固定パスとして直接読みに行っていたが、OPC上この固定は仕様上の保証ではなく、`_rels/.rels` 経由でのみ発見可能なworkbookパーツを持つ実在ファイル(`tests/fixtures/other/minimal_package.xlsx`、calamineテストコーパス由来)が確認されたため、`_rels/.rels`→`officeDocument`関係→workbookパーツという本来の解決順に改めた。workbookパーツ自身の `_rels`(`xl/_rels/workbook.xml.rels` 相当)のパスも、この解決済みworkbookパーツパスから[`rels_path_for`](#主要な型・関数案)で導出する——`xl/workbook.xml` という固定文字列にはもう依存しない。続けてそのworkbookパーツの `_rels` と `workbook.xml` 本体を取得・パースし、シート名・可視性・実体ファイルパスの「ルーティングプラン」を構築する。あわせてworkbookパーツの `_rels` 内から `sharedStrings.xml` / `styles.xml` への関係を関係タイプ（`Relationship.rel_type`）で識別する（[relationships.md 含まない責務](parse/relationships.md) が「どの r:id がどのパーツ種別に対応するかの意味づけは呼び出し元の責務」としていた分担を実装する）。いずれの関係も存在しない場合がありうる(`sharedStrings.xml` は以前から任意パーツ扱い、`styles.xml` もIssue #54でこれに合流した——詳細はエラー処理方針参照)。本フェーズでは `ParsedWorkbookXml::date1904`(Issue #40)も読み取り、ローカル変数として保持する——`Workbook` のフィールドには決してならず、`StyleSheet`(後述)と同じ「フェーズ間の一時値」として扱う
 - ルーティングプラン構築後、rels読み込みに使ったリーダーと [`parse::RelationshipMap`](parse/relationships.md) をスコープアウトさせ破棄する（architecture.md「フェーズ1完了時にルーティングマップ構築後、`_rels` の一時バッファを破棄する」の実装）
 - ルーティングプラン確定後、シートループに入る前に [`SharedStringTable`](parse/shared_strings.md) と [`StyleSheet`](model/style.md) を一度だけ構築する
 - シートごとに [`model::Sheet::new`](model/sheet.md) で空シートを構築し、対応するエントリを [`parse::parse_worksheet`](parse/worksheet.md) に渡してストリームでセルを挿入させ（フェーズ3）、その出力を [`resolve::resolve_sheet`](resolve/mod.md) へ渡して解決する（フェーズ4）
@@ -29,8 +29,10 @@ use crate::parse::shared_strings::SharedStringTable;
 use crate::{container, model, parse, resolve};
 use std::io::{Read, Seek};
 
-const WORKBOOK_RELS_PATH: &str = "xl/_rels/workbook.xml.rels";
-const WORKBOOK_PATH: &str = "xl/workbook.xml";
+// パッケージルート自身の関係パーツ。xl/workbook.xmlとは異なりOPC仕様が
+// パスそのものを固定する唯一の例外（Issue #55）。
+const PACKAGE_RELS_PATH: &str = "_rels/.rels";
+const OFFICE_DOCUMENT_REL_TYPE_SUFFIX: &str = "/relationships/officeDocument";
 const SHARED_STRINGS_REL_TYPE_SUFFIX: &str = "/relationships/sharedStrings";
 const STYLES_REL_TYPE_SUFFIX: &str = "/relationships/styles";
 
@@ -57,15 +59,31 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
         .with_max_total_size(limits.max_total_size);
 
     // --- フェーズ1: リレーションシップの解決とルーティングプラン構築 ---
+    // まずパッケージルート自身の _rels/.rels を読み、officeDocument関係から
+    // workbookパーツの実際のパスを解決する(Issue #55。詳細は本文参照)。
+    let package_rels_reader = container
+        .get_entry(PACKAGE_RELS_PATH)?
+        .ok_or_else(|| Error::MissingRelationshipPart(PACKAGE_RELS_PATH.to_string()))?;
+    let package_relationships =
+        parse::parse_relationships(package_rels_reader, "", PACKAGE_RELS_PATH)?;
+    let workbook_path = package_relationships
+        .values()
+        .find(|r| r.rel_type.ends_with(OFFICE_DOCUMENT_REL_TYPE_SUFFIX))
+        .map(|r| r.target.clone())
+        .ok_or_else(|| Error::InvalidPackage(PACKAGE_RELS_PATH.to_string()))?;
+    drop(package_relationships);
+
+    let (workbook_rels_path, workbook_dir) = rels_path_for(&workbook_path);
     let rels_reader = container
-        .get_entry(WORKBOOK_RELS_PATH)?
-        .ok_or_else(|| Error::MissingRelationshipPart(WORKBOOK_RELS_PATH.to_string()))?;
-    let relationships = parse::parse_relationships(rels_reader, "xl", WORKBOOK_RELS_PATH)?;
+        .get_entry(&workbook_rels_path)?
+        .ok_or_else(|| Error::MissingRelationshipPart(workbook_rels_path.clone()))?;
+    let relationships =
+        parse::parse_relationships(rels_reader, workbook_dir, &workbook_rels_path)?;
 
     let workbook_reader = container
-        .get_entry(WORKBOOK_PATH)?
-        .ok_or_else(|| Error::InvalidPackage(WORKBOOK_PATH.to_string()))?;
-    let parsed_workbook = parse::parse_workbook_xml(workbook_reader, WORKBOOK_PATH)?;
+        .get_entry(&workbook_path)?
+        .ok_or_else(|| Error::InvalidPackage(workbook_path.clone()))?;
+    let parsed_workbook = parse::parse_workbook_xml(workbook_reader, &workbook_path)?;
     let date1904 = parsed_workbook.date1904;
 
     let mut routes = Vec::with_capacity(parsed_workbook.sheets.len());
@@ -162,14 +180,19 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
 
 - 各フェーズの失敗を `?` で早期リターンし、後続フェーズを実行しない（[resolve/mod.md](resolve/mod.md) の `resolve_sheet` と同じ fail closed の原則）。1シートでもパース・解決に失敗した場合、それまでに処理済みの他シートを含めて `Workbook` を返さない（部分的に壊れたブックを黙って返さない。オープンクエスチョン4参照）
 - `container::get_entry` が返す `Ok(None)`（エントリ不在）からどの `Error` バリアントを構築するかは、[container/mod.md](container/mod.md) が「呼び出し側の文脈でしか判断できない」としていたとおり本ファイルの責務とする:
-  - `xl/_rels/workbook.xml.rels` 不在 → `Error::MissingRelationshipPart`（フェーズ1の必須パーツ）
-  - `xl/workbook.xml` 不在、または rels が指す `styles.xml`/`sharedStrings.xml` の実体パーツが不在 → `Error::InvalidPackage`(リレーションシップ自体は約束していたパーツが実際には無い——破損・切り詰められたパッケージ)
+  - `_rels/.rels`（パッケージルート自身の関係パーツ）不在 → `Error::MissingRelationshipPart`（フェーズ1で最初に読む必須パーツ。Issue #55）
+  - `_rels/.rels` は存在するが `officeDocument` タイプの関係が1件も無い → `Error::InvalidPackage`（workbookパーツのパスをそもそも解決できない。Issue #55）
+  - workbookパーツの `_rels`（`officeDocument` 関係のターゲットから導出したパス）不在 → `Error::MissingRelationshipPart`
+  - workbookパーツ本体（同上のパス）不在、または rels が指す `styles.xml`/`sharedStrings.xml` の実体パーツが不在 → `Error::InvalidPackage`(リレーションシップ自体は約束していたパーツが実際には無い——破損・切り詰められたパッケージ)
   - `workbook.xml` の `<sheet r:id="...">` が指す r:id が `RelationshipMap` に存在しない、または rels が指す worksheet の実体パーツが不在 → `Error::DanglingRelationship`
 - `sharedStrings.xml` *または* `styles.xml` に対応するリレーションシップ自体が全く見つからない場合(リレーションシップは存在するが対象の実体パーツが欠落している上記のケースとは異なる)はエラーにしない: `sharedStrings.xml` は `SharedStringTable::default()`(空テーブル)、`styles.xml` は `StyleSheet::new()`(空テーブル)へそれぞれフォールバックする——文字列セルを持たないブック/セルスタイルを一切使わないブックは、それぞれのパーツを持つ必要が元々ない。`styles.xml` はIssue #54でこのグレースフルデグラデーション方針に合流した——セルスタイルなしのブックに対してこのパーツを完全に省略する第三者製ツールが実際に確認されており(calamine自身のテストコーパスで検証済み)、有効なはずのパッケージを過度に厳格に拒否していたと判断した
 
 ## テスト方針
 
 - 正当な最小構成の `.xlsx` 相当ZIP（1シート、数値・共有文字列参照・結合セルを含む）を `run` に渡し、`Ok` で期待する `Workbook` が得られることの確認（統合テスト）
+- `_rels/.rels` が存在しないZIPに対し `Error::MissingRelationshipPart` を返すことの確認（Issue #55）
+- `_rels/.rels` は存在するが `officeDocument` タイプの関係が無いZIPに対し `Error::InvalidPackage` を返すことの確認（Issue #55）
+- workbookパーツが `xl/workbook.xml` ではなくパッケージルート直下（`workbook.xml`）にあり、`_rels/.rels` 経由でのみ発見可能なZIPでも `run` が正しく解決できることの確認——`tests/fixtures/other/minimal_package.xlsx`（calamineテストコーパス由来）が実例として存在する（Issue #55）
 - `xl/_rels/workbook.xml.rels` が存在しないZIPに対し `Error::MissingRelationshipPart` を返すことの確認
 - `xl/workbook.xml` が存在しないZIPに対し `Error::InvalidPackage` を返すことの確認
 - `workbook.xml` の `<sheet r:id="...">` が指す r:id が rels 内に存在しない場合に `Error::DanglingRelationship` を返すことの確認
@@ -186,7 +209,7 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
 
 1. **`json.rs` を `run` 内から呼ぶかどうか**: [architecture.md](architecture.md) の `pipeline.rs` 節は「`resolve` で解決した結果を `json.rs` でシリアライズする」と5フェーズ全体の流れを説明する一方、[model/workbook.md](model/workbook.md) は既に「`lib.rs` の公開API（`parse_workbook(path) -> Result<Workbook>`）の返り値そのものになる」と明記しており、`Workbook`（JSONではなく構造化データ）が主要な返り値であることを前提としている。本設計はこの矛盾を、architecture.md の記述を「クレート全体が提供する5フェーズの機能」を示す概念的な説明と解釈し、`run` 自体はフェーズ1〜4（`Workbook` を返す）までを担い、フェーズ5（JSON化）は [`json.rs`](json.md) が提供する別関数として `Workbook` から明示的に呼び出す2段構成と解決した。`lib.rs`（未設計）がこの2段構成をどう公開するか（`parse_workbook` と `parse_workbook_json` を別々に公開する、`Workbook` に `to_json` メソッドを生やす等）は `lib.rs` の設計時に確定させる。
 2. **`lib.rs` との結線**: `run` は `pub(crate)` とし、パス文字列から `std::fs::File` を開いて渡す薄いラッパーを `lib.rs` 側の公開関数として想定しているが、`Read + Seek` を実装する任意の入力（インメモリバッファ等）をどこまで `lib.rs` の公開APIとして許容するかは `lib.rs` の設計時に確定させる。
-3. **`[Content_Types].xml` の検証要否**: 現状 `[Content_Types].xml` の中身を一切参照せず、`xl/workbook.xml` や `xl/_rels/workbook.xml.rels` といった固定パスへ直接アクセスしている。実務上のExcel生成ファイルはこれらのパスが事実上固定的だが、厳密なOPC準拠のためには `[Content_Types].xml` のContent-Type宣言を介してパーツを解決すべきという意見もありうる。
+3. ~~`xl/workbook.xml` / `xl/_rels/workbook.xml.rels` の固定パス依存~~ → **部分的に解決**（Issue [#55](https://github.com/MinamiyamaKotaro/xlsxparser/issues/55)）: workbookパーツのパスは `_rels/.rels` の `officeDocument` 関係から解決するよう改めた（本文参照）。ただしこの解決は `Relationship.rel_type`（関係タイプ文字列の前方一致）のみに基づくものであり、`[Content_Types].xml` のContent-Type宣言は依然として一切参照していない。厳密なOPC準拠のためには `[Content_Types].xml` を介した二重検証（パーツのContent-Typeが期待どおりか）を行うべきという意見もありうるが、関係タイプによる解決だけで実用上は十分機能しており（`minimal_package.xlsx` を含め、これまで確認できた全ケースを解決できている）、優先度は低いままとした。
 4. **個々のシートのパース失敗時の耐性**: 現状は1シートでもエラーがあれば `run` 全体を `Err` で返す設計（fail closed）を採用している。要求仕様書に「壊れたシートをスキップして他シートだけ返す」という要件はないためこの設計としたが、将来的にエラー耐性モード（部分的に読めたデータを返す）の要求が生じた場合は見直しが必要になる。
 5. **並行処理**: 現状シートを1つずつ逐次処理する設計（依存関係セクションで述べたとおり `container::get_entry` の逐次アクセス制約とも自然に合致する）。要求仕様書に並列化要件はないが、複数シートを持つ大規模ブックに対するパフォーマンス最適化として、各シートのバイト列を先にすべてメモリへ読み出したうえでスレッドプール等により並列処理する余地はあるか（この場合ストリーミング方針とはトレードオフになる）は、実装後のプロファイリング結果を踏まえて再検討する。
 6. ~~`BufRead` 要求と `container::get_entry` の返り値の型の不整合~~ → **実装時に解決**: `parse::parse_*` の各関数はいずれも `impl BufRead` を要求する（quick-xmlの `Reader::read_event_into` がこれを必要とするため）が、`container::get_entry` が返す `BoundedReader<'_, impl Read + '_>` は `Read` のみを実装する。`run` は `get_entry` から得た各readerを `parse::parse_*` へ渡す前に `std::io::BufReader::new(..)` でラップする。上記コードブロックのドラフトはこの点を反映していないが、これは未決の設計論点だったからではなく、`container/` と `parse/` がそれぞれ独立に設計されており、両者を実際に結合する `pipeline.rs` のコンパイルまでこの境界面が検証されていなかったための単純な抜けである。

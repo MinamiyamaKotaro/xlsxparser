@@ -14,15 +14,33 @@
 
 use std::io::{Cursor, Write};
 
+/// The package root's `officeDocument` relationship (Issue #55), pointing
+/// at the conventional `xl/workbook.xml` every fixture in this module tree
+/// uses. `build_zip` injects this automatically so none of the ~90 existing
+/// call sites across `fixtures/*.rs` had to change when Issue #55's
+/// pipeline started reading `_rels/.rels` before anything else.
+const DEFAULT_ROOT_RELS_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#;
+
+const ROOT_RELS_PATH: &str = "_rels/.rels";
+
 /// Packs `entries` (zip entry name -> raw bytes) into an in-memory ZIP
 /// archive using the `Deflated` compression method, matching what real
-/// `.xlsx` writers produce.
+/// `.xlsx` writers produce. Injects [`DEFAULT_ROOT_RELS_XML`] at
+/// [`ROOT_RELS_PATH`] unless `entries` already supplies that path itself
+/// (for fixtures that specifically need to test root-rels handling).
 pub fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut buf = Vec::new();
     {
         let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
+        if !entries.iter().any(|(name, _)| *name == ROOT_RELS_PATH) {
+            writer.start_file(ROOT_RELS_PATH, options).unwrap();
+            writer.write_all(DEFAULT_ROOT_RELS_XML).unwrap();
+        }
         for (name, data) in entries {
             writer.start_file(*name, options).unwrap();
             writer.write_all(data).unwrap();

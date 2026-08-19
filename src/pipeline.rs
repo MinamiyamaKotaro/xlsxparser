@@ -13,8 +13,11 @@ use crate::parse::SharedStringTable;
 use crate::{parse, resolve};
 use std::io::{BufReader, Read, Seek};
 
-const WORKBOOK_RELS_PATH: &str = "xl/_rels/workbook.xml.rels";
-const WORKBOOK_PATH: &str = "xl/workbook.xml";
+/// The package root's own relationship part. Unlike `xl/workbook.xml`, this
+/// path *is* fixed by the OPC spec itself (ECMA-376 Part 2) — every OPC
+/// package has exactly one, at this exact location.
+const PACKAGE_RELS_PATH: &str = "_rels/.rels";
+const OFFICE_DOCUMENT_REL_TYPE_SUFFIX: &str = "/relationships/officeDocument";
 const SHARED_STRINGS_REL_TYPE_SUFFIX: &str = "/relationships/sharedStrings";
 const STYLES_REL_TYPE_SUFFIX: &str = "/relationships/styles";
 
@@ -41,17 +44,39 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
         .with_max_total_size(limits.max_total_size);
 
     // --- Phase 1: relationship resolution and building the routing plan ---
+    // Per OPC, the workbook part's actual path is not fixed — it is
+    // whatever the package root's `officeDocument` relationship (in
+    // `_rels/.rels`) points to. `xl/workbook.xml` is what virtually every
+    // real-world writer emits, but is not guaranteed (Issue #55); resolving
+    // it via the root rels part, as OPC requires, still lands on that same
+    // path for such files while also handling packages that don't.
+    let package_rels_reader = container
+        .get_entry(PACKAGE_RELS_PATH)?
+        .ok_or_else(|| Error::MissingRelationshipPart(PACKAGE_RELS_PATH.to_string()))?;
+    let package_relationships =
+        parse::parse_relationships(BufReader::new(package_rels_reader), "", PACKAGE_RELS_PATH)?;
+    let workbook_path = package_relationships
+        .values()
+        .find(|r| r.rel_type.ends_with(OFFICE_DOCUMENT_REL_TYPE_SUFFIX))
+        .map(|r| r.target.clone())
+        .ok_or_else(|| Error::InvalidPackage(PACKAGE_RELS_PATH.to_string()))?;
+    drop(package_relationships);
+
+    let (workbook_rels_path, workbook_dir) = rels_path_for(&workbook_path);
     let rels_reader = container
-        .get_entry(WORKBOOK_RELS_PATH)?
-        .ok_or_else(|| Error::MissingRelationshipPart(WORKBOOK_RELS_PATH.to_string()))?;
-    let relationships =
-        parse::parse_relationships(BufReader::new(rels_reader), "xl", WORKBOOK_RELS_PATH)?;
+        .get_entry(&workbook_rels_path)?
+        .ok_or_else(|| Error::MissingRelationshipPart(workbook_rels_path.clone()))?;
+    let relationships = parse::parse_relationships(
+        BufReader::new(rels_reader),
+        workbook_dir,
+        &workbook_rels_path,
+    )?;
 
     let workbook_reader = container
-        .get_entry(WORKBOOK_PATH)?
-        .ok_or_else(|| Error::InvalidPackage(WORKBOOK_PATH.to_string()))?;
+        .get_entry(&workbook_path)?
+        .ok_or_else(|| Error::InvalidPackage(workbook_path.clone()))?;
     let parsed_workbook =
-        parse::parse_workbook_xml(BufReader::new(workbook_reader), WORKBOOK_PATH)?;
+        parse::parse_workbook_xml(BufReader::new(workbook_reader), &workbook_path)?;
     let date1904 = parsed_workbook.date1904;
 
     let mut routes = Vec::with_capacity(parsed_workbook.sheets.len());
@@ -306,12 +331,22 @@ mod tests {
     use crate::model::{CellRef, CellValue};
     use std::io::{Cursor, Write};
 
+    /// Every existing test builds its ZIP around `xl/workbook.xml` as the
+    /// workbook part, predating Issue #55's root-rels-based resolution. To
+    /// avoid touching all ~16 call sites, this injects a root `_rels/.rels`
+    /// pointing at `xl/workbook.xml` (the pre-#55 hardcoded path) unless the
+    /// caller already supplies its own (as the Issue #55-specific tests
+    /// below do, to exercise a different target).
     fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut buf = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
             let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
+            if !entries.iter().any(|(name, _)| *name == PACKAGE_RELS_PATH) {
+                writer.start_file(PACKAGE_RELS_PATH, options).unwrap();
+                writer.write_all(DEFAULT_ROOT_RELS_XML).unwrap();
+            }
             for (name, data) in entries {
                 writer.start_file(*name, options).unwrap();
                 writer.write_all(data).unwrap();
@@ -320,6 +355,11 @@ mod tests {
         }
         buf
     }
+
+    const DEFAULT_ROOT_RELS_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#;
 
     const RELS_XML: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
@@ -544,6 +584,80 @@ mod tests {
         let zip = build_zip(&[("xl/_rels/workbook.xml.rels", RELS_XML)]);
         let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
         assert!(matches!(err, Error::InvalidPackage(_)));
+    }
+
+    /// Builds a ZIP without `build_zip`'s automatic `_rels/.rels` injection,
+    /// for tests (Issue #55) that need to control that part directly.
+    fn build_zip_raw(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for (name, data) in entries {
+                writer.start_file(*name, options).unwrap();
+                writer.write_all(data).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn missing_package_rels_is_missing_relationship_part() {
+        // Issue #55: `_rels/.rels` itself (fixed by the OPC spec) is the
+        // very first part read; if it's absent, that's the failure, not a
+        // later dangling reference to xl/workbook.xml.
+        let zip = build_zip_raw(&[]);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::MissingRelationshipPart(ref p) if p == PACKAGE_RELS_PATH));
+    }
+
+    #[test]
+    fn package_rels_without_office_document_relationship_is_invalid_package() {
+        // Issue #55: `_rels/.rels` exists but carries no `officeDocument`
+        // relationship, so there's no workbook part path to resolve at all.
+        let root_rels_without_office_document: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/core-properties" Target="docProps/core.xml"/>
+</Relationships>"#;
+        let zip = build_zip_raw(&[("_rels/.rels", root_rels_without_office_document)]);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(ref p) if p == PACKAGE_RELS_PATH));
+    }
+
+    #[test]
+    fn workbook_part_at_package_root_resolves_via_root_rels() {
+        // Issue #55: the workbook part is not required to live at
+        // `xl/workbook.xml` — only `_rels/.rels`'s `officeDocument`
+        // relationship says where it actually is. Mirrors
+        // tests/fixtures/other/minimal_package.xlsx's layout at the unit
+        // level (workbook.xml/styles.xml/sheet1.xml all at the package
+        // root, discoverable only through the relationship graph).
+        let root_rels: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="workbook.xml"/>
+</Relationships>"#;
+        let workbook_rels_at_root: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="sheet1.xml"/>
+</Relationships>"#;
+        let worksheet_without_shared_strings: &[u8] =
+            br#"<worksheet><sheetData><row r="1"><c r="A1"><v>42</v></c></row></sheetData></worksheet>"#;
+        let zip = build_zip_raw(&[
+            ("_rels/.rels", root_rels),
+            ("_rels/workbook.xml.rels", workbook_rels_at_root),
+            ("workbook.xml", WORKBOOK_XML),
+            ("sheet1.xml", worksheet_without_shared_strings),
+        ]);
+
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+
+        assert_eq!(workbook.sheets().len(), 1);
+        assert_eq!(
+            workbook.sheets()[0]
+                .get(CellRef { row: 1, col: 1 })
+                .unwrap()
+                .value,
+            Some(CellValue::Number(42.0))
+        );
     }
 
     #[test]

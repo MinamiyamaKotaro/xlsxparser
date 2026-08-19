@@ -127,6 +127,10 @@ mod tests {
         buf
     }
 
+    const ROOT_RELS_XML: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#;
+
     const RELS_XML: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
   <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
@@ -146,6 +150,7 @@ mod tests {
 
     fn minimal_xlsx() -> Vec<u8> {
         build_zip(&[
+            ("_rels/.rels", ROOT_RELS_XML),
             ("xl/_rels/workbook.xml.rels", RELS_XML),
             ("xl/workbook.xml", WORKBOOK_XML),
             ("xl/styles.xml", STYLES_XML),

@@ -7,7 +7,9 @@
 //! (shared strings, styles, merged ranges).
 
 use crate::error::Error;
-use crate::model::{Cell, CellRef, CellValue, ColWidthRange, MergedRegion, Sheet, StyleId};
+use crate::model::{
+    Cell, CellRef, CellValue, ColWidthRange, DateTimeValue, MergedRegion, Sheet, StyleId,
+};
 use crate::parse::{
     concat_rich_text, create_secure_reader, optional_attr, read_event, read_leaf_text,
     required_attr,
@@ -267,6 +269,12 @@ fn build_cell(
         Some("inlineStr") => inline_string.map(|s| CellValue::Text(Arc::from(s))),
         Some("b") => value_text.map(|s| CellValue::Boolean(s == "1")),
         Some("e") => value_text.map(|s| CellValue::Error(s.to_string())),
+        // ECMA-376 Part 1's `t="d"` extension (Issue #58): the `<v>` text is
+        // an ISO 8601 string rather than a serial number.
+        Some("d") => value_text
+            .map(|s| parse_iso8601_datetime(s, path))
+            .transpose()?
+            .map(CellValue::DateTime),
         // Unknown `t` value: falls back to keeping the raw text as Text
         // rather than dropping data.
         Some(_) => value_text.map(|s| CellValue::Text(Arc::from(s))),
@@ -278,6 +286,76 @@ fn parse_number(text: &str, path: &str) -> Result<f64, Error> {
     text.trim().parse::<f64>().map_err(|_| {
         Error::InvalidPackage(format!("invalid numeric cell value {text:?} in {path}"))
     })
+}
+
+/// Parses a `t="d"` cell's `<v>` text as ISO 8601 (Issue #58). Handles the
+/// three shapes real files use: date-only (`2021-01-01`), date+time
+/// (`2021-01-01T10:10:10`), and time-only (`10:10:10`). Fractional seconds
+/// and UTC/offset suffixes are not observed in the wild for this rarely-used
+/// extension and are rejected rather than silently truncated.
+///
+/// A time-only value has no date component in the source, so it lands on
+/// Excel's own "time of day" convention (serial day 0 = 1899-12-30),
+/// matching how `resolve/style.rs::serial_to_date_time` already decodes a
+/// fractional serial < 1.
+fn parse_iso8601_datetime(text: &str, path: &str) -> Result<DateTimeValue, Error> {
+    let (date_part, time_part) = match text.split_once('T') {
+        Some((d, t)) => (Some(d), Some(t)),
+        None if text.contains(':') => (None, Some(text)),
+        None => (Some(text), None),
+    };
+
+    let (year, month, day) = match date_part {
+        Some(d) => {
+            let mut it = d.split('-');
+            let (Some(y), Some(mo), Some(da), None) = (it.next(), it.next(), it.next(), it.next())
+            else {
+                return Err(invalid_iso8601(text, path));
+            };
+            let year = y.parse::<i32>().map_err(|_| invalid_iso8601(text, path))?;
+            let month = mo.parse::<u8>().map_err(|_| invalid_iso8601(text, path))?;
+            let day = da.parse::<u8>().map_err(|_| invalid_iso8601(text, path))?;
+            (year, month, day)
+        }
+        None => (1899, 12, 30),
+    };
+
+    let (hour, minute, second) = match time_part {
+        Some(t) => {
+            let mut it = t.split(':');
+            let (Some(h), Some(mi), Some(se), None) = (it.next(), it.next(), it.next(), it.next())
+            else {
+                return Err(invalid_iso8601(text, path));
+            };
+            let hour = h.parse::<u8>().map_err(|_| invalid_iso8601(text, path))?;
+            let minute = mi.parse::<u8>().map_err(|_| invalid_iso8601(text, path))?;
+            let second = se.parse::<u8>().map_err(|_| invalid_iso8601(text, path))?;
+            (hour, minute, second)
+        }
+        None => (0, 0, 0),
+    };
+
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return Err(invalid_iso8601(text, path));
+    }
+
+    Ok(DateTimeValue {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+    })
+}
+
+fn invalid_iso8601(text: &str, path: &str) -> Error {
+    Error::InvalidPackage(format!("invalid ISO 8601 cell value {text:?} in {path}"))
 }
 
 /// Parses a `<mergeCell ref="A1:C3"/>` reference into a `MergedRegion`. Only
