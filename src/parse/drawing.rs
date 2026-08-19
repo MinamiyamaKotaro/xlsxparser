@@ -565,6 +565,28 @@ mod tests {
     }
 
     #[test]
+    fn pic_without_blip_is_skipped() {
+        // A <xdr:pic> that closes without ever containing an <a:blip> (e.g.
+        // a picture placeholder with no image data) has no embed_r_id to
+        // take, so it must contribute zero images rather than erroring.
+        let xml = format!(
+            r#"<xdr:wsDr {NS}>
+  <xdr:twoCellAnchor>
+    {from}
+    {to}
+    <xdr:pic><xdr:blipFill></xdr:blipFill></xdr:pic>
+    <xdr:clientData/>
+  </xdr:twoCellAnchor>
+</xdr:wsDr>"#,
+            from = marker_xml("from", 0, 0, 0, 0),
+            to = marker_xml("to", 1, 0, 1, 0),
+        );
+
+        let images = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap();
+        assert!(images.is_empty());
+    }
+
+    #[test]
     fn multiple_anchors_all_parsed() {
         let xml = format!(
             r#"<xdr:wsDr {NS}>
@@ -858,12 +880,17 @@ mod tests {
         );
         let images = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap();
         assert_eq!(images.len(), 1);
-        match images[0].anchor {
-            ImageAnchor::OneCell { from, .. } => {
-                assert_eq!(from.cell, CellRef { row: 5, col: 3 });
+        assert_eq!(
+            images[0].anchor,
+            ImageAnchor::OneCell {
+                from: AnchorMarker {
+                    cell: CellRef { row: 5, col: 3 },
+                    col_off: 5000,
+                    row_off: 5000,
+                },
+                ext: ImageExtent { cx: 100, cy: 100 },
             }
-            ImageAnchor::TwoCell { .. } => panic!("expected a OneCell anchor"),
-        }
+        );
     }
 
     #[test]
@@ -965,22 +992,21 @@ mod tests {
 
         assert_eq!(images[1].embed_r_id, "rId2");
         assert_eq!(images[1].hyperlink_r_id.as_deref(), Some("rId3"));
-        match images[1].anchor {
-            ImageAnchor::OneCell { from, ext } => {
-                assert_eq!(from.cell, CellRef { row: 5, col: 2 });
-                // delta = 2_160_000 - 1_080_000 = 1_080_000, added to from's own colOff.
-                assert_eq!(from.col_off, 267_120 + 1_080_000);
-                assert_eq!(from.row_off, 69_840);
-                assert_eq!(
-                    ext,
-                    ImageExtent {
-                        cx: 720_000,
-                        cy: 540_000
-                    }
-                );
+        // delta = 2_160_000 - 1_080_000 = 1_080_000, added to from's own colOff.
+        assert_eq!(
+            images[1].anchor,
+            ImageAnchor::OneCell {
+                from: AnchorMarker {
+                    cell: CellRef { row: 5, col: 2 },
+                    col_off: 267_120 + 1_080_000,
+                    row_off: 69_840,
+                },
+                ext: ImageExtent {
+                    cx: 720_000,
+                    cy: 540_000
+                },
             }
-            ImageAnchor::TwoCell { .. } => panic!("expected a OneCell anchor"),
-        }
+        );
     }
 
     #[test]
@@ -1028,21 +1054,20 @@ mod tests {
 
         let images = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap();
         assert_eq!(images.len(), 1);
-        match images[0].anchor {
-            ImageAnchor::OneCell { from, ext } => {
-                assert_eq!(from.cell, CellRef { row: 1, col: 1 });
-                assert_eq!(from.col_off, 1000 + 120_000);
-                assert_eq!(from.row_off, 2000 + 60_000);
-                assert_eq!(
-                    ext,
-                    ImageExtent {
-                        cx: 20_000,
-                        cy: 10_000
-                    }
-                );
+        assert_eq!(
+            images[0].anchor,
+            ImageAnchor::OneCell {
+                from: AnchorMarker {
+                    cell: CellRef { row: 1, col: 1 },
+                    col_off: 1000 + 120_000,
+                    row_off: 2000 + 60_000,
+                },
+                ext: ImageExtent {
+                    cx: 20_000,
+                    cy: 10_000
+                },
             }
-            ImageAnchor::TwoCell { .. } => panic!("expected a OneCell anchor"),
-        }
+        );
     }
 
     #[test]
@@ -1157,5 +1182,39 @@ mod tests {
 
         let images = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap();
         assert!(images.is_empty());
+    }
+
+    #[test]
+    fn grouped_pic_with_anchor_missing_from_is_missing_required_element() {
+        // A grouped picture's resolved position is always anchored at the
+        // enclosing anchor's own `from` marker (see `resolve_grouped_pic`'s
+        // doc) — if that marker itself is missing, resolution must fail
+        // the same way the non-grouped path already does, not silently
+        // treat the missing base as (0, 0).
+        let xml = format!(
+            r#"<xdr:wsDr {NS}>
+  <xdr:oneCellAnchor>
+    <xdr:ext cx="1" cy="1"/>
+    <xdr:grpSp>
+      <xdr:nvGrpSpPr><xdr:cNvPr id="1" name=""/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>
+      <xdr:grpSpPr><a:xfrm>
+        <a:off x="0" y="0"/><a:ext cx="100" cy="100"/>
+        <a:chOff x="0" y="0"/><a:chExt cx="100" cy="100"/>
+      </a:xfrm></xdr:grpSpPr>
+      {pic}
+    </xdr:grpSp>
+  </xdr:oneCellAnchor>
+</xdr:wsDr>"#,
+            pic = pic_xml("rId1", None),
+        );
+
+        let err = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MissingRequiredElement {
+                name: "xdr:from",
+                ..
+            }
+        ));
     }
 }
