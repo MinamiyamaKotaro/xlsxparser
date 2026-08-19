@@ -95,6 +95,8 @@ Issue #67の実装中に、もう1つ関連するスコーピング問題が見�
 - 0始まりから1始まりへの変換でオーバーフローする、または `CellRef::MAX_ROW`/`MAX_COL` を超える座標は `Error::InvalidCellRef`(上記「主要な型・関数」参照)
 - 構文的に不正なXMLは、他の `parse/` モジュールと同じ `create_secure_reader`/`read_event` のゲートウェイを経由して `Error::XmlParse`/`Error::ZipBombDetected`/`Error::DoctypeRejected` に変換される
 - `chExt`がいずれかの軸でゼロの`<xdr:grpSp>`(`resolve_grouped_pic`の`ext / chExt`が未定義になる)は`Error::InvalidPackage`でfail-fast——整形式だが意味を成さない数値を`NaN`/`Infinity`として静かに生成するのではなく拒否する、本ファイルの一般的な方針に倣う(Issue #67)
+- `MAX_GROUP_NESTING_DEPTH`(64)を超える`<xdr:grpSp>`のネストは`Error::TooManyNestedGroups`——ネストしたグループの開始タグが`group_stack`をこの上限より深く積もうとした時点でチェックし、そのグループの内容をこれ以上読む前に拒否する(セキュリティレビュー Finding 1、Issue #71のフォローアップ。詳細は後述)
+- グループ変換の解決後の座標(`resolve_grouped_pic`の最終`x`/`y`/`cx`/`cy`)が非有限(`NaN`/`Infinity`——極端な`ext`/`chExt`比率をネスト段数分掛け合わせることで到達可能)、または防御的な妥当性上限(`MAX_PLAUSIBLE_EMU`、10^12 EMU——Excelの実際の最大シート範囲を大きく上回る)を超える場合は`Error::InvalidPackage`でfail-fast、変換ループ完了後に一度だけチェックする(セキュリティレビュー Finding 2、Issue #71のフォローアップ)
 
 ## テスト方針
 
@@ -113,6 +115,8 @@ Issue #67の実装中に、もう1つ関連するスコーピング問題が見�
 - グループ内のある画像に貼られたハイパーリンクが、ハイパーリンクを持たない次の兄弟画像に紛れ込まないことの確認
 - `chExt`がいずれかの軸でゼロの`<xdr:grpSp>`が`Error::InvalidPackage`になることの確認
 - 画像を持たない図形のみで構成されるグループ(`<xdr:pic>`がどこにも無い)が画像を一切生成しないことの確認
+- `<xdr:grpSp>`のネストが`MAX_GROUP_NESTING_DEPTH`ちょうどでは受理され、1段超えると`Error::TooManyNestedGroups`になることの確認(セキュリティレビュー Finding 1)
+- 少数のネスト段数に対して細工した`ext`/`chExt`比率を掛け合わせ、解決後の座標を非有限または非現実的な大きさへ到達させると`Error::InvalidPackage`になることの確認(セキュリティレビュー Finding 2)
 
 ## 未決事項 / オープンクエスチョン
 
@@ -122,3 +126,4 @@ Issue #67の実装中に、もう1つ関連するスコーピング問題が見�
 4. ~~`<xdr:grpSp>`(グループ化された画像)に対応するか、するならどう対応するか~~ → **解決**: Issue #67 — 上記「グループ画像」節参照。グループ内の画像は常に`ImageAnchor::OneCell`に解決される。
 5. **Issue #67によってグループ化されていない画像にも追加される解析コスト**: 別Issue [#71](https://github.com/MinamiyamaKotaro/xlsxparser/issues/71) として追跡。実際のLibreOffice出力に対するPoCベンチマークでは、`parse_anchor_body`の`match`が大きくなったことに起因して1シェイプあたり約20%のコスト増が測定された——追加したアームのガード内ロジックはグループ化されていない画像では実行されないが、各XMLイベントに対する「タグ名か」という比較そのものは常に発生するため。絶対値は数百ナノ秒の規模にとどまる(計測したフィクスチャでのワークブック全体のパース時間約190µsと比べれば無視できる)が、画像枚数が非常に多い実ファイルで測定可能な水準になった場合は再検討の余地がある。
 6. **グループ自体に貼られたハイパーリンクの`Image::hyperlink`への反映**: グループ内の**個々の画像**ではなく**グループ自体**に貼られたハイパーリンクは、意図的に出力モデルのどこにも反映していない——個々の画像単位のハイパーリンクのみがIssue #65の元々のスコープである。実ファイルでこれに依存するケースが見つかった場合は再検討する。
+7. ~~`<xdr:grpSp>`のネスト深さに防御的な上限が必要か~~ → **解決**: 必要だった。`resolve_grouped_pic`は`<xdr:pic>`を1枚解決するごとに現在のネスト深さに比例したコスト(O(深さ))がかかるため、`D`段のネストと最内層の`N`枚の兄弟画像を持つdrawing部品は、構築に必要なバイト数がO(N+D)であるのに対しコストはO(N×D)になる——Zip Bombのバイト数上限だけでは`D`を制限できず、`docs/security/old/code-review.en.md` Finding 1が結合セル数について見つけたのと同じ形。実測(`docs/security/design-review.en.md` Finding 1): 22.6MBのdrawing部品(D=N=50,000)が修正前は10.9秒の同期的CPU占有を引き起こした。`MAX_GROUP_NESTING_DEPTH = 64`(`parse::drawing`)を追加し、各`<xdr:grpSp>`の開始タグでチェックする——`resolve::merge::MAX_MERGE_REGIONS`/`resolve::column_width::MAX_COLUMN_WIDTH_RANGES`と同じ防御的上限のパターン。修正後に同じ攻撃形状を再計測すると1ms未満で拒否されることを確認した。関連する別の数値上限(`MAX_PLAUSIBLE_EMU`)も同時に追加した——詳細は上記エラー処理方針、および`docs/security/design-review.en.md`/`code-review.en.md`のFinding 1・2を参照。
