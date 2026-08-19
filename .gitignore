@@ -18,3 +18,7 @@ Thumbs.db
 
 # TEST files: contains personal information, do not commit (added 2026-08-18 13:37 JST)
 tests/fixtures/other
+
+# Throwaway proof-of-concept code (design exploration, not meant to be
+# merged) — see e.g. Issue #67's grouped-image transform PoC.
+/PoC/
