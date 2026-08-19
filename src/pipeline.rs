@@ -181,22 +181,36 @@ fn rels_path_for(part_path: &str) -> (String, &str) {
 /// `<xdr:pic>`'s `r:embed`/hyperlink `r:id` against `drawingN.xml`'s own
 /// `_rels`.
 ///
-/// Error handling mirrors how `route.worksheet_path` itself is resolved
-/// above: any `r:id` referenced by the XML that fails to resolve — whether
-/// because the `_rels` part doesn't exist at all, the `r:id` isn't in it, or
-/// the target it resolves to has no matching ZIP entry — is
+/// Error handling for everything up through the embedded media
+/// (`r:embed`) mirrors how `route.worksheet_path` itself is resolved above:
+/// any `r:id` referenced by the XML that fails to resolve — whether because
+/// the `_rels` part doesn't exist at all, the `r:id` isn't in it, or the
+/// target it resolves to has no matching ZIP entry — is
 /// `Error::DanglingRelationship`, fail-fast. This sheet already declared
-/// `<drawing r:id="...">`, so an unresolvable reference here means a
+/// `<drawing r:id="...">`, so an unresolvable `r:embed` here means a
 /// genuinely broken package, not an absent optional feature (contrast the
 /// sharedStrings/styles relationship-type-absent case above, which
 /// legitimately falls back to an empty default instead).
 ///
+/// The image's own hyperlink (`a:hlinkClick`) is treated differently: an
+/// unresolvable `hyperlink_r_id` (missing from `drawing1.xml.rels`, or an
+/// `Internal` target absent from the ZIP) degrades to `Image::hyperlink:
+/// None` rather than failing the whole sheet. Unlike `r:embed` — without
+/// which there is no image to speak of — `Image::hyperlink` is already
+/// `Option<String>` in the model, a field the rest of this codebase treats
+/// as legitimately absent; a broken *decoration* on an otherwise-valid
+/// image souring the parse of every other cell on the sheet would be a
+/// poor tradeoff for a diff-oriented tool (PR #66 review). A `has_entry`
+/// call that itself errors (e.g. a resolved path that fails Zip Slip
+/// validation) still propagates via `?` either way — that is a distinct,
+/// always-fail-fast concern from "no matching entry."
+///
 /// Only an `Internal` (in-package) target's existence is verified against
-/// the ZIP; an `External` one (a hyperlink URL, most commonly) is kept
-/// as-is without a filesystem check, since this library never fetches
-/// external resources. Neither branch ever reads the target's bytes — only
-/// `get_entry`'s `Option` is inspected — so resolving images costs O(image
-/// count), never O(image size).
+/// the ZIP, via `ZipContainer::has_entry`; an `External` one (a hyperlink
+/// URL, most commonly) is kept as-is without a filesystem check, since this
+/// library never fetches external resources. Neither branch ever reads the
+/// target's bytes, so resolving images costs O(image count), never O(image
+/// size).
 fn resolve_sheet_images<R: Read + Seek>(
     container: &mut ZipContainer<R>,
     worksheet_path: &str,
@@ -257,7 +271,7 @@ fn resolve_sheet_images<R: Read + Seek>(
                     r_id: pending.embed_r_id.clone(),
                 })?;
         if embed_rel.target_mode == parse::TargetMode::Internal
-            && container.get_entry(&embed_rel.target)?.is_none()
+            && !container.has_entry(&embed_rel.target)?
         {
             return Err(Error::DanglingRelationship {
                 r_id: pending.embed_r_id.clone(),
@@ -265,21 +279,13 @@ fn resolve_sheet_images<R: Read + Seek>(
         }
         let target = embed_rel.target.clone();
 
-        let hyperlink = match &pending.hyperlink_r_id {
-            Some(hyperlink_r_id) => {
-                let hyperlink_rel =
-                    rels.get(hyperlink_r_id)
-                        .ok_or_else(|| Error::DanglingRelationship {
-                            r_id: hyperlink_r_id.clone(),
-                        })?;
-                if hyperlink_rel.target_mode == parse::TargetMode::Internal
-                    && container.get_entry(&hyperlink_rel.target)?.is_none()
-                {
-                    return Err(Error::DanglingRelationship {
-                        r_id: hyperlink_r_id.clone(),
-                    });
-                }
-                Some(hyperlink_rel.target.clone())
+        // Unlike embed above, an unresolvable hyperlink degrades to `None`
+        // rather than failing the sheet — see this function's doc comment.
+        let hyperlink = match pending.hyperlink_r_id.as_ref().and_then(|id| rels.get(id)) {
+            Some(hyperlink_rel) => {
+                let exists = hyperlink_rel.target_mode != parse::TargetMode::Internal
+                    || container.has_entry(&hyperlink_rel.target)?;
+                exists.then(|| hyperlink_rel.target.clone())
             }
             None => None,
         };
@@ -962,9 +968,12 @@ mod tests {
     }
 
     #[test]
-    fn hyperlink_r_id_not_in_drawing_rels_is_dangling_relationship() {
+    fn hyperlink_r_id_not_in_drawing_rels_degrades_to_no_hyperlink() {
         // rIdEmbed resolves fine, but rIdHyperlink (referenced by
         // <a:hlinkClick> in DRAWING1_XML) has no entry in drawing1.xml.rels.
+        // Unlike an unresolvable r:embed, this must not fail the whole
+        // sheet (PR #66 review) — the image itself still resolves, just
+        // without a hyperlink.
         let rels_without_hyperlink: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rIdEmbed" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
 </Relationships>"#;
@@ -975,16 +984,20 @@ mod tests {
             }
         }
         let zip = build_zip(&entries);
-        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
-        assert!(matches!(err, Error::DanglingRelationship { .. }));
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+        let images = workbook.sheets()[0].images();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].target, "xl/media/image1.png");
+        assert_eq!(images[0].hyperlink, None);
     }
 
     #[test]
-    fn internal_hyperlink_target_missing_is_dangling_relationship() {
+    fn internal_hyperlink_target_missing_degrades_to_no_hyperlink() {
         // rIdHyperlink resolves to an Internal (in-package) relationship
-        // this time, rather than DRAWING1_RELS_XML's External URL — its
-        // target must be checked for existence in the ZIP just like an
-        // embed target is, and this one doesn't exist.
+        // this time, rather than DRAWING1_RELS_XML's External URL, and its
+        // target doesn't exist in the ZIP. Same graceful-degradation policy
+        // as hyperlink_r_id_not_in_drawing_rels_degrades_to_no_hyperlink —
+        // only r:embed's own existence check is fail-fast.
         let rels_with_internal_hyperlink: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rIdEmbed" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
   <Relationship Id="rIdHyperlink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="../other/missing.xml"/>
@@ -996,7 +1009,10 @@ mod tests {
             }
         }
         let zip = build_zip(&entries);
-        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
-        assert!(matches!(err, Error::DanglingRelationship { .. }));
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+        let images = workbook.sheets()[0].images();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].target, "xl/media/image1.png");
+        assert_eq!(images[0].hyperlink, None);
     }
 }

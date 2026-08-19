@@ -8,6 +8,7 @@ pub mod sanitize;
 
 use crate::error::Error;
 use sanitize::{BoundedReader, DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE, DEFAULT_MAX_UNCOMPRESSED_SIZE};
+use std::collections::HashSet;
 use std::io::{Read, Seek};
 
 /// The entry point for ZIP extraction of a .xlsx (OPC) package. All entry
@@ -30,6 +31,14 @@ pub struct ZipContainer<R> {
     /// Running total of bytes decompressed so far via `get_entry`.
     /// `get_entry` lends this out to `BoundedReader` as `&mut`.
     total_read: u64,
+    /// Every entry name in the archive, captured once at `open_reader` time
+    /// (the same pass that already runs `validate_entry_path` over
+    /// `archive.file_names()`) so `has_entry` can answer an existence-only
+    /// query in O(1) without going through `get_entry`'s local-file-header
+    /// read and `BoundedReader` construction (Issue #65 PR review: image
+    /// anchor resolution only ever needs to know whether a target exists,
+    /// never its bytes).
+    entry_name_set: HashSet<String>,
 }
 
 impl<R: Read + Seek> ZipContainer<R> {
@@ -43,14 +52,17 @@ impl<R: Read + Seek> ZipContainer<R> {
     pub fn open_reader(reader: R) -> Result<Self, Error> {
         let archive =
             zip::ZipArchive::new(reader).map_err(|e| Error::InvalidPackage(e.to_string()))?;
+        let mut entry_name_set = HashSet::with_capacity(archive.len());
         for name in archive.file_names() {
             sanitize::validate_entry_path(name)?;
+            entry_name_set.insert(name.to_string());
         }
         Ok(Self {
             archive,
             max_entry_size: DEFAULT_MAX_UNCOMPRESSED_SIZE,
             max_total_size: DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE,
             total_read: 0,
+            entry_name_set,
         })
     }
 
@@ -106,6 +118,19 @@ impl<R: Read + Seek> ZipContainer<R> {
             Err(zip::result::ZipError::FileNotFound) => Ok(None),
             Err(e) => Err(Error::InvalidPackage(e.to_string())),
         }
+    }
+
+    /// Checks whether `name` exists in the archive, without reading it —
+    /// re-validates `name` the same way `get_entry` does (see its doc: this
+    /// may be a dynamically computed, untrusted path), then does an O(1)
+    /// `entry_name_set` lookup instead of `get_entry`'s local-file-header
+    /// read and `BoundedReader` construction. For a caller that only needs
+    /// to know an entry exists — never its content — this is both a
+    /// clearer statement of intent and cheaper than `get_entry(name)?
+    /// .is_some()` followed by immediately dropping the reader.
+    pub fn has_entry(&self, name: &str) -> Result<bool, Error> {
+        sanitize::validate_entry_path(name)?;
+        Ok(self.entry_name_set.contains(name))
     }
 
     /// Lists all entry names in the archive (already validated at open
@@ -207,6 +232,31 @@ mod tests {
         let mut container = ZipContainer::open_reader(Cursor::new(bytes)).unwrap();
 
         assert!(container.get_entry("xl/missing.xml").unwrap().is_none());
+    }
+
+    #[test]
+    fn has_entry_true_for_existing_name() {
+        let bytes = build_zip(&[("xl/workbook.xml", b"<workbook/>")]);
+        let container = ZipContainer::open_reader(Cursor::new(bytes)).unwrap();
+
+        assert!(container.has_entry("xl/workbook.xml").unwrap());
+    }
+
+    #[test]
+    fn has_entry_false_for_missing_name() {
+        let bytes = build_zip(&[("xl/workbook.xml", b"<workbook/>")]);
+        let container = ZipContainer::open_reader(Cursor::new(bytes)).unwrap();
+
+        assert!(!container.has_entry("xl/missing.xml").unwrap());
+    }
+
+    #[test]
+    fn has_entry_rejects_malformed_name_even_if_absent() {
+        let bytes = build_zip(&[("xl/workbook.xml", b"<workbook/>")]);
+        let container = ZipContainer::open_reader(Cursor::new(bytes)).unwrap();
+
+        let result = container.has_entry("../etc/passwd");
+        assert!(matches!(result, Err(Error::ZipSlipDetected { .. })));
     }
 
     #[test]
