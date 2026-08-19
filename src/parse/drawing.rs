@@ -125,169 +125,170 @@ fn parse_anchor_body(
     let mut pic_ext = (0i64, 0i64);
 
     loop {
-        match read_event(reader, &mut buf, path)? {
-            Event::Start(e) if e.local_name().as_ref() == b"from" => {
-                from = Some(parse_marker(reader, path)?);
-            }
-            Event::Start(e) if e.local_name().as_ref() == b"to" => {
-                to = Some(parse_marker(reader, path)?);
-            }
-            Event::Start(e) if e.local_name().as_ref() == b"grpSp" => {
-                group_stack.push(GroupContext::default());
-            }
-            Event::End(e) if e.local_name().as_ref() == b"grpSp" => {
-                group_stack.pop();
-            }
-            Event::Start(e) if e.local_name().as_ref() == b"grpSpPr" => {
-                in_grp_sp_pr = true;
-            }
-            Event::End(e) if e.local_name().as_ref() == b"grpSpPr" => {
-                in_grp_sp_pr = false;
-            }
-            Event::Start(e) if e.local_name().as_ref() == b"pic" => {
-                in_pic = true;
-            }
-            // A shape's own spPr/xfrm off/ext only matters — and is only
-            // read at all — when it's inside a group: for a plain,
-            // non-grouped picture it's redundant with (and, per Issue #65,
-            // must never overwrite) the anchor's own from/to/ext.
-            Event::Start(e)
-                if e.local_name().as_ref() == b"spPr" && in_pic && !group_stack.is_empty() =>
-            {
-                in_sp_pr = true;
-            }
-            Event::End(e) if e.local_name().as_ref() == b"spPr" => {
-                in_sp_pr = false;
-            }
-            Event::Empty(e) if e.local_name().as_ref() == b"off" => {
-                let x = parse_attr_i64(&e, path, "x")?;
-                let y = parse_attr_i64(&e, path, "y")?;
-                if in_grp_sp_pr {
-                    if let Some(g) = group_stack.last_mut() {
-                        g.off_x = x;
-                        g.off_y = y;
-                    }
-                } else if in_sp_pr {
-                    pic_off = (x, y);
+        let event = read_event(reader, &mut buf, path)?;
+        match event {
+            Event::Start(e) => match e.local_name().as_ref() {
+                b"from" => {
+                    from = Some(parse_marker(reader, path)?);
                 }
-            }
-            Event::Empty(e) if e.local_name().as_ref() == b"ext" => {
-                if in_grp_sp_pr {
+                b"to" => {
+                    to = Some(parse_marker(reader, path)?);
+                }
+                b"pic" => {
+                    in_pic = true;
+                }
+                b"spPr" if in_pic && !group_stack.is_empty() => {
+                    in_sp_pr = true;
+                }
+                b"blip" => {
+                    embed_r_id = Some(required_attr(&e, path, "r:embed")?);
+                }
+                b"hlinkClick" if in_pic => {
+                    hyperlink_r_id = optional_attr(&e, path, "r:id")?;
+                }
+                b"grpSp" => {
+                    group_stack.push(GroupContext::default());
+                }
+                b"grpSpPr" => {
+                    in_grp_sp_pr = true;
+                }
+                _ => {}
+            },
+            Event::End(e) => match e.local_name().as_ref() {
+                b"pic" => {
+                    if let Some(id) = embed_r_id.take() {
+                        let anchor = if group_stack.is_empty() {
+                            match kind {
+                                AnchorKind::TwoCell => ImageAnchor::TwoCell {
+                                    from: from.ok_or_else(|| Error::MissingRequiredElement {
+                                        path: path.to_string(),
+                                        name: "xdr:from",
+                                    })?,
+                                    to: to.ok_or_else(|| Error::MissingRequiredElement {
+                                        path: path.to_string(),
+                                        name: "xdr:to",
+                                    })?,
+                                },
+                                AnchorKind::OneCell => ImageAnchor::OneCell {
+                                    from: from.ok_or_else(|| Error::MissingRequiredElement {
+                                        path: path.to_string(),
+                                        name: "xdr:from",
+                                    })?,
+                                    ext: ext.ok_or_else(|| Error::MissingRequiredElement {
+                                        path: path.to_string(),
+                                        name: "xdr:ext",
+                                    })?,
+                                },
+                            }
+                        } else {
+                            // A grouped picture always resolves to a OneCell
+                            // shape (explicit cell + offset + size) regardless
+                            // of the enclosing anchor's own kind — its
+                            // position/size come entirely from the group
+                            // transform, not from a `to` marker of its own.
+                            let base = from.ok_or_else(|| Error::MissingRequiredElement {
+                                path: path.to_string(),
+                                name: "xdr:from",
+                            })?;
+                            let (dx, dy, cx, cy) =
+                                resolve_grouped_pic(&group_stack, path, pic_off, pic_ext)?;
+                            ImageAnchor::OneCell {
+                                from: AnchorMarker {
+                                    cell: base.cell,
+                                    col_off: base.col_off + dx,
+                                    row_off: base.row_off + dy,
+                                },
+                                ext: ImageExtent { cx, cy },
+                            }
+                        };
+                        images.push(PendingImage {
+                            anchor,
+                            embed_r_id: id,
+                            hyperlink_r_id: hyperlink_r_id.take(),
+                        });
+                    }
+                    in_pic = false;
+                    pic_off = (0, 0);
+                    pic_ext = (0, 0);
+                }
+                b"spPr" => {
+                    in_sp_pr = false;
+                }
+                b"grpSp" => {
+                    group_stack.pop();
+                }
+                b"grpSpPr" => {
+                    in_grp_sp_pr = false;
+                }
+                b"twoCellAnchor" | b"oneCellAnchor" if group_stack.is_empty() => {
+                    break;
+                }
+                _ => {}
+            },
+            Event::Empty(e) => match e.local_name().as_ref() {
+                b"off" => {
+                    let x = parse_attr_i64(&e, path, "x")?;
+                    let y = parse_attr_i64(&e, path, "y")?;
+                    if in_grp_sp_pr {
+                        if let Some(g) = group_stack.last_mut() {
+                            g.off_x = x;
+                            g.off_y = y;
+                        }
+                    } else if in_sp_pr {
+                        pic_off = (x, y);
+                    }
+                }
+                b"ext" => {
+                    if in_grp_sp_pr {
+                        let cx = parse_attr_i64(&e, path, "cx")?;
+                        let cy = parse_attr_i64(&e, path, "cy")?;
+                        if let Some(g) = group_stack.last_mut() {
+                            g.ext_cx = cx;
+                            g.ext_cy = cy;
+                        }
+                    } else if in_sp_pr {
+                        pic_ext = (
+                            parse_attr_i64(&e, path, "cx")?,
+                            parse_attr_i64(&e, path, "cy")?,
+                        );
+                    } else if !in_pic {
+                        // The anchor's own OneCell size — see Issue #65's
+                        // follow-up doc note for why this dispatch (anchor-level
+                        // / group-level / pic-level) exists. `!in_pic` also
+                        // covers a *non-grouped* pic's own spPr/xfrm/ext (whose
+                        // spPr is never tracked via `in_sp_pr` at all — see the
+                        // `spPr` match arm's `!group_stack.is_empty()` guard —
+                        // so without this it would otherwise fall through here
+                        // and silently overwrite the anchor's own value).
+                        let cx = parse_attr_i64(&e, path, "cx")?;
+                        let cy = parse_attr_i64(&e, path, "cy")?;
+                        ext = Some(ImageExtent { cx, cy });
+                    }
+                }
+                b"chOff" if in_grp_sp_pr => {
+                    let x = parse_attr_i64(&e, path, "x")?;
+                    let y = parse_attr_i64(&e, path, "y")?;
+                    if let Some(g) = group_stack.last_mut() {
+                        g.ch_off_x = x;
+                        g.ch_off_y = y;
+                    }
+                }
+                b"chExt" if in_grp_sp_pr => {
                     let cx = parse_attr_i64(&e, path, "cx")?;
                     let cy = parse_attr_i64(&e, path, "cy")?;
                     if let Some(g) = group_stack.last_mut() {
-                        g.ext_cx = cx;
-                        g.ext_cy = cy;
+                        g.ch_ext_cx = cx;
+                        g.ch_ext_cy = cy;
                     }
-                } else if in_sp_pr {
-                    pic_ext = (
-                        parse_attr_i64(&e, path, "cx")?,
-                        parse_attr_i64(&e, path, "cy")?,
-                    );
-                } else if !in_pic {
-                    // The anchor's own OneCell size — see Issue #65's
-                    // follow-up doc note for why this dispatch (anchor-level
-                    // / group-level / pic-level) exists. `!in_pic` also
-                    // covers a *non-grouped* pic's own spPr/xfrm/ext (whose
-                    // spPr is never tracked via `in_sp_pr` at all — see the
-                    // `spPr` match arm's `!group_stack.is_empty()` guard —
-                    // so without this it would otherwise fall through here
-                    // and silently overwrite the anchor's own value).
-                    let cx = parse_attr_i64(&e, path, "cx")?;
-                    let cy = parse_attr_i64(&e, path, "cy")?;
-                    ext = Some(ImageExtent { cx, cy });
                 }
-            }
-            Event::Empty(e) if e.local_name().as_ref() == b"chOff" && in_grp_sp_pr => {
-                let x = parse_attr_i64(&e, path, "x")?;
-                let y = parse_attr_i64(&e, path, "y")?;
-                if let Some(g) = group_stack.last_mut() {
-                    g.ch_off_x = x;
-                    g.ch_off_y = y;
+                b"blip" => {
+                    embed_r_id = Some(required_attr(&e, path, "r:embed")?);
                 }
-            }
-            Event::Empty(e) if e.local_name().as_ref() == b"chExt" && in_grp_sp_pr => {
-                let cx = parse_attr_i64(&e, path, "cx")?;
-                let cy = parse_attr_i64(&e, path, "cy")?;
-                if let Some(g) = group_stack.last_mut() {
-                    g.ch_ext_cx = cx;
-                    g.ch_ext_cy = cy;
+                b"hlinkClick" if in_pic => {
+                    hyperlink_r_id = optional_attr(&e, path, "r:id")?;
                 }
-            }
-            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"blip" => {
-                embed_r_id = Some(required_attr(&e, path, "r:embed")?);
-            }
-            // Gated on `in_pic`: a hyperlink on the *group itself*
-            // (`<xdr:nvGrpSpPr><xdr:cNvPr><a:hlinkClick>`) appears earlier
-            // in document order than any picture inside it and must not
-            // leak into the first picture found.
-            Event::Start(e) | Event::Empty(e)
-                if e.local_name().as_ref() == b"hlinkClick" && in_pic =>
-            {
-                hyperlink_r_id = optional_attr(&e, path, "r:id")?;
-            }
-            Event::End(e) if e.local_name().as_ref() == b"pic" => {
-                if let Some(id) = embed_r_id.take() {
-                    let anchor = if group_stack.is_empty() {
-                        match kind {
-                            AnchorKind::TwoCell => ImageAnchor::TwoCell {
-                                from: from.ok_or_else(|| Error::MissingRequiredElement {
-                                    path: path.to_string(),
-                                    name: "xdr:from",
-                                })?,
-                                to: to.ok_or_else(|| Error::MissingRequiredElement {
-                                    path: path.to_string(),
-                                    name: "xdr:to",
-                                })?,
-                            },
-                            AnchorKind::OneCell => ImageAnchor::OneCell {
-                                from: from.ok_or_else(|| Error::MissingRequiredElement {
-                                    path: path.to_string(),
-                                    name: "xdr:from",
-                                })?,
-                                ext: ext.ok_or_else(|| Error::MissingRequiredElement {
-                                    path: path.to_string(),
-                                    name: "xdr:ext",
-                                })?,
-                            },
-                        }
-                    } else {
-                        // A grouped picture always resolves to a OneCell
-                        // shape (explicit cell + offset + size) regardless
-                        // of the enclosing anchor's own kind — its
-                        // position/size come entirely from the group
-                        // transform, not from a `to` marker of its own.
-                        let base = from.ok_or_else(|| Error::MissingRequiredElement {
-                            path: path.to_string(),
-                            name: "xdr:from",
-                        })?;
-                        let (dx, dy, cx, cy) =
-                            resolve_grouped_pic(&group_stack, path, pic_off, pic_ext)?;
-                        ImageAnchor::OneCell {
-                            from: AnchorMarker {
-                                cell: base.cell,
-                                col_off: base.col_off + dx,
-                                row_off: base.row_off + dy,
-                            },
-                            ext: ImageExtent { cx, cy },
-                        }
-                    };
-                    images.push(PendingImage {
-                        anchor,
-                        embed_r_id: id,
-                        hyperlink_r_id: hyperlink_r_id.take(),
-                    });
-                }
-                in_pic = false;
-                pic_off = (0, 0);
-                pic_ext = (0, 0);
-            }
-            Event::End(e)
-                if matches!(e.local_name().as_ref(), b"twoCellAnchor" | b"oneCellAnchor")
-                    && group_stack.is_empty() =>
-            {
-                break;
-            }
+                _ => {}
+            },
             Event::Eof => {
                 return Err(Error::MissingRequiredElement {
                     path: path.to_string(),
