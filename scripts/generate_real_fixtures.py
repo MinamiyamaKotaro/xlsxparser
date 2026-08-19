@@ -129,6 +129,105 @@ def _one_cell_anchor_xml():
     )
 
 
+def _grouped_images_anchor_xml():
+    """Two pictures grouped together via `<xdr:grpSp>` (Issue #67), using
+    the same numeric conventions confirmed against real LibreOffice output:
+    the outermost group's own `chOff`/`chExt` equal its `off`/`ext` (scale
+    1), and both group- and pic-level `off`/`ext` are literal
+    absolute-canvas EMU. The first pic carries no hyperlink; the second
+    carries an `External` one, so the fixture also exercises per-pic
+    hyperlink scoping surviving the group transform.
+    """
+    return (
+        '<xdr:twoCellAnchor editAs="absolute">'
+        "<xdr:from><xdr:col>1</xdr:col><xdr:colOff>267120</xdr:colOff>"
+        "<xdr:row>4</xdr:row><xdr:rowOff>69840</xdr:rowOff></xdr:from>"
+        "<xdr:to><xdr:col>3</xdr:col><xdr:colOff>441720</xdr:colOff>"
+        "<xdr:row>7</xdr:row><xdr:rowOff>122040</xdr:rowOff></xdr:to>"
+        "<xdr:grpSp>"
+        '<xdr:nvGrpSpPr><xdr:cNvPr id="1" name=""/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>'
+        "<xdr:grpSpPr><a:xfrm>"
+        '<a:off x="1080000" y="720000"/><a:ext cx="1800000" cy="540000"/>'
+        '<a:chOff x="1080000" y="720000"/><a:chExt cx="1800000" cy="540000"/>'
+        "</a:xfrm></xdr:grpSpPr>"
+        "<xdr:pic>"
+        '<xdr:nvPicPr><xdr:cNvPr id="2" name="Picture 1"/><xdr:cNvPicPr/></xdr:nvPicPr>'
+        '<xdr:blipFill><a:blip r:embed="rIdEmbed1"/></xdr:blipFill>'
+        '<xdr:spPr><a:xfrm><a:off x="1080000" y="720000"/><a:ext cx="720000" cy="360000"/></a:xfrm></xdr:spPr>'
+        "</xdr:pic>"
+        "<xdr:pic>"
+        '<xdr:nvPicPr><xdr:cNvPr id="3" name="Picture 2"><a:hlinkClick r:id="rIdHyperlink"/></xdr:cNvPr><xdr:cNvPicPr/></xdr:nvPicPr>'
+        '<xdr:blipFill><a:blip r:embed="rIdEmbed2"/></xdr:blipFill>'
+        '<xdr:spPr><a:xfrm><a:off x="2160000" y="720000"/><a:ext cx="720000" cy="540000"/></a:xfrm></xdr:spPr>'
+        "</xdr:pic>"
+        "</xdr:grpSp>"
+        "<xdr:clientData/>"
+        "</xdr:twoCellAnchor>"
+    )
+
+
+def _add_drawing_with_grouped_images(entries, image_path):
+    """Like `_add_drawing_with_image`, but splices in two embedded media
+    relationships (`rIdEmbed1`/`rIdEmbed2`) plus one hyperlink
+    (`rIdHyperlink`, only on the second pic) for `_grouped_images_anchor_xml`'s
+    two-picture `<xdr:grpSp>`. Both media entries reuse the same
+    `sample_image.png` bytes — xlsxparser never reads them either way.
+    """
+    with open(image_path, "rb") as f:
+        image_bytes = f.read()
+    entries["xl/media/image1.png"] = image_bytes
+    entries["xl/media/image2.png"] = image_bytes
+
+    entries["xl/drawings/drawing1.xml"] = (
+        '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        + _grouped_images_anchor_xml()
+        + "</xdr:wsDr>"
+    ).encode("utf-8")
+
+    entries["xl/drawings/_rels/drawing1.xml.rels"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rIdEmbed1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+        'Target="../media/image1.png"/>'
+        '<Relationship Id="rIdEmbed2" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+        'Target="../media/image2.png"/>'
+        '<Relationship Id="rIdHyperlink" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" '
+        'Target="https://example.com/second-logo" TargetMode="External"/>'
+        "</Relationships>"
+    ).encode("utf-8")
+
+    entries["xl/worksheets/_rels/sheet1.xml.rels"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rIdDrawing" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" '
+        'Target="../drawings/drawing1.xml"/>'
+        "</Relationships>"
+    ).encode("utf-8")
+
+    sheet_xml = entries["xl/worksheets/sheet1.xml"].decode("utf-8")
+    assert "<drawing " not in sheet_xml
+    sheet_xml = sheet_xml.replace(
+        "</worksheet>", '<drawing r:id="rIdDrawing"/></worksheet>'
+    )
+    entries["xl/worksheets/sheet1.xml"] = sheet_xml.encode("utf-8")
+
+    content_types = entries["[Content_Types].xml"].decode("utf-8")
+    content_types = content_types.replace(
+        "</Types>",
+        '<Default Extension="png" ContentType="image/png"/>'
+        '<Override PartName="/xl/drawings/drawing1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>'
+        "</Types>",
+    )
+    entries["[Content_Types].xml"] = content_types.encode("utf-8")
+
+
 def _add_drawing_with_image(entries, image_path, anchor_xml, with_hyperlink):
     """Splices a `<drawing>`-anchored image onto sheet1, the same way
     `_add_shared_strings_part` splices in a part openpyxl's high-level API
@@ -348,6 +447,27 @@ def embedded_image_one_cell():
     return path
 
 
+def grouped_images():
+    """Two pictures grouped via `<xdr:grpSp>` (Issue #67), mirroring
+    `embedded_image`/`embedded_image_one_cell` but for the group-transform
+    resolution path. See `_grouped_images_anchor_xml`'s docstring for the
+    numeric layout.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws["A1"] = "logos"
+    path = os.path.join(COMPLEX_DIR, "grouped_images.xlsx")
+    wb.save(path)
+
+    image_path = os.path.join(ROOT, "scripts", "fixtures_assets", "sample_image.png")
+    _mutate_zip_entries(
+        path,
+        lambda entries: _add_drawing_with_grouped_images(entries, image_path),
+    )
+    return path
+
+
 def extreme_sparse():
     """A1 and Excel's absolute bottom-right corner, XFD1048576, populated —
     nothing in between.
@@ -548,6 +668,7 @@ def main():
         multi_sheet_states,
         embedded_image,
         embedded_image_one_cell,
+        grouped_images,
         extreme_sparse,
         corrupted_xml,
         missing_relations,

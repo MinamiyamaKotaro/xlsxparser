@@ -203,6 +203,82 @@ pub fn embedded_image_one_cell() -> Vec<u8> {
     ])
 }
 
+/// Two pictures grouped together via `<xdr:grpSp>` (Issue #67), using the
+/// same numeric conventions confirmed against real LibreOffice output: the
+/// outermost group's own `chOff`/`chExt` equal its `off`/`ext` (scale 1),
+/// and both group- and pic-level `off`/`ext` are literal absolute-canvas
+/// EMU. Mirrors `src/parse/drawing.rs`'s
+/// `single_level_group_resolves_each_pic_relative_to_from` unit test, at
+/// full-pipeline scope: relationship resolution (`target`/`hyperlink`) on
+/// top of the anchor-math the unit test already covers. The first pic
+/// carries no hyperlink; the second carries an `External` one, verifying
+/// per-pic hyperlink scoping survives the group transform.
+pub fn grouped_images() -> Vec<u8> {
+    let rows = r#"<row r="1"><c r="A1" t="str"><v>logos</v></c></row>"#;
+    let worksheet = worksheet_xml(rows, "").replace(
+        "</worksheet>",
+        r#"<drawing r:id="rIdDrawing"/></worksheet>"#,
+    );
+    let worksheet_rels = rels_xml(&[("rIdDrawing", "drawing", "../drawings/drawing1.xml")]);
+    let drawing_xml = br#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <xdr:twoCellAnchor editAs="absolute">
+    <xdr:from><xdr:col>1</xdr:col><xdr:colOff>267120</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>69840</xdr:rowOff></xdr:from>
+    <xdr:to><xdr:col>3</xdr:col><xdr:colOff>441720</xdr:colOff><xdr:row>7</xdr:row><xdr:rowOff>122040</xdr:rowOff></xdr:to>
+    <xdr:grpSp>
+      <xdr:nvGrpSpPr><xdr:cNvPr id="1" name=""/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>
+      <xdr:grpSpPr>
+        <a:xfrm>
+          <a:off x="1080000" y="720000"/><a:ext cx="1800000" cy="540000"/>
+          <a:chOff x="1080000" y="720000"/><a:chExt cx="1800000" cy="540000"/>
+        </a:xfrm>
+      </xdr:grpSpPr>
+      <xdr:pic>
+        <xdr:nvPicPr><xdr:cNvPr id="2" name="Picture 1"/><xdr:cNvPicPr/></xdr:nvPicPr>
+        <xdr:blipFill><a:blip r:embed="rIdEmbed1"/></xdr:blipFill>
+        <xdr:spPr><a:xfrm><a:off x="1080000" y="720000"/><a:ext cx="720000" cy="360000"/></a:xfrm></xdr:spPr>
+      </xdr:pic>
+      <xdr:pic>
+        <xdr:nvPicPr><xdr:cNvPr id="3" name="Picture 2"><a:hlinkClick r:id="rIdHyperlink"/></xdr:cNvPr><xdr:cNvPicPr/></xdr:nvPicPr>
+        <xdr:blipFill><a:blip r:embed="rIdEmbed2"/></xdr:blipFill>
+        <xdr:spPr><a:xfrm><a:off x="2160000" y="720000"/><a:ext cx="720000" cy="540000"/></a:xfrm></xdr:spPr>
+      </xdr:pic>
+    </xdr:grpSp>
+    <xdr:clientData/>
+  </xdr:twoCellAnchor>
+</xdr:wsDr>"#;
+    let drawing_rels: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdEmbed1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+  <Relationship Id="rIdEmbed2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image2.png"/>
+  <Relationship Id="rIdHyperlink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/second-logo" TargetMode="External"/>
+</Relationships>"#;
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "styles", "styles.xml"),
+            ])
+            .as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        ("xl/styles.xml", DEFAULT_STYLES_XML),
+        ("xl/worksheets/sheet1.xml", worksheet.as_bytes()),
+        (
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            worksheet_rels.as_bytes(),
+        ),
+        ("xl/drawings/drawing1.xml", drawing_xml),
+        ("xl/drawings/_rels/drawing1.xml.rels", drawing_rels),
+        // Content doesn't matter — xlsxparser never reads image bytes.
+        ("xl/media/image1.png", b"\x89PNG\r\n\x1a\n" as &[u8]),
+        ("xl/media/image2.png", b"\x89PNG\r\n\x1a\n" as &[u8]),
+    ])
+}
+
 /// `A1` holds a value, and the next (and only other) populated cell is
 /// `XFD1048576` — Excel's absolute bottom-right corner (column 16384, row
 /// 1,048,576). Verifies the sparse `HashMap<CellRef, Cell>` storage means

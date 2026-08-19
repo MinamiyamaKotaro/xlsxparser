@@ -184,6 +184,57 @@ fn real_embedded_image_one_cell_xlsx_resolves_a_single_cell_confined_anchor() {
 }
 
 #[test]
+fn real_grouped_images_xlsx_resolves_relative_to_group_with_per_pic_hyperlink_scoping() {
+    use xlsxparser::{AnchorMarker, ImageAnchor, ImageExtent};
+
+    let workbook = parse_workbook(fixture_path("complex/grouped_images.xlsx")).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    let images = sheet.images();
+    assert_eq!(images.len(), 2);
+
+    assert_eq!(images[0].target, "xl/media/image1.png");
+    assert_eq!(images[0].hyperlink, None);
+    assert_eq!(
+        images[0].anchor,
+        ImageAnchor::OneCell {
+            from: AnchorMarker {
+                cell: CellRef { row: 5, col: 2 },
+                col_off: 267_120,
+                row_off: 69_840,
+            },
+            ext: ImageExtent {
+                cx: 720_000,
+                cy: 360_000,
+            },
+        }
+    );
+
+    assert_eq!(images[1].target, "xl/media/image2.png");
+    assert_eq!(
+        images[1].hyperlink.as_deref(),
+        Some("https://example.com/second-logo")
+    );
+    // scripts/generate_real_fixtures.py's _grouped_images_anchor_xml()
+    // places the second pic 1_080_000 EMU right of the first, added to the
+    // anchor's own colOff.
+    assert_eq!(
+        images[1].anchor,
+        ImageAnchor::OneCell {
+            from: AnchorMarker {
+                cell: CellRef { row: 5, col: 2 },
+                col_off: 267_120 + 1_080_000,
+                row_off: 69_840,
+            },
+            ext: ImageExtent {
+                cx: 720_000,
+                cy: 540_000,
+            },
+        }
+    );
+}
+
+#[test]
 fn real_extreme_sparse_xlsx_registers_only_the_two_populated_cells() {
     let workbook = parse_workbook(fixture_path("complex/extreme_sparse.xlsx")).unwrap();
     let sheet = &workbook.sheets()[0];
