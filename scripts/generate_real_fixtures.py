@@ -22,7 +22,10 @@ Two categories need more than "just call openpyxl and save":
 - load/: genuinely large workbooks, generated for real by openpyxl
   (`massive_dense_accounting`, `thousand_sheets`). `massive_sst` again
   layers a hand-built large xl/sharedStrings.xml on top for the same
-  reason as `out_of_bounds_sst`.
+  reason as `out_of_bounds_sst`. `many_images` layers 200 `<xdr:pic>`
+  anchors on top the same way `embedded_image` does for a single one (Issue
+  #71 follow-up), to check `parse_drawing`'s cost stays linear in image
+  count.
 
 - complex/embedded_image.xlsx: an image anchored via `<drawing r:id>`
   (Issue #65). openpyxl *can* insert images through its own API, but only
@@ -43,7 +46,9 @@ Requires: pip install openpyxl
 import datetime
 import os
 import re
+import struct
 import zipfile
+import zlib
 
 import openpyxl
 
@@ -164,6 +169,125 @@ def _grouped_images_anchor_xml():
         "<xdr:clientData/>"
         "</xdr:twoCellAnchor>"
     )
+
+
+def _tiny_png_bytes():
+    """A minimal, genuinely-valid 1x1 transparent PNG (~70 bytes), built
+    from stdlib `zlib`/`struct` alone — no Pillow dependency. Used in place
+    of `sample_image.png` wherever a fixture needs *many* embedded media
+    entries (`many_images`): xlsxparser never reads image bytes (Issue #65's
+    stated scope stops at the anchor and the target path), so 200 real
+    copies of the ~37KB `sample_image.png` would only bloat the repository
+    for no verification benefit.
+    """
+
+    def chunk(tag, data):
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    signature = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)  # 1x1, 8-bit RGBA
+    raw_scanline = b"\x00\x00\x00\x00\x00"  # filter byte + 1 RGBA pixel
+    idat = zlib.compress(raw_scanline)
+    return (
+        signature
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", idat)
+        + chunk(b"IEND", b"")
+    )
+
+
+def _many_images_anchor_xml(n):
+    """`n` non-grouped `twoCellAnchor`s, one per row (image `i` spans row
+    `i` to `i + 1` in column A), each with its own `rIdEmbed{i}` — a
+    many-pictures-in-one-sheet scenario (Issue #71 follow-up: verifying
+    parse_drawing's cost stays linear, not quadratic, in image count) as a
+    real openpyxl-adjacent package rather than only a synthetic in-memory
+    XML string.
+    """
+    anchors = []
+    for i in range(n):
+        anchors.append(
+            "<xdr:twoCellAnchor>"
+            f"<xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff>"
+            f"<xdr:row>{i}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>"
+            f"<xdr:to><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff>"
+            f"<xdr:row>{i + 1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>"
+            "<xdr:pic>"
+            "<xdr:nvPicPr>"
+            f'<xdr:cNvPr id="{i + 2}" name="Picture {i + 1}"/>'
+            "<xdr:cNvPicPr/>"
+            "</xdr:nvPicPr>"
+            f'<xdr:blipFill><a:blip r:embed="rIdEmbed{i}"/></xdr:blipFill>'
+            "<xdr:spPr/>"
+            "</xdr:pic>"
+            "<xdr:clientData/>"
+            "</xdr:twoCellAnchor>"
+        )
+    return "".join(anchors)
+
+
+def _add_drawing_with_many_images(entries, n):
+    """Like `_add_drawing_with_image`, but registers `n` embedded media
+    relationships (`rIdEmbed0`..`rIdEmbed{n-1}`) for `_many_images_anchor_xml`'s
+    `n` independent pictures. All `n` media entries reuse the same
+    `_tiny_png_bytes()` (see its docstring for why a real photo isn't used
+    here, unlike `_add_drawing_with_grouped_images`).
+    """
+    image_bytes = _tiny_png_bytes()
+    for i in range(n):
+        entries[f"xl/media/image{i}.png"] = image_bytes
+
+    entries["xl/drawings/drawing1.xml"] = (
+        '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        + _many_images_anchor_xml(n)
+        + "</xdr:wsDr>"
+    ).encode("utf-8")
+
+    rels = [
+        f'<Relationship Id="rIdEmbed{i}" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+        f'Target="../media/image{i}.png"/>'
+        for i in range(n)
+    ]
+    entries["xl/drawings/_rels/drawing1.xml.rels"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(rels)
+        + "</Relationships>"
+    ).encode("utf-8")
+
+    entries["xl/worksheets/_rels/sheet1.xml.rels"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rIdDrawing" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" '
+        'Target="../drawings/drawing1.xml"/>'
+        "</Relationships>"
+    ).encode("utf-8")
+
+    sheet_xml = entries["xl/worksheets/sheet1.xml"].decode("utf-8")
+    assert "<drawing " not in sheet_xml
+    sheet_xml = sheet_xml.replace(
+        "</worksheet>", '<drawing r:id="rIdDrawing"/></worksheet>'
+    )
+    entries["xl/worksheets/sheet1.xml"] = sheet_xml.encode("utf-8")
+
+    content_types = entries["[Content_Types].xml"].decode("utf-8")
+    content_types = content_types.replace(
+        "</Types>",
+        '<Default Extension="png" ContentType="image/png"/>'
+        '<Override PartName="/xl/drawings/drawing1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>'
+        "</Types>",
+    )
+    entries["[Content_Types].xml"] = content_types.encode("utf-8")
 
 
 def _add_drawing_with_grouped_images(entries, image_path):
@@ -659,6 +783,28 @@ def massive_sst():
     return path
 
 
+def many_images():
+    """200 non-grouped pictures, one per row (Issue #71 follow-up): a
+    genuine `.xlsx` package to make the "does parse_drawing's cost stay
+    linear (not quadratic) in image count" claim a permanent, checked-in
+    regression test rather than a throwaway benchmark. 200 keeps the
+    checked-in fixture and CI runtime small while still being far larger
+    than any handful-of-images fixture elsewhere in this repository.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws["A1"] = "many images"
+    path = os.path.join(LOAD_DIR, "many_images.xlsx")
+    wb.save(path)
+
+    _mutate_zip_entries(
+        path,
+        lambda entries: _add_drawing_with_many_images(entries, 200),
+    )
+    return path
+
+
 def main():
     for directory in (NORMAL_DIR, COMPLEX_DIR, ERROR_DIR, LOAD_DIR):
         os.makedirs(directory, exist_ok=True)
@@ -677,6 +823,7 @@ def main():
         massive_dense_accounting,
         thousand_sheets,
         massive_sst,
+        many_images,
     ):
         path = fn()
         print(f"wrote {os.path.relpath(path, ROOT)}")
