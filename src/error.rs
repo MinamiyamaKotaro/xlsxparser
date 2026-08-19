@@ -73,6 +73,24 @@ pub enum Error {
     #[error("DOCTYPE declaration rejected in {path} (XXE defense)")]
     DoctypeRejected { path: String },
 
+    /// `<xdr:grpSp>` nesting depth in a `drawingN.xml` exceeded
+    /// `parse::drawing::MAX_GROUP_NESTING_DEPTH`. `parse::drawing`'s
+    /// `resolve_grouped_pic` costs O(current nesting depth) per `<xdr:pic>`
+    /// resolved, so — the same reasoning as `TooManyMergedRanges` — nesting
+    /// depth itself must be bounded independently of the Zip Bomb byte-size
+    /// cap: a drawing part with `D` levels of nesting and `N` sibling
+    /// pictures at the innermost level costs O(N * D) while costing only
+    /// O(N + D) bytes to construct, letting a file of a few tens of MB
+    /// (well under the 512 MiB per-entry cap) cause many seconds of
+    /// synchronous CPU blocking (security review Finding 1, Issue #71
+    /// follow-up).
+    #[error("too many nested <xdr:grpSp> groups in {path}: depth {depth} exceeds limit {limit}")]
+    TooManyNestedGroups {
+        path: String,
+        depth: usize,
+        limit: usize,
+    },
+
     // --- Phase 4: analysis and deferred resolution ---
     /// An A1-style cell reference string is invalid (syntax error, numeric
     /// overflow, empty string, etc. — returned by `CellRef::from_a1`).
@@ -305,6 +323,16 @@ mod tests {
             }
             .to_string(),
             "too many column width ranges in one sheet: 2001 exceeds limit 2000"
+        );
+
+        assert_eq!(
+            Error::TooManyNestedGroups {
+                path: "xl/drawings/drawing1.xml".into(),
+                depth: 65,
+                limit: 64,
+            }
+            .to_string(),
+            "too many nested <xdr:grpSp> groups in xl/drawings/drawing1.xml: depth 65 exceeds limit 64"
         );
 
         assert_eq!(
