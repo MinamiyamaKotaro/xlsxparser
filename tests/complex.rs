@@ -142,6 +142,67 @@ fn embedded_image_one_cell_resolves_a_single_cell_confined_anchor() {
 }
 
 #[test]
+fn grouped_images_resolve_relative_to_group_with_per_pic_hyperlink_scoping() {
+    use xlsxparser::{AnchorMarker, ImageAnchor, ImageExtent};
+
+    let workbook = parse_workbook_reader(Cursor::new(complex::grouped_images())).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    let images = sheet.images();
+    assert_eq!(images.len(), 2);
+
+    assert_eq!(images[0].target, "xl/media/image1.png");
+    assert_eq!(images[0].hyperlink, None);
+    assert_eq!(
+        images[0].anchor,
+        ImageAnchor::OneCell {
+            from: AnchorMarker {
+                cell: CellRef { row: 5, col: 2 },
+                col_off: 267_120,
+                row_off: 69_840,
+            },
+            ext: ImageExtent {
+                cx: 720_000,
+                cy: 360_000,
+            },
+        }
+    );
+
+    assert_eq!(images[1].target, "xl/media/image2.png");
+    assert_eq!(
+        images[1].hyperlink.as_deref(),
+        Some("https://example.com/second-logo")
+    );
+    // delta = 2_160_000 - 1_080_000 = 1_080_000, added to the anchor's own colOff.
+    assert_eq!(
+        images[1].anchor,
+        ImageAnchor::OneCell {
+            from: AnchorMarker {
+                cell: CellRef { row: 5, col: 2 },
+                col_off: 267_120 + 1_080_000,
+                row_off: 69_840,
+            },
+            ext: ImageExtent {
+                cx: 720_000,
+                cy: 540_000,
+            },
+        }
+    );
+
+    let json = xlsxparser::to_json_string(&workbook).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let json_images = parsed["sheets"][0]["images"].as_array().unwrap();
+    assert_eq!(json_images.len(), 2);
+    assert_eq!(json_images[0]["anchor"]["type"], "oneCell");
+    assert!(json_images[0].get("hyperlink").is_none());
+    assert_eq!(json_images[1]["target"], "xl/media/image2.png");
+    assert_eq!(
+        json_images[1]["hyperlink"],
+        "https://example.com/second-logo"
+    );
+}
+
+#[test]
 fn extreme_sparse_coordinates_register_only_the_populated_cells() {
     let workbook = parse_workbook_reader(Cursor::new(complex::extreme_sparse())).unwrap();
     let sheet = &workbook.sheets()[0];
