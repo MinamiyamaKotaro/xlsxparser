@@ -24,6 +24,15 @@ Two categories need more than "just call openpyxl and save":
   layers a hand-built large xl/sharedStrings.xml on top for the same
   reason as `out_of_bounds_sst`.
 
+- complex/embedded_image.xlsx: an image anchored via `<drawing r:id>`
+  (Issue #65). openpyxl *can* insert images through its own API, but only
+  by shelling out to Pillow to read the file, which this script's
+  dependency footprint (`pip install openpyxl` alone) doesn't want to grow
+  just for a fixture. `_add_drawing_with_image` instead splices in the four
+  OOXML parts a real image insertion produces, the same layering technique
+  `_add_shared_strings_part` already uses for a different missing-from-
+  openpyxl part.
+
 Kept in the repository (rather than run-once-and-discard) so these binary
 fixtures can be regenerated if openpyxl's output shape ever changes.
 
@@ -67,6 +76,85 @@ def _mutate_zip_entries(path, mutate_fn):
     entries = _read_zip_entries(path)
     mutate_fn(entries)
     _write_zip_entries(path, entries)
+
+
+def _add_drawing_with_image(entries, image_path):
+    """Splices a `<drawing>`-anchored image onto sheet1, the same way
+    `_add_shared_strings_part` splices in a part openpyxl's high-level API
+    doesn't write directly — openpyxl *can* insert images via
+    `openpyxl.drawing.image.Image`, but only by shelling out to Pillow to
+    read the file, which this repository doesn't want as a fixture-generation
+    dependency. Hand-building the four OOXML parts a real image insertion
+    produces (`xl/media/image1.png`, `xl/drawings/drawing1.xml` with a
+    `twoCellAnchor`, `xl/drawings/_rels/drawing1.xml.rels`, and
+    `xl/worksheets/_rels/sheet1.xml.rels`) sidesteps that while still
+    exercising the genuine `<drawing r:id="...">` cross-reference a real
+    writer emits (Issue #65).
+    """
+    with open(image_path, "rb") as f:
+        entries["xl/media/image1.png"] = f.read()
+
+    entries["xl/drawings/drawing1.xml"] = (
+        '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        "<xdr:twoCellAnchor>"
+        "<xdr:from><xdr:col>1</xdr:col><xdr:colOff>10000</xdr:colOff>"
+        "<xdr:row>1</xdr:row><xdr:rowOff>20000</xdr:rowOff></xdr:from>"
+        "<xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff>"
+        "<xdr:row>8</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>"
+        "<xdr:pic>"
+        "<xdr:nvPicPr>"
+        '<xdr:cNvPr id="2" name="Picture 1">'
+        '<a:hlinkClick r:id="rIdHyperlink"/>'
+        "</xdr:cNvPr>"
+        "<xdr:cNvPicPr/>"
+        "</xdr:nvPicPr>"
+        '<xdr:blipFill><a:blip r:embed="rIdEmbed"/></xdr:blipFill>'
+        "<xdr:spPr/>"
+        "</xdr:pic>"
+        "<xdr:clientData/>"
+        "</xdr:twoCellAnchor>"
+        "</xdr:wsDr>"
+    ).encode("utf-8")
+
+    entries["xl/drawings/_rels/drawing1.xml.rels"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rIdEmbed" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+        'Target="../media/image1.png"/>'
+        '<Relationship Id="rIdHyperlink" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" '
+        'Target="https://example.com/sample-image" TargetMode="External"/>'
+        "</Relationships>"
+    ).encode("utf-8")
+
+    entries["xl/worksheets/_rels/sheet1.xml.rels"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rIdDrawing" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" '
+        'Target="../drawings/drawing1.xml"/>'
+        "</Relationships>"
+    ).encode("utf-8")
+
+    sheet_xml = entries["xl/worksheets/sheet1.xml"].decode("utf-8")
+    assert "<drawing " not in sheet_xml
+    sheet_xml = sheet_xml.replace(
+        "</worksheet>", '<drawing r:id="rIdDrawing"/></worksheet>'
+    )
+    entries["xl/worksheets/sheet1.xml"] = sheet_xml.encode("utf-8")
+
+    content_types = entries["[Content_Types].xml"].decode("utf-8")
+    content_types = content_types.replace(
+        "</Types>",
+        '<Default Extension="png" ContentType="image/png"/>'
+        '<Override PartName="/xl/drawings/drawing1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>'
+        "</Types>",
+    )
+    entries["[Content_Types].xml"] = content_types.encode("utf-8")
 
 
 def _add_shared_strings_part(entries, strings):
@@ -160,6 +248,27 @@ def multi_sheet_states():
 
     path = os.path.join(COMPLEX_DIR, "multi_sheet_states.xlsx")
     wb.save(path)
+    return path
+
+
+def embedded_image():
+    """A picture anchored to B2:E9 (Issue #65), carrying both an embedded
+    media relationship and the image's own (External) hyperlink — the two
+    relationship kinds `pipeline.rs`'s Phase 3.5 resolves against
+    `drawing1.xml.rels`. Uses the checked-in
+    `scripts/fixtures_assets/sample_image.png` as the embedded media's real
+    bytes, even though xlsxparser itself never reads them (Issue #65's
+    stated scope stops at the anchor position and target *path*).
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws["A1"] = "logo"
+    path = os.path.join(COMPLEX_DIR, "embedded_image.xlsx")
+    wb.save(path)
+
+    image_path = os.path.join(ROOT, "scripts", "fixtures_assets", "sample_image.png")
+    _mutate_zip_entries(path, lambda entries: _add_drawing_with_image(entries, image_path))
     return path
 
 
@@ -361,6 +470,7 @@ def main():
         basic_types,
         houganshi_merged,
         multi_sheet_states,
+        embedded_image,
         extreme_sparse,
         corrupted_xml,
         missing_relations,

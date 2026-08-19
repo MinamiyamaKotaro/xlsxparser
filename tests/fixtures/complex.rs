@@ -90,6 +90,64 @@ pub fn multi_sheet_states() -> Vec<u8> {
     ])
 }
 
+/// A picture anchored `B2:E9` (Issue #65), carrying both an embedded media
+/// relationship (`r:embed`) and the image's own `External` hyperlink
+/// (`a:hlinkClick`) — the two relationship kinds `pipeline.rs`'s Phase 3.5
+/// resolves against `drawing1.xml.rels`. Mirrors
+/// `scripts/generate_real_fixtures.py`'s `embedded_image()`, the real
+/// openpyxl-authored counterpart exercised by `tests/real_fixtures.rs`.
+pub fn embedded_image() -> Vec<u8> {
+    let rows = r#"<row r="1"><c r="A1" t="str"><v>logo</v></c></row>"#;
+    let worksheet = worksheet_xml(rows, "").replace(
+        "</worksheet>",
+        r#"<drawing r:id="rIdDrawing"/></worksheet>"#,
+    );
+    let worksheet_rels = rels_xml(&[("rIdDrawing", "drawing", "../drawings/drawing1.xml")]);
+    let drawing_xml = br#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <xdr:twoCellAnchor>
+    <xdr:from><xdr:col>1</xdr:col><xdr:colOff>10000</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>20000</xdr:rowOff></xdr:from>
+    <xdr:to><xdr:col>4</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>8</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+    <xdr:pic>
+      <xdr:nvPicPr>
+        <xdr:cNvPr id="2" name="Picture 1"><a:hlinkClick r:id="rIdHyperlink"/></xdr:cNvPr>
+        <xdr:cNvPicPr/>
+      </xdr:nvPicPr>
+      <xdr:blipFill><a:blip r:embed="rIdEmbed"/></xdr:blipFill>
+    </xdr:pic>
+    <xdr:clientData/>
+  </xdr:twoCellAnchor>
+</xdr:wsDr>"#;
+    let drawing_rels: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdEmbed" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+  <Relationship Id="rIdHyperlink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/sample-image" TargetMode="External"/>
+</Relationships>"#;
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "styles", "styles.xml"),
+            ])
+            .as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        ("xl/styles.xml", DEFAULT_STYLES_XML),
+        ("xl/worksheets/sheet1.xml", worksheet.as_bytes()),
+        (
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            worksheet_rels.as_bytes(),
+        ),
+        ("xl/drawings/drawing1.xml", drawing_xml),
+        ("xl/drawings/_rels/drawing1.xml.rels", drawing_rels),
+        // Content doesn't matter — xlsxparser never reads image bytes.
+        ("xl/media/image1.png", b"\x89PNG\r\n\x1a\n" as &[u8]),
+    ])
+}
+
 /// `A1` holds a value, and the next (and only other) populated cell is
 /// `XFD1048576` — Excel's absolute bottom-right corner (column 16384, row
 /// 1,048,576). Verifies the sparse `HashMap<CellRef, Cell>` storage means
