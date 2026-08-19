@@ -660,6 +660,49 @@ mod tests {
         ));
     }
 
+    fn parse_leaf_text_result(xml: &[u8]) -> Result<String, Error> {
+        let mut reader = create_secure_reader(xml);
+        let mut buf = Vec::new();
+        // Advance past the opening <v> tag.
+        loop {
+            match reader.read_event_into(&mut buf).unwrap() {
+                Event::Start(e) if e.local_name().as_ref() == b"v" => break,
+                Event::Eof => panic!("no <v> start tag found"),
+                _ => {}
+            }
+            buf.clear();
+        }
+        buf.clear();
+        read_leaf_text(&mut reader, "xl/worksheets/sheet1.xml")
+    }
+
+    #[test]
+    fn read_leaf_text_resolves_a_general_ref_entity() {
+        // &#38; is the numeric character reference for '&', tokenized by
+        // quick-xml as Event::GeneralRef rather than folded into
+        // Event::Text.
+        let text = parse_leaf_text_result(b"<v>4&#38;2</v>").unwrap();
+        assert_eq!(text, "4&2");
+    }
+
+    #[test]
+    fn read_leaf_text_eof_before_closing_tag_is_missing_required_element() {
+        let err = parse_leaf_text_result(b"<v>unterminated").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MissingRequiredElement {
+                name: "closing tag",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn read_leaf_text_ignores_a_comment_and_still_captures_surrounding_text() {
+        let text = parse_leaf_text_result(b"<v>4<!-- note -->2</v>").unwrap();
+        assert_eq!(text, "42");
+    }
+
     #[test]
     fn read_event_rejects_doctype_and_stops_reading() {
         let xml =

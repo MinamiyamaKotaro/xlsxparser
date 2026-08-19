@@ -456,4 +456,189 @@ mod tests {
         let images = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap();
         assert!(images.is_empty());
     }
+
+    #[test]
+    fn anchor_body_eof_before_closing_tag_is_missing_required_element() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}><xdr:twoCellAnchor>{from}<xdr:pic><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>"#,
+            from = marker_xml("from", 0, 0, 0, 0),
+        );
+        let err = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MissingRequiredElement {
+                name: "closing tag",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn two_cell_anchor_with_pic_but_no_from_is_missing_required_element() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}>
+  <xdr:twoCellAnchor>
+    {to}
+    <xdr:pic><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
+  </xdr:twoCellAnchor>
+</xdr:wsDr>"#,
+            to = marker_xml("to", 1, 0, 1, 0),
+        );
+        let err = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MissingRequiredElement {
+                name: "xdr:from",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn two_cell_anchor_with_pic_but_no_to_is_missing_required_element() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}>
+  <xdr:twoCellAnchor>
+    {from}
+    <xdr:pic><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
+  </xdr:twoCellAnchor>
+</xdr:wsDr>"#,
+            from = marker_xml("from", 0, 0, 0, 0),
+        );
+        let err = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MissingRequiredElement { name: "xdr:to", .. }
+        ));
+    }
+
+    #[test]
+    fn one_cell_anchor_with_pic_but_no_from_is_missing_required_element() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}>
+  <xdr:oneCellAnchor>
+    <xdr:ext cx="100" cy="100"/>
+    <xdr:pic><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
+  </xdr:oneCellAnchor>
+</xdr:wsDr>"#
+        );
+        let err = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MissingRequiredElement {
+                name: "xdr:from",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn one_cell_anchor_with_pic_but_no_ext_is_missing_required_element() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}>
+  <xdr:oneCellAnchor>
+    {from}
+    <xdr:pic><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
+  </xdr:oneCellAnchor>
+</xdr:wsDr>"#,
+            from = marker_xml("from", 0, 0, 0, 0),
+        );
+        let err = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MissingRequiredElement {
+                name: "xdr:ext",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn marker_eof_before_closing_tag_is_missing_required_element() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}>
+  <xdr:oneCellAnchor>
+    <xdr:from><xdr:col>0</xdr:col><xdr:row>0</xdr:row>"#
+        );
+        let err = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MissingRequiredElement {
+                name: "closing tag",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn marker_missing_col_is_missing_required_element() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}>
+  <xdr:oneCellAnchor>
+    <xdr:from><xdr:row>0</xdr:row></xdr:from>
+    <xdr:ext cx="100" cy="100"/>
+    <xdr:pic><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
+  </xdr:oneCellAnchor>
+</xdr:wsDr>"#
+        );
+        let err = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MissingRequiredElement {
+                name: "xdr:col",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn marker_ignores_whitespace_between_child_elements() {
+        // Pretty-printed XML puts insignificant whitespace (Event::Text)
+        // between <xdr:from>'s children — parse_marker's catch-all arm must
+        // simply skip it rather than mistaking it for one of col/colOff/
+        // row/rowOff.
+        let xml = format!(
+            r#"<xdr:wsDr {NS}>
+  <xdr:oneCellAnchor>
+    <xdr:from>
+      <xdr:col>2</xdr:col>
+      <xdr:colOff>5000</xdr:colOff>
+      <xdr:row>4</xdr:row>
+      <xdr:rowOff>5000</xdr:rowOff>
+    </xdr:from>
+    <xdr:ext cx="100" cy="100"/>
+    <xdr:pic><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
+  </xdr:oneCellAnchor>
+</xdr:wsDr>"#
+        );
+        let images = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap();
+        assert_eq!(images.len(), 1);
+        match images[0].anchor {
+            ImageAnchor::OneCell { from, .. } => {
+                assert_eq!(from.cell, CellRef { row: 5, col: 3 });
+            }
+            ImageAnchor::TwoCell { .. } => panic!("expected a OneCell anchor"),
+        }
+    }
+
+    #[test]
+    fn marker_missing_row_is_missing_required_element() {
+        let xml = format!(
+            r#"<xdr:wsDr {NS}>
+  <xdr:oneCellAnchor>
+    <xdr:from><xdr:col>0</xdr:col></xdr:from>
+    <xdr:ext cx="100" cy="100"/>
+    <xdr:pic><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
+  </xdr:oneCellAnchor>
+</xdr:wsDr>"#
+        );
+        let err = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::MissingRequiredElement {
+                name: "xdr:row",
+                ..
+            }
+        ));
+    }
 }

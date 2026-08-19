@@ -864,4 +864,139 @@ mod tests {
         let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
         assert!(matches!(err, Error::DanglingRelationship { .. }));
     }
+
+    #[test]
+    fn rels_path_for_with_no_directory_component() {
+        // Every real OPC part path this crate ever computes has a
+        // directory component (e.g. "xl/worksheets/sheet1.xml"), so this
+        // exercises the degenerate case directly rather than via `run`.
+        assert_eq!(
+            rels_path_for("sheet1.xml"),
+            ("_rels/sheet1.xml.rels".to_string(), "")
+        );
+    }
+
+    #[test]
+    fn malformed_worksheet_rels_xml_propagates_parse_error() {
+        // Distinct from drawing_r_id_with_no_worksheet_rels_part_is_dangling_relationship
+        // (the part is entirely absent): here the part exists but is
+        // malformed XML, so parse::parse_relationships itself must fail and
+        // that failure must propagate rather than being swallowed.
+        let malformed_rels: &[u8] =
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdDrawing"/></Relationships>"#;
+        let mut entries = xlsx_with_drawing_entries();
+        for entry in &mut entries {
+            if entry.0 == "xl/worksheets/_rels/sheet1.xml.rels" {
+                entry.1 = malformed_rels;
+            }
+        }
+        let zip = build_zip(&entries);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::MissingRequiredElement { .. }));
+    }
+
+    #[test]
+    fn malformed_drawing_rels_xml_propagates_parse_error() {
+        let malformed_rels: &[u8] =
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdEmbed"/></Relationships>"#;
+        let mut entries = xlsx_with_drawing_entries();
+        for entry in &mut entries {
+            if entry.0 == "xl/drawings/_rels/drawing1.xml.rels" {
+                entry.1 = malformed_rels;
+            }
+        }
+        let zip = build_zip(&entries);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::MissingRequiredElement { .. }));
+    }
+
+    #[test]
+    fn drawing_with_no_picture_anchors_yields_no_images() {
+        // A <drawing> that resolves and parses fine but anchors a plain
+        // shape, not a <xdr:pic> — parse::parse_drawing correctly yields no
+        // PendingImage, and resolve_sheet_images must short-circuit before
+        // ever trying to read drawing1.xml.rels or any media entry (neither
+        // is present in this ZIP at all, proving the early return is real).
+        let drawing_without_pic: &[u8] = br#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <xdr:twoCellAnchor>
+    <xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+    <xdr:to><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+    <xdr:sp/>
+    <xdr:clientData/>
+  </xdr:twoCellAnchor>
+</xdr:wsDr>"#;
+        let mut entries = xlsx_with_drawing_entries();
+        entries.retain(|(name, _)| {
+            !matches!(
+                *name,
+                "xl/drawings/_rels/drawing1.xml.rels" | "xl/media/image1.png"
+            )
+        });
+        for entry in &mut entries {
+            if entry.0 == "xl/drawings/drawing1.xml" {
+                entry.1 = drawing_without_pic;
+            }
+        }
+        let zip = build_zip(&entries);
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+        assert!(workbook.sheets()[0].images().is_empty());
+    }
+
+    #[test]
+    fn embed_r_id_not_in_drawing_rels_is_dangling_relationship() {
+        // drawing1.xml.rels exists and parses fine, but has no entry for
+        // rIdEmbed at all (distinct from missing_drawing_rels_part_is_dangling_relationship,
+        // where the whole rels part is absent).
+        let rels_without_embed: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdUnrelated" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+</Relationships>"#;
+        let mut entries = xlsx_with_drawing_entries();
+        for entry in &mut entries {
+            if entry.0 == "xl/drawings/_rels/drawing1.xml.rels" {
+                entry.1 = rels_without_embed;
+            }
+        }
+        let zip = build_zip(&entries);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::DanglingRelationship { .. }));
+    }
+
+    #[test]
+    fn hyperlink_r_id_not_in_drawing_rels_is_dangling_relationship() {
+        // rIdEmbed resolves fine, but rIdHyperlink (referenced by
+        // <a:hlinkClick> in DRAWING1_XML) has no entry in drawing1.xml.rels.
+        let rels_without_hyperlink: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdEmbed" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+</Relationships>"#;
+        let mut entries = xlsx_with_drawing_entries();
+        for entry in &mut entries {
+            if entry.0 == "xl/drawings/_rels/drawing1.xml.rels" {
+                entry.1 = rels_without_hyperlink;
+            }
+        }
+        let zip = build_zip(&entries);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::DanglingRelationship { .. }));
+    }
+
+    #[test]
+    fn internal_hyperlink_target_missing_is_dangling_relationship() {
+        // rIdHyperlink resolves to an Internal (in-package) relationship
+        // this time, rather than DRAWING1_RELS_XML's External URL — its
+        // target must be checked for existence in the ZIP just like an
+        // embed target is, and this one doesn't exist.
+        let rels_with_internal_hyperlink: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdEmbed" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+  <Relationship Id="rIdHyperlink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="../other/missing.xml"/>
+</Relationships>"#;
+        let mut entries = xlsx_with_drawing_entries();
+        for entry in &mut entries {
+            if entry.0 == "xl/drawings/_rels/drawing1.xml.rels" {
+                entry.1 = rels_with_internal_hyperlink;
+            }
+        }
+        let zip = build_zip(&entries);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::DanglingRelationship { .. }));
+    }
 }
