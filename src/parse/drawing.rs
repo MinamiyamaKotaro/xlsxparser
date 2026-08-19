@@ -492,6 +492,56 @@ mod tests {
     }
 
     #[test]
+    fn parse_marker_ignores_an_unrecognized_non_self_closing_child() {
+        // An explicit (non-self-closing) child element neither col/colOff/
+        // row/rowOff nor from/to's own closing tag must be skipped by both
+        // of parse_marker's nested match catch-alls (its Start arm's and
+        // its End arm's), not just the outer catch-all that whitespace
+        // Text events hit (see marker_ignores_whitespace_between_child_
+        // elements below).
+        let xml = "<xdr:from><xdr:extLst></xdr:extLst><xdr:col>2</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>3</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>";
+        let marker = parse_marker_standalone(xml).unwrap();
+        assert_eq!(marker.cell, CellRef { row: 4, col: 3 });
+    }
+
+    #[test]
+    fn blip_and_hlink_click_as_explicit_start_end_tags_are_still_parsed() {
+        // Real writers always self-close <a:blip>/<a:hlinkClick> (they
+        // never have children), but both are still valid, semantically
+        // identical XML written as an explicit open/close pair instead —
+        // and parse_anchor_body's nested match handles that shape via a
+        // separate arm (under Event::Start) from the self-closing one
+        // (under Event::Empty), so both need their own coverage.
+        let xml = format!(
+            r#"<xdr:wsDr {NS}>
+  <xdr:twoCellAnchor>
+    {from}
+    {to}
+    <xdr:pic>
+      <xdr:nvPicPr>
+        <xdr:cNvPr id="2" name="Picture 1">
+          <a:hlinkClick r:id="rId2"></a:hlinkClick>
+        </xdr:cNvPr>
+        <xdr:cNvPicPr/>
+      </xdr:nvPicPr>
+      <xdr:blipFill>
+        <a:blip r:embed="rId1"></a:blip>
+      </xdr:blipFill>
+    </xdr:pic>
+    <xdr:clientData/>
+  </xdr:twoCellAnchor>
+</xdr:wsDr>"#,
+            from = marker_xml("from", 1, 10, 2, 20),
+            to = marker_xml("to", 5, 0, 10, 0),
+        );
+
+        let images = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].embed_r_id, "rId1");
+        assert_eq!(images[0].hyperlink_r_id.as_deref(), Some("rId2"));
+    }
+
+    #[test]
     fn parses_two_cell_anchor_with_embed_and_hyperlink() {
         let xml = format!(
             r#"<xdr:wsDr {NS}>
