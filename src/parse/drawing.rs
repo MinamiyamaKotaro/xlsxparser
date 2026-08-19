@@ -500,12 +500,13 @@ mod tests {
 
         let images = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap();
         assert_eq!(images.len(), 1);
-        match images[0].anchor {
-            ImageAnchor::OneCell { ext, .. } => {
-                assert_eq!(ext, ImageExtent { cx: 100, cy: 200 });
+        assert!(matches!(
+            images[0].anchor,
+            ImageAnchor::OneCell {
+                ext: ImageExtent { cx: 100, cy: 200 },
+                ..
             }
-            ImageAnchor::TwoCell { .. } => panic!("expected a OneCell anchor"),
-        }
+        ));
     }
 
     #[test]
