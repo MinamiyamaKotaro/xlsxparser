@@ -71,6 +71,18 @@ enum AnchorKind {
     OneCell,
 }
 
+/// Defensive cap on `<xdr:grpSp>` nesting depth (security review Finding 1,
+/// Issue #71 follow-up). `resolve_grouped_pic` costs O(current nesting
+/// depth) per `<xdr:pic>` resolved, so a drawing part with `D` levels of
+/// nesting and `N` sibling pictures at the innermost level costs O(N * D)
+/// while costing only O(N + D) bytes to construct — the Zip Bomb byte-size
+/// cap alone does not bound `D` (the same shape as `resolve::merge`'s
+/// `MAX_MERGE_REGIONS`, which bounds merge-cell count for the same reason).
+/// Real-world LibreOffice/Excel-authored group nesting is essentially never
+/// more than a handful of levels deep, so 64 leaves enormous headroom over
+/// any legitimate file while capping worst-case cost at O(N * 64).
+pub(crate) const MAX_GROUP_NESTING_DEPTH: usize = 64;
+
 /// A `<xdr:grpSp>`'s own `<xdr:grpSpPr><a:xfrm>` — `off`/`ext` describe the
 /// group's bounding box (in its *parent*'s coordinate space: the anchor's
 /// own space for the outermost group, or the enclosing group's child space
@@ -147,6 +159,13 @@ fn parse_anchor_body(
                     hyperlink_r_id = optional_attr(&e, path, "r:id")?;
                 }
                 b"grpSp" => {
+                    if group_stack.len() >= MAX_GROUP_NESTING_DEPTH {
+                        return Err(Error::TooManyNestedGroups {
+                            path: path.to_string(),
+                            depth: group_stack.len() + 1,
+                            limit: MAX_GROUP_NESTING_DEPTH,
+                        });
+                    }
                     group_stack.push(GroupContext::default());
                 }
                 b"grpSpPr" => {
@@ -346,6 +365,33 @@ fn resolve_grouped_pic(
         y = off_y + (y - g.ch_off_y as f64) * scale_y;
     }
 
+    // Defensive plausibility bound (security review Finding 2, Issue #71
+    // follow-up): each group level's off/ext are individually
+    // attacker-controlled i64 values with no bound of their own, and their
+    // scale factors compound multiplicatively across nesting levels — a
+    // handful of levels with an extreme ext/chExt ratio can drive x/y/cx/cy
+    // to f64::INFINITY (silently saturating to i64::MAX below, via Rust's
+    // saturating float-to-int cast) or merely to an absurd-but-finite
+    // magnitude, either way propagating unchecked into the public
+    // AnchorMarker/ImageExtent API. Rejecting outright (rather than
+    // clamping to the bound) matches this function's existing `chExt == 0`
+    // policy: a well-formed-but-nonsensical numeric value is treated as a
+    // broken package, not silently coerced.
+    if !x.is_finite() || !y.is_finite() || !cx.is_finite() || !cy.is_finite() {
+        return Err(Error::InvalidPackage(format!(
+            "drawing group transform produced a non-finite coordinate in {path}"
+        )));
+    }
+    if x.abs() > MAX_PLAUSIBLE_EMU
+        || y.abs() > MAX_PLAUSIBLE_EMU
+        || cx.abs() > MAX_PLAUSIBLE_EMU
+        || cy.abs() > MAX_PLAUSIBLE_EMU
+    {
+        return Err(Error::InvalidPackage(format!(
+            "drawing group transform produced an implausibly large coordinate in {path}"
+        )));
+    }
+
     Ok((
         x.round() as i64,
         y.round() as i64,
@@ -353,6 +399,15 @@ fn resolve_grouped_pic(
         cy.round() as i64,
     ))
 }
+
+/// Defensive plausibility ceiling for a resolved EMU coordinate/extent
+/// (security review Finding 2, Issue #71 follow-up) — 10^12 EMU is
+/// approximately 27.7 km (914,400 EMU per inch), several orders of
+/// magnitude beyond Excel's real maximum sheet extent (1,048,576 rows *
+/// default row height is on the order of 2*10^11 EMU), so this never
+/// rejects a legitimate file while still catching a crafted group-nesting
+/// chain designed to overflow toward `i64::MAX`.
+const MAX_PLAUSIBLE_EMU: f64 = 1_000_000_000_000.0;
 
 /// Parses a `<xdr:from>`/`<xdr:to>` marker's four child leaf elements
 /// (`col`/`colOff`/`row`/`rowOff`) into an `AnchorMarker`.
@@ -1153,6 +1208,126 @@ mod tests {
                 },
             }
         );
+    }
+
+    /// Builds `depth` levels of trivially-valid nested `<xdr:grpSp>` (scale
+    /// 1, non-zero chExt so the existing zero-dimension guard never fires),
+    /// with one `<xdr:pic>` at the innermost level.
+    fn nested_groups_xml(depth: usize) -> String {
+        let open: String = (0..depth)
+            .map(|i| {
+                format!(
+                    r#"<xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="{}" name=""/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr><xdr:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/><a:chOff x="0" y="0"/><a:chExt cx="100" cy="100"/></a:xfrm></xdr:grpSpPr>"#,
+                    i + 1
+                )
+            })
+            .collect();
+        let close = "</xdr:grpSp>".repeat(depth);
+        format!(
+            r#"<xdr:wsDr {NS}>
+  <xdr:oneCellAnchor>
+    {from}
+    <xdr:ext cx="1" cy="1"/>
+    {open}
+    {pic}
+    {close}
+  </xdr:oneCellAnchor>
+</xdr:wsDr>"#,
+            from = marker_xml("from", 0, 0, 0, 0),
+            pic = pic_xml("rId1", None),
+        )
+    }
+
+    #[test]
+    fn group_nesting_depth_at_the_limit_is_accepted() {
+        let xml = nested_groups_xml(MAX_GROUP_NESTING_DEPTH);
+        let images = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap();
+        assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn group_nesting_depth_over_the_limit_is_too_many_nested_groups() {
+        let xml = nested_groups_xml(MAX_GROUP_NESTING_DEPTH + 1);
+        let err = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::TooManyNestedGroups {
+                depth,
+                limit,
+                ..
+            } if depth == MAX_GROUP_NESTING_DEPTH + 1 && limit == MAX_GROUP_NESTING_DEPTH
+        ));
+    }
+
+    #[test]
+    fn extreme_group_transform_scale_is_rejected_as_invalid_package() {
+        // A handful of levels with an extreme ext/chExt ratio compounds
+        // multiplicatively — this drives the resolved coordinate well past
+        // MAX_PLAUSIBLE_EMU (and, with enough levels, to f64::INFINITY)
+        // long before MAX_GROUP_NESTING_DEPTH would ever be reached.
+        let xml = format!(
+            r#"<xdr:wsDr {NS}>
+  <xdr:oneCellAnchor>
+    {from}
+    <xdr:ext cx="1" cy="1"/>
+    <xdr:grpSp>
+      <xdr:nvGrpSpPr><xdr:cNvPr id="1" name=""/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>
+      <xdr:grpSpPr><a:xfrm>
+        <a:off x="0" y="0"/><a:ext cx="9223372036854775807" cy="9223372036854775807"/>
+        <a:chOff x="0" y="0"/><a:chExt cx="1" cy="1"/>
+      </a:xfrm></xdr:grpSpPr>
+      <xdr:grpSp>
+        <xdr:nvGrpSpPr><xdr:cNvPr id="2" name=""/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>
+        <xdr:grpSpPr><a:xfrm>
+          <a:off x="0" y="0"/><a:ext cx="9223372036854775807" cy="9223372036854775807"/>
+          <a:chOff x="0" y="0"/><a:chExt cx="1" cy="1"/>
+        </a:xfrm></xdr:grpSpPr>
+        {pic}
+      </xdr:grpSp>
+    </xdr:grpSp>
+  </xdr:oneCellAnchor>
+</xdr:wsDr>"#,
+            from = marker_xml("from", 0, 0, 0, 0),
+            pic = pic_xml("rId1", None),
+        );
+
+        let err = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
+    }
+
+    #[test]
+    fn group_transform_overflowing_to_infinity_is_rejected_as_invalid_package() {
+        // 20 levels (well under MAX_GROUP_NESTING_DEPTH) each scaling by
+        // ~9.22e18 compounds past f64::MAX (~1.8e308), producing
+        // f64::INFINITY rather than merely an implausibly large finite
+        // value — the `is_finite()` branch, distinct from the
+        // MAX_PLAUSIBLE_EMU magnitude check the previous test exercises.
+        let levels = 20;
+        let open: String = (0..levels)
+            .map(|i| {
+                format!(
+                    r#"<xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="{}" name=""/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr><xdr:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="9223372036854775807" cy="9223372036854775807"/><a:chOff x="0" y="0"/><a:chExt cx="1" cy="1"/></a:xfrm></xdr:grpSpPr>"#,
+                    i + 1
+                )
+            })
+            .collect();
+        let close = "</xdr:grpSp>".repeat(levels);
+        let xml = format!(
+            r#"<xdr:wsDr {NS}>
+  <xdr:oneCellAnchor>
+    {from}
+    <xdr:ext cx="1" cy="1"/>
+    {open}
+    {pic}
+    {close}
+  </xdr:oneCellAnchor>
+</xdr:wsDr>"#,
+            from = marker_xml("from", 0, 0, 0, 0),
+            pic = pic_xml("rId1", None),
+        );
+
+        let err = parse_drawing(xml.as_bytes(), "xl/drawings/drawing1.xml").unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
     }
 
     #[test]
