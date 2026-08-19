@@ -56,11 +56,18 @@ DrawingMLの `xdr:col`/`xdr:row` は0始まり(ECMA-376 Part 1の `ST_ColumnRow`
 - `read_leaf_text` は元々 `parse/worksheet.rs` 内のprivateヘルパーだったが、本モジュールからも使うために `parse/mod.rs` の共有関数へ昇格させた — 両モジュールとも「ネストした要素を想定しない」単純な数値・テキストのleaf要素(`<v>`, `<xdr:col>` 等)を読む点で共通しており、`concat_rich_text` が扱うより複雑な `<r><t>` ラン構造とは性質が異なる
 - 依存元: `pipeline.rs` のPhase 3.5([pipeline.md](../pipeline.md) 参照)。`PendingImage` のrelationship IDを `drawingN.xml.rels` に対して解決し、最終的な `Vec<model::Image>` を構築する
 
+### `<xdr:ext>`と`<a:ext>`のローカル名衝突(Issue #65の追加修正)
+
+`parse_anchor_body`のフラットな接頭辞非依存のイベントスキャン([parse/mod.md](mod.md)の名前空間方針参照)では、`<xdr:ext>`(`OneCell`アンカー自身の表示サイズ、`oneCellAnchor`の直下の子)と`<a:ext>`(`<xdr:pic>`自身の`<xdr:spPr><a:xfrm>`内にあり、図形自体の内部ジオメトリを表す)は、接頭辞を取り除くとどちらも単に"ext"となるためローカル名だけでは区別できません。実際のライター(仮説ではなく実際のLibreOffice出力で確認済み)は、グループ化していない単純な`<xdr:pic>`に対しても`<xdr:spPr><a:xfrm><a:ext>`を出力し、これは文書順でアンカー自身の`<xdr:ext>`より**後**に出現します(`CT_OneCellAnchor`スキーマの`from, ext, pic`という順序)。そのためガードが無いと、pic内部の(通常は無関係な)サイズが、実際に画面に表示されるアンカーのサイズを静かに上書きしてしまいます。`<xdr:ext>`はまさに差分検出用途の消費者が関心を持つ値(シート上に表示される実際のサイズ)であるため、これは見た目上の問題ではなく実際の正しさに関わるバグでした。
+
+深さカウンタではなく単純な`bool`(`in_pic`。`<xdr:pic>`は自己入れ子しないため十分)を`<xdr:pic>`進入時にセットし、`<xdr:ext>`のマッチを`!in_pic`のときのみ有効にすることで修正しました。これは`<xdr:grpSp>`対応(Issue #67)で、グループ内画像位置解決のために`<xdr:pic>`自身の`off`/`ext`を実際に読む必要が生じた際に、より一般的な形で必要になるのと同じ種類のスコーピング問題です。
+
 ## エラー処理方針
 
 - `<xdr:pic>` を持つアンカーにおいて必須要素(`TwoCell` アンカーの `xdr:from`/`xdr:to`、`OneCell` アンカーの `xdr:from`/`xdr:ext`、`<xdr:pic>` の `<a:blip>` が持つべき `r:embed`)が欠落している場合は `Error::MissingRequiredElement` — `parse/worksheet.rs` が `<c>` の `r` 属性欠落に適用するのと同じfail-fast方針
 - `<xdr:pic>` を全く持たないアンカーは上記チェックが走る前に早期リターンし、結果から単に除外される — 単純な図形・グラフのアンカーがこれらを持たないのは正当なため、エラーとしない
 - leaf要素の数値内容が不正な場合(`xdr:col`/`xdr:colOff`/`xdr:row`/`xdr:rowOff`、または `xdr:ext` の `cx`/`cy` 属性)は `Error::InvalidPackage` — `parse/worksheet.rs::parse_u32_attr`/`parse_f64_attr` の規約(整形式の要素だが期待する型としてパースできない内容を持つ場合)に倣う
+- `<xdr:pic>` が自身の `<xdr:spPr><a:xfrm><a:ext>` にアンカー自身の `<xdr:ext>` と**異なる** `cx`/`cy` を持つ場合でも、`oneCellAnchor` の解決結果はアンカー自身の値を採用する(pic内部の値では上書きされない。Issue #65の追加修正 — 上記のローカル名衝突の注記参照)
 - 0始まりから1始まりへの変換でオーバーフローする、または `CellRef::MAX_ROW`/`MAX_COL` を超える座標は `Error::InvalidCellRef`(上記「主要な型・関数」参照)
 - 構文的に不正なXMLは、他の `parse/` モジュールと同じ `create_secure_reader`/`read_event` のゲートウェイを経由して `Error::XmlParse`/`Error::ZipBombDetected`/`Error::DoctypeRejected` に変換される
 
@@ -72,6 +79,7 @@ DrawingMLの `xdr:col`/`xdr:row` は0始まり(ECMA-376 Part 1の `ST_ColumnRow`
 - 複数のアンカーを持つ `drawingN.xml` から、画像アンカーの数だけ文書順に `PendingImage` が生成されることの確認
 - `<a:blip r:embed>` を欠く `<xdr:pic>` が `Error::MissingRequiredElement { name: "r:embed", .. }` になることの確認
 - 1始まり変換後に `u32` をオーバーフローする、または `CellRef::MAX_ROW`/`MAX_COL` を超える `xdr:row`/`xdr:col` の値が `Error::InvalidCellRef` になることの確認
+- `<xdr:pic>` が自身の `<xdr:spPr><a:xfrm><a:ext>` にアンカーの `<xdr:ext>` と異なる `cx`/`cy` を持つ `oneCellAnchor` で、解決結果がアンカー自身の値になる(pic内部の値に上書きされない)ことの確認(Issue #65の追加修正)
 - `xdr:ext` の属性が不正な場合(`cx`/`cy` が数値でない)に `Error::InvalidPackage` になることの確認
 - アンカーを一切持たない空の `<xdr:wsDr>` が空の `Vec` を返すことの確認
 
