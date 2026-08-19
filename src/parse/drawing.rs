@@ -365,19 +365,25 @@ fn parse_marker(reader: &mut Reader<impl BufRead>, path: &str) -> Result<AnchorM
 
     loop {
         match read_event(reader, &mut buf, path)? {
-            Event::Start(e) if e.local_name().as_ref() == b"col" => {
-                col = Some(parse_leaf(reader, path, "xdr:col")?);
-            }
-            Event::Start(e) if e.local_name().as_ref() == b"colOff" => {
-                col_off = Some(parse_leaf(reader, path, "xdr:colOff")?);
-            }
-            Event::Start(e) if e.local_name().as_ref() == b"row" => {
-                row = Some(parse_leaf(reader, path, "xdr:row")?);
-            }
-            Event::Start(e) if e.local_name().as_ref() == b"rowOff" => {
-                row_off = Some(parse_leaf(reader, path, "xdr:rowOff")?);
-            }
-            Event::End(e) if matches!(e.local_name().as_ref(), b"from" | b"to") => break,
+            Event::Start(e) => match e.local_name().as_ref() {
+                b"col" => {
+                    col = Some(parse_leaf(reader, path, "xdr:col")?);
+                }
+                b"colOff" => {
+                    col_off = Some(parse_leaf(reader, path, "xdr:colOff")?);
+                }
+                b"row" => {
+                    row = Some(parse_leaf(reader, path, "xdr:row")?);
+                }
+                b"rowOff" => {
+                    row_off = Some(parse_leaf(reader, path, "xdr:rowOff")?);
+                }
+                _ => {}
+            },
+            Event::End(e) => match e.local_name().as_ref() {
+                b"from" | b"to" => break,
+                _ => {}
+            },
             Event::Eof => {
                 return Err(Error::MissingRequiredElement {
                     path: path.to_string(),
@@ -455,6 +461,34 @@ mod tests {
         format!(
             "<xdr:{tag}><xdr:col>{col}</xdr:col><xdr:colOff>{col_off}</xdr:colOff><xdr:row>{row}</xdr:row><xdr:rowOff>{row_off}</xdr:rowOff></xdr:{tag}>"
         )
+    }
+
+    /// Advances `reader` past a marker's own opening tag (`parse_marker`'s
+    /// callers always do this via the enclosing anchor's event loop before
+    /// calling it) and returns the parsed `AnchorMarker`.
+    fn parse_marker_standalone(xml: &str) -> Result<AnchorMarker, Error> {
+        let mut reader = create_secure_reader(xml.as_bytes());
+        let mut buf = Vec::new();
+        read_event(&mut reader, &mut buf, "drawing1.xml").unwrap(); // consume <xdr:from>/<xdr:to>
+        buf.clear();
+        parse_marker(&mut reader, "drawing1.xml")
+    }
+
+    #[test]
+    fn parse_marker_converts_zero_based_col_row_to_one_based_cell_ref() {
+        let marker = parse_marker_standalone(&marker_xml("from", 4, 12345, 9, 67890)).unwrap();
+        assert_eq!(marker.cell, CellRef { row: 10, col: 5 });
+        assert_eq!(marker.col_off, 12345);
+        assert_eq!(marker.row_off, 67890);
+    }
+
+    #[test]
+    fn parse_marker_defaults_missing_col_off_and_row_off_to_zero() {
+        let xml = "<xdr:to><xdr:col>2</xdr:col><xdr:row>3</xdr:row></xdr:to>";
+        let marker = parse_marker_standalone(xml).unwrap();
+        assert_eq!(marker.cell, CellRef { row: 4, col: 3 });
+        assert_eq!(marker.col_off, 0);
+        assert_eq!(marker.row_off, 0);
     }
 
     #[test]
