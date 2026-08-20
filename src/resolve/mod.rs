@@ -5,10 +5,13 @@
 //! purely on in-memory data (`model::Sheet` and the pending lists Phase 3
 //! built), per `docs/design/architecture.en.md` design principle 2.
 
+mod color;
 mod column_width;
 mod merge;
 mod shared_strings;
 mod style;
+
+pub use color::resolve_color;
 
 use crate::error::Error;
 use crate::model::{ColWidthRange, MergedRegion, Sheet, StyleSheet};

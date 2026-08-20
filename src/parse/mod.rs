@@ -10,6 +10,7 @@ mod drawing;
 mod relationships;
 mod shared_strings;
 mod styles;
+mod theme;
 mod workbook;
 mod worksheet;
 
@@ -17,6 +18,7 @@ pub(crate) use drawing::parse_drawing;
 pub(crate) use relationships::{parse_relationships, TargetMode};
 pub(crate) use shared_strings::{parse_shared_strings, SharedStringTable};
 pub(crate) use styles::parse_styles;
+pub(crate) use theme::parse_theme;
 pub(crate) use workbook::parse_workbook_xml;
 pub(crate) use worksheet::{parse_worksheet, PendingSharedString, PendingStyle};
 

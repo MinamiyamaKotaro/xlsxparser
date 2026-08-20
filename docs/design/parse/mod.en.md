@@ -6,7 +6,7 @@ Design doc for `src/parse/mod.rs`. Per [architecture.md](../architecture.en.md),
 
 ## Responsibility / Scope
 
-- Declares submodules (`mod relationships; mod workbook; mod shared_strings; mod styles; mod worksheet;`) and re-exports crate-internal types
+- Declares submodules (`mod relationships; mod workbook; mod shared_strings; mod styles; mod worksheet; mod theme;`) and re-exports crate-internal types
 - Provides `create_secure_reader`, the sole gateway for constructing a `quick_xml::Reader` with XXE mitigations already applied. Every module under `parse/` must obtain its `Reader` only through this function, never by calling `Reader::from_reader` directly (this implements architecture.md's rationale: "if each parser initializes its own `Reader`, there is a risk of a missed configuration")
 - Provides `convert_xml_error`, the sole gateway for converting `quick_xml::Error` into [`crate::error::Error`](../error.en.md). This is also where limit-exceeded errors from [container/sanitize.md](../container/sanitize.en.md)'s `BoundedReader` (Zip Bomb protection) are detected and converted into `Error::ZipBombDetected`
 - Provides `read_event`, the sole gateway for reading events. `quick-xml` is a non-validating parser that never resolves a DTD internal subset or an external entity even in its default configuration, so classic XXE cannot occur in the first place — but rather than resting on that assumption alone, this function actively rejects any `<!DOCTYPE ...>` declaration (`Event::DocType`) unconditionally the moment it is detected as XML syntax (fail closed), giving XXE mitigation an explicit, verifiable form that doesn't depend on the parser's internal implementation or future version changes. Every module under `parse/` reads events only through this function, never calling `Reader::read_event_into` directly (reflects [the security review](../../security/design-review.en.md) Finding 1)
@@ -21,12 +21,14 @@ mod workbook;
 mod shared_strings;
 mod styles;
 mod worksheet;
+mod theme;
 
 pub(crate) use relationships::{Relationship, RelationshipMap, TargetMode, parse_relationships};
 pub(crate) use shared_strings::{SharedStringTable, parse_shared_strings};
 pub(crate) use styles::parse_styles;
 pub(crate) use workbook::{WorkbookSheetEntry, parse_workbook_xml};
 pub(crate) use worksheet::{PendingSharedString, PendingStyle, WorksheetParseOutput, parse_worksheet};
+pub(crate) use theme::parse_theme;
 
 use crate::error::Error;
 use quick_xml::events::{BytesStart, Event};
@@ -271,7 +273,7 @@ fn trim_tail_in_place(text: &mut String, start: usize) {
 ## Dependencies
 
 - Depends on: [`container/sanitize.rs`](../container/sanitize.en.md) (only for downcasting to `LimitExceeded` — no dependency on `container::ZipContainer` itself; architecture.md design policy 3 forbids `container` and `parse` from knowing about each other's orchestration role directly, and referencing this single internal error type does not violate that), [`error.rs`](../error.en.md), and the external `quick-xml` crate
-- Depended on by: every submodule under `parse/` ([relationships.rs](relationships.en.md) / [workbook.rs](workbook.en.md) / [shared_strings.rs](shared_strings.en.md) / [styles.rs](styles.en.md) / [worksheet.rs](worksheet.en.md)), `pipeline.rs` (calls the re-exported parse functions)
+- Depended on by: every submodule under `parse/` ([relationships.rs](relationships.en.md) / [workbook.rs](workbook.en.md) / [shared_strings.rs](shared_strings.en.md) / [styles.rs](styles.en.md) / [worksheet.rs](worksheet.en.md) / [theme.rs](theme.en.md)), `pipeline.rs` (calls the re-exported parse functions)
 
 `convert_xml_error`'s reference to `container::sanitize::LimitExceeded` is simply the implementation of what both [container/sanitize.md Error Handling Policy](../container/sanitize.en.md) and [container/mod.md Error Handling Policy](../container/mod.en.md) had already settled — that the conversion boundary lives where `parse/` converts `quick_xml::Error` into `crate::error::Error`. This resolves the open point both of those files had left pending.
 

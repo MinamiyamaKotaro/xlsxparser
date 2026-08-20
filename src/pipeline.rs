@@ -8,7 +8,7 @@
 use crate::container::sanitize::SizeLimits;
 use crate::container::ZipContainer;
 use crate::error::Error;
-use crate::model::{Sheet, SheetVisibility, StyleSheet, Workbook};
+use crate::model::{ColorRef, Sheet, SheetVisibility, StyleSheet, Workbook};
 use crate::parse::SharedStringTable;
 use crate::{parse, resolve};
 use std::io::{BufReader, Read, Seek};
@@ -20,6 +20,7 @@ const PACKAGE_RELS_PATH: &str = "_rels/.rels";
 const OFFICE_DOCUMENT_REL_TYPE_SUFFIX: &str = "/relationships/officeDocument";
 const SHARED_STRINGS_REL_TYPE_SUFFIX: &str = "/relationships/sharedStrings";
 const STYLES_REL_TYPE_SUFFIX: &str = "/relationships/styles";
+const THEME_REL_TYPE_SUFFIX: &str = "/relationships/theme";
 
 /// One sheet's routing info, finalized once Phase 1 completes.
 struct SheetRoute {
@@ -105,6 +106,12 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
         .values()
         .find(|r| r.rel_type.ends_with(STYLES_REL_TYPE_SUFFIX))
         .map(|r| r.target.clone());
+    // theme{N}.xml is likewise optional at the relationship level — most
+    // workbooks never reference a theme color at all (Issue #76).
+    let theme_path = relationships
+        .values()
+        .find(|r| r.rel_type.ends_with(THEME_REL_TYPE_SUFFIX))
+        .map(|r| r.target.clone());
 
     // The reader used for the rels read, and the RelationshipMap, go out of
     // scope and are dropped here (implements architecture.md's "dispose of
@@ -136,6 +143,20 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
         // StyleId that was never assigned, so an empty StyleSheet degrades
         // gracefully rather than erroring.
         None => StyleSheet::new(),
+    };
+    // "Pay-for-what-you-use" (Issue #76): theme{N}.xml is read and parsed
+    // only when the workbook both has the part *and* stylesheet actually
+    // references a ColorRef::Theme — the overwhelming majority of
+    // workbooks never use a theme color, so this keeps zero added I/O/CPU
+    // cost on the common path.
+    let theme = match theme_path {
+        Some(path) if stylesheet_uses_theme_color(&stylesheet) => {
+            let reader = container
+                .get_entry(&path)?
+                .ok_or_else(|| Error::InvalidPackage(path.clone()))?;
+            Some(parse::parse_theme(BufReader::new(reader), &path)?)
+        }
+        _ => None,
     };
 
     // --- Per sheet: Phase 3 (streaming parse) -> Phase 4 (resolution) ---
@@ -182,7 +203,20 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
     // (implements architecture.md's "dispose of SharedStringTable and
     // StyleSheet once Phase 4 completes").
 
-    Ok(Workbook::new(sheets))
+    Ok(Workbook::new(sheets, theme))
+}
+
+/// Whether `stylesheet` contains at least one `ColorRef::Theme` reference
+/// (Issue #76's "pay-for-what-you-use" gate — see `run`'s theme-reading
+/// step above). Scans every `ResolvedStyle`'s fill colors; cost is
+/// O(number of distinct styles in the file), never O(cell count), the same
+/// "resolve/scan per style, not per cell" shape the rest of style
+/// resolution already has.
+fn stylesheet_uses_theme_color(stylesheet: &StyleSheet) -> bool {
+    stylesheet.values().any(|style| {
+        matches!(style.fill_fg_color, Some(ColorRef::Theme { .. }))
+            || matches!(style.fill_bg_color, Some(ColorRef::Theme { .. }))
+    })
 }
 
 /// Computes the `_rels` part path for a given OPC part (e.g.
@@ -384,6 +418,40 @@ mod tests {
 
     const STYLES_XML: &[u8] = br#"<styleSheet><cellXfs><xf numFmtId="0"/></cellXfs></styleSheet>"#;
 
+    const RELS_WITH_THEME: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+  <Relationship Id="rId6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/>
+</Relationships>"#;
+
+    const STYLES_WITH_THEME_COLOR_XML: &[u8] = br#"<styleSheet>
+<fills count="1"><fill><patternFill patternType="solid"><fgColor theme="4" tint="-0.25"/></patternFill></fill></fills>
+<cellXfs><xf numFmtId="0" fillId="0"/></cellXfs>
+</styleSheet>"#;
+
+    const WORKSHEET_WITH_STYLE_XML: &[u8] =
+        br#"<worksheet><sheetData><row r="1"><c r="A1" s="0"><v>1</v></c></row></sheetData></worksheet>"#;
+
+    const THEME1_XML: &[u8] =
+        br#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+<a:themeElements>
+<a:clrScheme name="Office">
+<a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1>
+<a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>
+<a:dk2><a:srgbClr val="1F497D"/></a:dk2>
+<a:lt2><a:srgbClr val="EEECE1"/></a:lt2>
+<a:accent1><a:srgbClr val="4F81BD"/></a:accent1>
+<a:accent2><a:srgbClr val="C0504D"/></a:accent2>
+<a:accent3><a:srgbClr val="9BBB59"/></a:accent3>
+<a:accent4><a:srgbClr val="8064A2"/></a:accent4>
+<a:accent5><a:srgbClr val="4BACC6"/></a:accent5>
+<a:accent6><a:srgbClr val="F79646"/></a:accent6>
+<a:hlink><a:srgbClr val="0000FF"/></a:hlink>
+<a:folHlink><a:srgbClr val="800080"/></a:folHlink>
+</a:clrScheme>
+</a:themeElements>
+</a:theme>"#;
+
     const WORKSHEET_XML: &[u8] = br#"<worksheet><sheetData>
 <row r="1">
   <c r="A1"><v>42</v></c>
@@ -423,6 +491,90 @@ mod tests {
             sheet.get(CellRef { row: 1, col: 3 }),
             sheet.get(CellRef { row: 1, col: 4 })
         );
+        // No theme relationship at all in RELS_XML (Issue #76).
+        assert!(workbook.theme().is_none());
+    }
+
+    #[test]
+    fn theme_resolves_end_to_end_when_a_style_references_a_theme_color() {
+        // Issue #76: a workbook whose stylesheet references a
+        // ColorRef::Theme, and that actually has a theme{N}.xml part, must
+        // resolve Workbook::theme() and let resolve::resolve_color produce
+        // the real displayed color.
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_WITH_THEME),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/styles.xml", STYLES_WITH_THEME_COLOR_XML),
+            ("xl/worksheets/sheet1.xml", WORKSHEET_WITH_STYLE_XML),
+            ("xl/theme/theme1.xml", THEME1_XML),
+        ]);
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+
+        let theme = workbook
+            .theme()
+            .expect("theme part referenced by a used ColorRef::Theme must resolve");
+        // Index 4 = accent1 (#4F81BD) under the slot-0/1-swapped index
+        // contract PoC-verified in Issue #76.
+        assert_eq!(
+            theme.0[4],
+            crate::model::Rgb {
+                r: 0x4F,
+                g: 0x81,
+                b: 0xBD
+            }
+        );
+
+        let sheet = &workbook.sheets()[0];
+        let cell = sheet.get(CellRef { row: 1, col: 1 }).unwrap();
+        let color = cell
+            .style
+            .as_ref()
+            .expect("cell references styleId 0")
+            .fill_fg_color
+            .as_ref()
+            .expect("styleId 0's fill has a theme fgColor");
+        let resolved = resolve::resolve_color(color, workbook.theme());
+        assert_eq!(
+            resolved,
+            Some(crate::model::Rgb {
+                r: 0x37,
+                g: 0x60,
+                b: 0x92
+            })
+        );
+    }
+
+    #[test]
+    fn theme_part_present_but_unused_is_never_read() {
+        // Issue #76 "pay-for-what-you-use": a theme relationship and part
+        // both exist, but no style in STYLES_XML references a
+        // ColorRef::Theme, so pipeline::run must never even attempt to
+        // parse xl/theme/theme1.xml. Using intentionally invalid XML here
+        // proves this: if the optimization ever regressed, this test would
+        // fail with an XML parse error rather than a clean success.
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_WITH_THEME),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/styles.xml", STYLES_XML),
+            ("xl/worksheets/sheet1.xml", WORKSHEET_WITH_STYLE_XML),
+            ("xl/theme/theme1.xml", b"<not even well-formed xml"),
+        ]);
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+        assert!(workbook.theme().is_none());
+    }
+
+    #[test]
+    fn missing_theme_entity_when_referenced_is_invalid_package() {
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_WITH_THEME),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/styles.xml", STYLES_WITH_THEME_COLOR_XML),
+            ("xl/worksheets/sheet1.xml", WORKSHEET_WITH_STYLE_XML),
+            // xl/theme/theme1.xml intentionally omitted, even though the
+            // relationship points to it and a style actually uses it.
+        ]);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
     }
 
     #[test]

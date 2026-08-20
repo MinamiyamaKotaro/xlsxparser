@@ -6,9 +6,10 @@
 
 ## 責務・スコープ
 
-- サブモジュールの宣言（`mod shared_strings; mod merge; mod style; mod column_width;`）と公開型の再エクスポート
+- サブモジュールの宣言（`mod shared_strings; mod merge; mod style; mod column_width; mod color;`）と公開型の再エクスポート
 - 1シート分の未解決データ（フェーズ3が構築した `model::Sheet` と、共有文字列インデックス・スタイルIDの保留リスト、`<cols>` の範囲リストと `defaultColWidth`、`<mergeCells>` の範囲リスト）を受け取り、[shared_strings.md](shared_strings.md) → [style.md](style.md) → [column_width.md](column_width.md) → [merge.md](merge.md) の順で解決処理を呼び出すエントリ関数 `resolve_sheet` を提供する
-- **含まない責務**: 各解決処理そのもののロジック（共有文字列のインデックス引き当て、スタイルの適用、列幅範囲・結合範囲の検証・登録は各サブモジュールの責務）、XMLパースそのもの（`parse/worksheet.rs` 等）、`SharedStringTable` / `StyleSheet` の構築（`parse/shared_strings.rs` / `parse/styles.rs`）
+- [`resolve/color.rs`](color.md)（`resolve_color`。Issue #76）を再エクスポートし、クレート外部から直接呼び出せるようにする——ただし [column_width.md](column_width.md) までの4つとは異なり `resolve_sheet` 自身からは呼び出さない（下記依存関係参照）
+- **含まない責務**: 各解決処理そのもののロジック（共有文字列のインデックス引き当て、スタイルの適用、列幅範囲・結合範囲の検証・登録、色の解決は各サブモジュールの責務）、XMLパースそのもの（`parse/worksheet.rs` 等）、`SharedStringTable` / `StyleSheet` の構築（`parse/shared_strings.rs` / `parse/styles.rs`）
 
 ## 主要な型・関数（案）
 
@@ -17,6 +18,9 @@ mod shared_strings;
 mod merge;
 mod style;
 mod column_width;
+mod color;
+
+pub use color::resolve_color;
 
 use crate::error::Error;
 use crate::model::sheet::{ColWidthRange, MergedRegion, Sheet};
@@ -52,8 +56,10 @@ pub fn resolve_sheet(
 
 ## 依存関係
 
-- 依存先: [`resolve/shared_strings.rs`](shared_strings.md), [`resolve/merge.rs`](merge.md), [`resolve/style.rs`](style.md), [`resolve/column_width.rs`](column_width.md)（すべて `mod` 宣言として）、[`model/sheet.rs`](../model/sheet.md)（`Sheet`, `MergedRegion`, `ColWidthRange`）、[`error.rs`](../error.md)。[`parse::shared_strings::SharedStringTable`](../parse/shared_strings.md)、[`parse::worksheet::{PendingSharedString, PendingStyle}`](../parse/worksheet.md) にも依存するが、これは architecture.md 設計方針2が禁じる「I/Oへの依存」ではなく「フェーズ3が既に構築済みの、メモリ上の構造化データへの依存」であるため、`resolve/` の I/O非依存方針とは矛盾しない（quick-xml や `std::fs` など実際のI/O・XML構造への依存は持たない）。
-- 依存元: `pipeline.rs`（各シートのフェーズ3完了後に `resolve_sheet` を呼び出す）
+- 依存先: [`resolve/shared_strings.rs`](shared_strings.md), [`resolve/merge.rs`](merge.md), [`resolve/style.rs`](style.md), [`resolve/column_width.rs`](column_width.md), [`resolve/color.rs`](color.md)（すべて `mod` 宣言として）、[`model/sheet.rs`](../model/sheet.md)（`Sheet`, `MergedRegion`, `ColWidthRange`）、[`error.rs`](../error.md)。[`parse::shared_strings::SharedStringTable`](../parse/shared_strings.md)、[`parse::worksheet::{PendingSharedString, PendingStyle}`](../parse/worksheet.md) にも依存するが、これは architecture.md 設計方針2が禁じる「I/Oへの依存」ではなく「フェーズ3が既に構築済みの、メモリ上の構造化データへの依存」であるため、`resolve/` の I/O非依存方針とは矛盾しない（quick-xml や `std::fs` など実際のI/O・XML構造への依存は持たない）。
+- 依存元: `pipeline.rs`（各シートのフェーズ3完了後に `resolve_sheet` を呼び出す）、クレート外部の呼び出し元（再エクスポートされた `resolve_color` を、`Workbook::theme()`/`ResolvedStyle.fill_fg_color`等と組み合わせて任意のタイミングで直接呼び出す。Issue #76「案A」）
+
+`resolve_color`(Issue #76)を `resolve_sheet` から呼び出さない理由: [resolve/color.md](color.md) が採用する「案A: オンデマンド解決API」は、色解決を全セル走査(フェーズ4)から独立させ、呼び出し側が表示用途で実際に必要とした箇所でのみ計算することでセル数に対するCPU・メモリオーバーヘッドを避ける設計であるため([Issue #76 設計提案](https://github.com/MinamiyamaKotaro/xlsxparser/issues/76#issuecomment-5352309575)参照)。`shared_strings`/`style`/`column_width`/`merge` の4つがいずれも「フェーズ3が残した保留状態を解消しない限りセルが不完全なままになる」必須処理であるのに対し、色解決は`ColorRef`という完全な情報が既に`ResolvedStyle`に格納された*後*に、必要な場合のみ行う付加的な変換である点が異なる。
 
 共有文字列解決・スタイル適用・列幅解決の3つには強い前後関係はない（それぞれが読み書きする状態が独立しているため）。結合解決を最後に置いているのは保険的な順序である: [merge.md](merge.md) の `insert_merge` は呼び出し時点で起点セルが `cells` に存在することを前提としており、さらにIssue #43以降は `merge::resolve` の最終ステップとして呼ばれる `Sheet::finalize_merges` が `cells` から起点以外の全エントリを削除するため、仮想(非起点)座標にまだ触れる可能性のある他の全ステップが完了した後でなければならない。
 

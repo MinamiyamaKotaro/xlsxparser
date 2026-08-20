@@ -36,9 +36,10 @@ pub use error::{Error, Result};
 pub use json::{to_json_string, to_json_writer};
 pub use model::{
     Alignment, AnchorMarker, Cell, CellRef, CellValue, ColWidthRange, ColorRef, DateTimeValue,
-    Font, Image, ImageAnchor, ImageExtent, MergedRegion, ResolvedStyle, Sheet, SheetVisibility,
-    StyleId, Workbook,
+    Font, Image, ImageAnchor, ImageExtent, MergedRegion, ResolvedStyle, Rgb, Sheet,
+    SheetVisibility, StyleId, ThemePalette, Workbook,
 };
+pub use resolve::resolve_color;
 
 use std::fs::File;
 use std::io::{Read, Seek};
@@ -333,6 +334,22 @@ mod tests {
         assert_reachable::<crate::DateTimeValue>();
         assert_reachable::<crate::SizeLimits>();
         assert_reachable::<crate::Error>();
+        assert_reachable::<crate::Rgb>();
+        assert_reachable::<crate::ThemePalette>();
         fn _assert_result_reachable(_: crate::Result<()>) {}
+
+        // resolve_color, unlike the above, is a function rather than a
+        // type, so it's exercised directly rather than through
+        // assert_reachable — also a real assertion, not just a
+        // compile-time check.
+        let color = crate::ColorRef::Rgb(std::sync::Arc::from("FFFF0000"));
+        assert_eq!(
+            crate::resolve_color(&color, None),
+            Some(crate::Rgb {
+                r: 0xFF,
+                g: 0x00,
+                b: 0x00
+            })
+        );
     }
 }

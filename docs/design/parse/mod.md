@@ -6,7 +6,7 @@
 
 ## 責務・スコープ
 
-- サブモジュールの宣言（`mod relationships; mod workbook; mod shared_strings; mod styles; mod worksheet;`）とクレート内公開型の再エクスポート
+- サブモジュールの宣言（`mod relationships; mod workbook; mod shared_strings; mod styles; mod worksheet; mod theme;`）とクレート内公開型の再エクスポート
 - XXE対策を適用済みの `quick_xml::Reader` を生成する唯一の窓口 `create_secure_reader` を提供する。`parse/` 配下の各モジュールはこの関数経由でのみ `Reader` を取得しなければならず、個別に `Reader::from_reader` を呼ばない（architecture.md 「各パーサーが個別に `Reader` を初期化すると設定漏れのリスクがあるため」を実装する）
 - `quick_xml::Error` を [`crate::error::Error`](../error.md) へ変換する唯一の窓口 `convert_xml_error` を提供する。[container/sanitize.md](../container/sanitize.md) が定義する `BoundedReader` からの上限超過（Zip Bomb）を検知し `Error::ZipBombDetected` へ変換する処理もここに集約する
 - イベント読み取りの唯一の窓口 `read_event` を提供する。`quick-xml` はDTD内部サブセット・外部実体を解決しない非検証型パーサーであり通常の構成でも古典的なXXEは成立しないが、この前提のみに依拠せず、`<!DOCTYPE ...>` 宣言（`Event::DocType`）自体をXMLの構文として検知した時点で無条件に拒否する（fail closed）ことで、パーサーの内部実装や将来のバージョン変更に依存しない明示的・検証可能なXXE対策とする。`parse/` 配下の各モジュールはこの関数経由でのみイベントを読み取り、`Reader::read_event_into` を直接呼ばない（[セキュリティレビュー](../../security/design-review.md) Finding 1を反映）
@@ -21,12 +21,14 @@ mod workbook;
 mod shared_strings;
 mod styles;
 mod worksheet;
+mod theme;
 
 pub(crate) use relationships::{Relationship, RelationshipMap, TargetMode, parse_relationships};
 pub(crate) use shared_strings::{SharedStringTable, parse_shared_strings};
 pub(crate) use styles::parse_styles;
 pub(crate) use workbook::{WorkbookSheetEntry, parse_workbook_xml};
 pub(crate) use worksheet::{PendingSharedString, PendingStyle, WorksheetParseOutput, parse_worksheet};
+pub(crate) use theme::parse_theme;
 
 use crate::error::Error;
 use quick_xml::events::{BytesStart, Event};
@@ -245,7 +247,7 @@ fn trim_tail_in_place(text: &mut String, start: usize) {
 ## 依存関係
 
 - 依存先: [`container/sanitize.rs`](../container/sanitize.md)（`LimitExceeded` へのダウンキャストのみ。`container::ZipContainer` そのものには依存しない。architecture.md 設計方針3が禁じるのは「`container` と `parse` が互いのオーケストレーション上の役割を直接知ること」であり、`parse/` が `container::sanitize::LimitExceeded` という1つの内部エラー型のみを参照することはこれに反しない）、[`error.rs`](../error.md)、外部クレート `quick-xml`
-- 依存元: `parse/` 配下の全サブモジュール（[relationships.rs](relationships.md) / [workbook.rs](workbook.md) / [shared_strings.rs](shared_strings.md) / [styles.rs](styles.md) / [worksheet.rs](worksheet.md)）、`pipeline.rs`（再エクスポートされた各パース関数の呼び出し）
+- 依存元: `parse/` 配下の全サブモジュール（[relationships.rs](relationships.md) / [workbook.rs](workbook.md) / [shared_strings.rs](shared_strings.md) / [styles.rs](styles.md) / [worksheet.rs](worksheet.md) / [theme.rs](theme.md)）、`pipeline.rs`（再エクスポートされた各パース関数の呼び出し）
 
 `convert_xml_error` が `container::sanitize::LimitExceeded` を参照する設計は、[container/sanitize.md エラー処理方針](../container/sanitize.md)・[container/mod.md エラー処理方針](../container/mod.md) の双方が既に「変換境界は `parse/` が `quick_xml::Error` を `crate::error::Error` へ変換する箇所に置く」と確定させていた内容をそのまま実装したものであり、両ファイルのオープンクエスチョンとして残されていた論点はこれで解決済みとなる。
 

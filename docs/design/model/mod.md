@@ -6,7 +6,7 @@
 
 ## 責務・スコープ
 
-- サブモジュールの宣言（`mod cell; mod sheet; mod workbook; mod style;`）
+- サブモジュールの宣言（`mod cell; mod sheet; mod workbook; mod style; mod color;`）
 - 公開型の再エクスポート（`pub use cell::{Cell, CellValue, CellRef};` など）
 - **含まない責務**: 型定義そのもの（各サブモジュールの責務）、ロジック（`model/` はロジックを持たない純粋データ構造のみという architecture.md の方針上、`mod.rs` にも処理は書かない）
 
@@ -17,18 +17,22 @@ mod cell;
 mod sheet;
 mod workbook;
 mod style;
+mod color;
 
 pub use cell::{Cell, CellRef, CellValue};
 pub use sheet::{MergedRegion, Sheet, SheetVisibility};
 pub use workbook::Workbook;
-pub use style::{ResolvedStyle, StyleId, StyleSheet};
+pub use style::{Alignment, ColorRef, Font, ResolvedStyle, StyleId, StyleSheet};
+pub use color::{Rgb, ThemePalette};
 ```
+
+`Rgb`/`ThemePalette`([`model/color.rs`](color.md)、Issue #76)は、`Workbook::theme()`/`ResolvedStyle.fill_fg_color`等から到達可能な公開APIの一部として再エクスポートする——[`resolve::color::resolve_color`](../resolve/color.md)をクレート外部から直接呼び出す「案A」の呼び出し形（[resolve/color.md](../resolve/color.md)参照）が、これらの型を公開せずには成立しないため。
 
 `DateTimeValue`（[model/cell.md](cell.md) の未決事項4を参照）は `model/cell.rs` 内で定義済みのため、`cell::{..}` の再エクスポート対象に含める。[`lib.md`](../lib.md) の設計により、`CellValue::DateTime` がクレート公開APIの一部である以上 `DateTimeValue` の再エクスポートは必須であることが確定した（具体的な型自体は [model/cell.md 未決事項4](cell.md) が別途扱う）。`ResolvedStyle` / `StyleSheet` / `StyleId` の配置場所は [`model/style.rs`](style.md) 新設により確定した（旧オープンクエスチョン1を解決。PR #8 レビュー指摘を反映）。
 
 ## 依存関係
 
-- 依存先: [`model/cell.rs`](cell.md), [`model/sheet.rs`](sheet.md), [`model/workbook.rs`](workbook.md), [`model/style.rs`](style.md)（すべて `mod` 宣言として）
+- 依存先: [`model/cell.rs`](cell.md), [`model/sheet.rs`](sheet.md), [`model/workbook.rs`](workbook.md), [`model/style.rs`](style.md), [`model/color.rs`](color.md)（すべて `mod` 宣言として）
 - 依存元: `resolve/`, `parse/`, `json.rs`, `lib.rs` などクレート内の他レイヤー（`crate::model::Workbook` のように本ファイル経由で型を参照する）
 
 ## エラー処理方針
