@@ -228,3 +228,38 @@ pub fn too_many_cells(n_cells: u32) -> Vec<u8> {
         ),
     ])
 }
+
+/// Same as [`too_many_cells`], but each cell is a self-closing `<c r="..."
+/// s="0"/>` (a style attribute, no `<v>` — the shape `<row>`/`<c>` take when
+/// self-closing, which only reaches `Sheet::insert_cell` if it carries a
+/// style, unlike a bare `<c r="A1"/>`). Exercises the `is_empty` branch of
+/// `parse/worksheet.rs`'s `<c>` handling — as opposed to [`too_many_cells`],
+/// which only ever produces non-self-closing `<c>...</c>` cells.
+pub fn too_many_cells_self_closing_with_style(n_cells: u32) -> Vec<u8> {
+    let mut rows = String::new();
+    for col in 1..=n_cells {
+        rows.push_str(&format!(
+            "<row r=\"{col}\"><c r=\"A{col}\" s=\"0\"/></row>\n"
+        ));
+    }
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "styles", "styles.xml"),
+            ])
+            .as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        ("xl/styles.xml", DEFAULT_STYLES_XML),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(&rows, "").as_bytes(),
+        ),
+    ])
+}

@@ -152,7 +152,7 @@ pub(crate) fn parse_worksheet(
                 let style_id = optional_attr(e, path, "s")?.and_then(|s| s.parse::<u32>().ok());
 
                 if is_empty {
-                    if flush_cell(
+                    let inserted = flush_cell(
                         sheet,
                         &mut pending_shared_strings,
                         &mut pending_styles,
@@ -163,7 +163,8 @@ pub(crate) fn parse_worksheet(
                         None,
                         None,
                         date1904,
-                    )? {
+                    )?;
+                    if inserted {
                         check_cell_count(&mut cell_count, max_cells, path)?;
                     }
                 } else {
@@ -187,7 +188,7 @@ pub(crate) fn parse_worksheet(
             }
             Event::End(e) if e.local_name().as_ref() == b"c" => {
                 if let Some(cell_ref) = cur_ref.take() {
-                    if flush_cell(
+                    let inserted = flush_cell(
                         sheet,
                         &mut pending_shared_strings,
                         &mut pending_styles,
@@ -198,7 +199,8 @@ pub(crate) fn parse_worksheet(
                         cur_value_text.take(),
                         cur_inline.take(),
                         date1904,
-                    )? {
+                    )?;
+                    if inserted {
                         check_cell_count(&mut cell_count, max_cells, path)?;
                     }
                 }

@@ -78,6 +78,40 @@ fn too_many_cells_is_rejected_before_exceeding_the_cap() {
 }
 
 #[test]
+fn too_many_self_closing_styled_cells_is_also_rejected() {
+    // Same cap as above, but every `<c>` is self-closing (`<c r="..."
+    // s="0"/>`) rather than `<c r="...">...</c>` — a styled cell still
+    // reaches `Sheet::insert_cell` even with no `<v>`, so it must count
+    // against the cap the same way a valued cell does.
+    let tiny_cap = SizeLimits {
+        max_cells_per_sheet: 3,
+        ..SizeLimits::default()
+    };
+    let err = parse_workbook_reader_with_limits(
+        Cursor::new(security::too_many_cells_self_closing_with_style(4)),
+        tiny_cap,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::TooManyCells {
+                count: 4,
+                limit: 3,
+                ..
+            }
+        ),
+        "expected Error::TooManyCells {{ count: 4, limit: 3, .. }}, got {err:?}"
+    );
+
+    parse_workbook_reader_with_limits(
+        Cursor::new(security::too_many_cells_self_closing_with_style(3)),
+        tiny_cap,
+    )
+    .unwrap();
+}
+
+#[test]
 fn zip_slip_entry_name_rejects_the_whole_archive() {
     let err = parse_workbook_reader(Cursor::new(security::zip_slip())).unwrap_err();
     assert!(
