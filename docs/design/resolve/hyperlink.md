@@ -75,7 +75,15 @@ fn validate_range(range: &HyperlinkRange, accepted: &[&HyperlinkRange]) -> Resul
             return Err(Error::InvalidHyperlinkRange {
                 start: range.start.to_a1(),
                 end: range.end.to_a1(),
-                reason: "overlaps with another hyperlink range".to_string(),
+                // resolve::mergeの同種メッセージと異なり、競合した範囲自身の
+                // 座標を含める——結合セルと違ってハイパーリンク範囲には
+                // 見た目のセルレイアウトという追加の手がかりが読み手に
+                // 無いため(Copilot PRレビュー、PR #96)。
+                reason: format!(
+                    "overlaps with another hyperlink range ({}:{})",
+                    other.start.to_a1(),
+                    other.end.to_a1()
+                ),
             });
         }
     }

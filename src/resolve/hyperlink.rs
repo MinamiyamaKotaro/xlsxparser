@@ -73,7 +73,11 @@ fn validate_range(range: &HyperlinkRange, accepted: &[&HyperlinkRange]) -> Resul
             return Err(Error::InvalidHyperlinkRange {
                 start: range.start.to_a1(),
                 end: range.end.to_a1(),
-                reason: "overlaps with another hyperlink range".to_string(),
+                reason: format!(
+                    "overlaps with another hyperlink range ({}:{})",
+                    other.start.to_a1(),
+                    other.end.to_a1()
+                ),
             });
         }
     }

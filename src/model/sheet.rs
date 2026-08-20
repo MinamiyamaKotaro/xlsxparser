@@ -622,7 +622,10 @@ impl Sheet {
                     active.insert(pos, *i);
                 }
                 SweepEvent::End(i) => {
-                    active.retain(|&j| j != *i);
+                    let col = ranges[*i].start.col;
+                    let pos = active.partition_point(|&j| ranges[j].start.col < col);
+                    debug_assert_eq!(active.get(pos), Some(i));
+                    active.remove(pos);
                 }
                 SweepEvent::Query(coord) => {
                     let pos = active.partition_point(|&j| ranges[j].start.col <= coord.col);

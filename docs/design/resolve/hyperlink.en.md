@@ -77,7 +77,16 @@ fn validate_range(range: &HyperlinkRange, accepted: &[&HyperlinkRange]) -> Resul
             return Err(Error::InvalidHyperlinkRange {
                 start: range.start.to_a1(),
                 end: range.end.to_a1(),
-                reason: "overlaps with another hyperlink range".to_string(),
+                // Names the conflicting range's own coordinates (unlike
+                // resolve::merge's equivalent message), since a hyperlink
+                // range doesn't get the extra debugging context a merge's
+                // visible cell layout already gives a reader for free —
+                // Copilot PR review, PR #96.
+                reason: format!(
+                    "overlaps with another hyperlink range ({}:{})",
+                    other.start.to_a1(),
+                    other.end.to_a1()
+                ),
             });
         }
     }
