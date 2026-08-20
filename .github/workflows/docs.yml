@@ -9,12 +9,14 @@ on:
     paths:
       - "docs/**/*.md"
       - "README.md"
+      - "tests/README.md"
       - ".markdownlint-cli2.jsonc"
       - ".github/workflows/docs.yml"
   pull_request:
     paths:
       - "docs/**/*.md"
       - "README.md"
+      - "tests/README.md"
       - ".markdownlint-cli2.jsonc"
       - ".github/workflows/docs.yml"
 
@@ -29,6 +31,7 @@ jobs:
           globs: |
             docs/**/*.md
             README.md
+            tests/README.md
 
   link-check:
     name: Link check
@@ -37,6 +40,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: lycheeverse/lychee-action@v2
         with:
-          args: --no-progress --verbose "docs/**/*.md" "README.md"
+          args: --no-progress --verbose "docs/**/*.md" "README.md" "tests/README.md"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
