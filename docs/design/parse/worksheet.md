@@ -74,10 +74,18 @@ pub(crate) struct WorksheetParseOutput {
 ///   [`resolve/shared_strings.rs`](../resolve/shared_strings.md) と
 ///   [`resolve/style.rs`](../resolve/style.md) はこの不変条件が守られている
 ///   前提で `Sheet::get_mut` の結果を `expect` している。
+///
+/// `date1904` は `workbook.xml` の `<workbookPr date1904="1"/>` フラグで、
+/// 本来はフェーズ4([`resolve/style.rs`](../resolve/style.md))だけの関心事
+/// だが、`t="d"` の時刻のみセル(ISO 8601の元テキストに日付部分が無い)の
+/// 仮の日付を、同じブック内の数値ベース時刻のみセルが解決する日付と
+/// 一致させるためだけにフェーズ3へも運ぶ(PR #80レビュー指摘2。詳細は
+/// `parse_iso8601_datetime` のdocコメント参照)。
 pub(crate) fn parse_worksheet(
     reader: impl BufRead,
     path: &str,
     sheet: &mut Sheet,
+    date1904: bool,
 ) -> Result<WorksheetParseOutput, Error> {
     let mut xml_reader = create_secure_reader(reader);
     let mut pending_shared_strings = Vec::new();
@@ -111,6 +119,7 @@ fn build_cell(
     style_id: Option<u32>,
     value_text: Option<&str>,
     inline_string: Option<String>,
+    date1904: bool,
 ) -> Result<Cell, Error> {
     let value = match cell_type {
         None | Some("n") => value_text.map(parse_number).transpose()?.map(CellValue::Number),
@@ -119,12 +128,52 @@ fn build_cell(
         Some("inlineStr") => inline_string.map(|s| CellValue::Text(Arc::from(s))),
         Some("b") => value_text.map(|s| s == "1").map(CellValue::Boolean),
         Some("e") => value_text.map(|s| CellValue::Error(s.to_string())),
+        // ECMA-376 Part 1のt="d"拡張(Issue #58): <v>のテキストはシリアル値
+        // ではなくISO 8601文字列そのもの。
+        Some("d") => value_text
+            .map(|s| parse_iso8601_datetime(s, date1904))
+            .transpose()?
+            .map(CellValue::DateTime),
         // 未知のt値: データを取りこぼさないよう生テキストをそのままTextとして
         // 保持するフォールバック（オープンクエスチョン3参照）。
         Some(_) => value_text.map(|s| CellValue::Text(Arc::from(s))),
     };
     let _ = (cell_ref, style_id);
     Ok(Cell { value, style: None })
+}
+
+/// `t="d"` セルの `<v>` テキストをISO 8601としてパースする(Issue #58)。
+/// 実在ファイル(`tests/fixtures/other/date_iso.xlsx`、calamineテスト
+/// コーパス由来)で確認できた3パターン——日付のみ(`2021-01-01`)、
+/// 日付+時刻(`2021-01-01T10:10:10`)、時刻のみ(`10:10:10`)——に加え、
+/// PR #80レビュー指摘1を受けて以下の仕様準拠のバリエーションも許容する:
+/// - 末尾のUTC/オフセット指定子(`Z`、`+09:00`、`-0500`)は読み捨てる。
+///   `DateTimeValue` にタイムゾーン用フィールドが無い(Excel自身の日付
+///   システム自体がタイムゾーンを持たないのと同じ)ため、オフセットに
+///   応じた変換はせず壁時計時刻をそのまま採用する
+/// - 小数秒(`10:10:10.500`)は整数秒へ切り捨てる
+/// - 秒は省略可(`10:10`)。省略時は0扱い
+///
+/// これら以外の不正な形式(セグメント数不一致・範囲外の数値等)は
+/// これまでどおりエラーとする。
+///
+/// 時刻のみの値は元テキストに日付部分が無いため、Excel自身の「日付なし
+/// 時刻」慣例(シリアル日0)へ倒す——具体的な日付は `date1904` に応じて
+/// 1899-12-30(1900年システム)/1904-01-01(1904年システム)のいずれか
+/// になる。[`resolve/style.rs`](../resolve/style.md)の `serial_to_date_time`
+/// が1未満のシリアル値をすでに同じ規約(`EPOCH_OFFSET_1900`/
+/// `EPOCH_OFFSET_1904`)でデコードしているのと整合させたもの(PR #80
+/// レビュー指摘2)。`date1904` 自体は本来フェーズ4だけの関心事だが、この
+/// 整合を取るためだけに `parse_worksheet` からフェーズ3全体を貫通させて
+/// ここまで運ばれてくる(型としては `resolve/style.rs` のプライベートな
+/// `EPOCH_OFFSET_1904` 等をフェーズ3から参照することはできない——
+/// `parse/` は `resolve/` に依存しないという architecture.md 設計方針2の
+/// 制約——ため、同じ2つの日付をこのファイル内で直接ハードコードして
+/// いる。両ファイルの記述が食い違わないよう、変更時は双方を確認する
+/// こと)。
+fn parse_iso8601_datetime(text: &str, date1904: bool) -> Result<DateTimeValue, Error> {
+    let _ = (text, date1904);
+    unimplemented!()
 }
 
 fn parse_number(text: &str) -> Result<f64, Error> {
@@ -135,8 +184,8 @@ fn parse_number(text: &str) -> Result<f64, Error> {
 
 ## 依存関係
 
-- 依存先: [`parse/mod.rs`](mod.md)（`create_secure_reader`, `convert_xml_error`, `required_attr`, `concat_rich_text`）、[`model/cell.rs`](../model/cell.md)（`Cell`, `CellRef`, `CellValue`）、[`model/sheet.rs`](../model/sheet.md)（`Sheet::insert_cell`, `MergedRegion`）、[`model/style.rs`](../model/style.md)（`StyleId`。`PendingStyle` のフィールド型として使う）、[`error.rs`](../error.md)。`resolve/` 配下のいずれのモジュールにも依存しない
-- 依存元: `pipeline.rs`（フェーズ3。シートごとに1回呼び出し、返り値を [`resolve::resolve_sheet`](../resolve/mod.md) へそのまま渡す）、[`resolve/shared_strings.rs`](../resolve/shared_strings.md)（本ファイルが定義する `PendingSharedString` を `use`）、[`resolve/style.rs`](../resolve/style.md)（同 `PendingStyle`）、[`resolve/mod.rs`](../resolve/mod.md)（`resolve_sheet` のシグネチャで両型を参照）
+- 依存先: [`parse/mod.rs`](mod.md)（`create_secure_reader`, `convert_xml_error`, `required_attr`, `concat_rich_text`）、[`model/cell.rs`](../model/cell.md)（`Cell`, `CellRef`, `CellValue`, `DateTimeValue`。`DateTimeValue` は `t="d"` 対応(Issue #58)で新規に依存した——[Issue #40](https://github.com/MinamiyamaKotaro/xlsxparser/issues/40)で導入された型を、シリアル値経由(`resolve/style.rs`)とは独立に本ファイルからも直接構築する2つ目の経路になる）、[`model/sheet.rs`](../model/sheet.md)（`Sheet::insert_cell`, `MergedRegion`）、[`model/style.rs`](../model/style.md)（`StyleId`。`PendingStyle` のフィールド型として使う）、[`error.rs`](../error.md)。`resolve/` 配下のいずれのモジュールにも依存しない
+- 依存元: `pipeline.rs`（フェーズ3。シートごとに1回呼び出し、返り値を [`resolve::resolve_sheet`](../resolve/mod.md) へそのまま渡す。`date1904`(`t="d"` 対応、Issue #58/PR #80レビュー指摘2で新規に追加した引数)は `pipeline.rs` がフェーズ1で `parse_workbook_xml` から読み取り済みの値をそのまま渡す——[pipeline.md](../pipeline.md) 側もこの呼び出しが4引数になったことを反映済み）、[`resolve/shared_strings.rs`](../resolve/shared_strings.md)（本ファイルが定義する `PendingSharedString` を `use`）、[`resolve/style.rs`](../resolve/style.md)（同 `PendingStyle`）、[`resolve/mod.rs`](../resolve/mod.md)（`resolve_sheet` のシグネチャで両型を参照）
 
 **`PendingSharedString` / `PendingStyle` を本ファイルに定義する設計の経緯**: 当初案では両型を消費側（[`resolve/shared_strings.rs`](../resolve/shared_strings.md) / [`resolve/style.rs`](../resolve/style.md)）に定義し、本ファイルがそれを逆に `use` する構造だったが、これは「パーサー層（低レイヤー）→ 解決層（高レイヤー）」という不自然な逆方向依存を生む（循環はしないが、architecture.md 設計方針2が意図する「I/O層（`container`/`parse`）とドメインロジック（`resolve`）の分離」の精神に反する）。[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を受け、両型は「フェーズ3の出力データそのもの」であるという実体に即して本ファイル（`parse/worksheet.rs`）へ定義を移設した。これにより依存の向きは次のとおり完全に一方向（DAG）となり、[`resolve/shared_strings.rs`](../resolve/shared_strings.md) が既に `parse::shared_strings::SharedStringTable` に依存していた（[resolve/mod.md 依存関係](../resolve/mod.md)）のと同じ「`resolve/` が `parse/` の構築済み構造化データに依存する」というパターンへ統一される:
 
@@ -155,6 +204,7 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 - `<c>` の `r` 属性（セル参照。例: `"B12"`）が欠落している場合は `Error::MissingRequiredElement` を返す。行内でのセル省略に基づく列位置の逐次推論（`r` 省略時に直前セルの次列とみなす、仕様上は許容される簡略記法）は行わない（オープンクエスチョン4参照）
 - `r` 属性の値が不正なA1形式（`CellRef::from_a1` が `Err` を返す）の場合はそのまま `Error::InvalidCellRef` を伝播する
 - `<v>` の数値テキストが `f64` としてパースできない場合は `Error::InvalidPackage`（暫定。より専用のバリアントを設けるかは [error.md](../error.md) 側の見直しに委ねる）とする
+- `t="d"` セルの `<v>` テキストが日付のみ・日付+時刻・時刻のみのいずれの形にも一致しない、または各数値要素の範囲が不正（月13、時24等）な場合は `Error::InvalidPackage`（上記の数値 `<v>` と同じ暫定方針。Issue #58）。小数秒・末尾のUTC/オフセット指定子・秒の省略はエラーにせず許容する（PR #80レビュー指摘1。`parse_iso8601_datetime` のdocコメント参照）
 - `<mergeCell ref="...">` の `ref` 属性値が `"A1:C3"` の形式（`:` 区切りの2座標）でない場合、または各座標が不正なA1形式の場合は `Error::InvalidCellRef` を伝播する。結合範囲としての妥当性（開始・終了の大小関係、他範囲との重複）そのものの検証は行わず、そのまま `merge_regions` へ積んで [`resolve/merge.rs`](../resolve/merge.md) の検証に委ねる
 - `<col>` の `width`/`defaultColWidth` が `f64` として、または `min`/`max` が `u32` としてパースできない場合は `Error::InvalidPackage`（上記の数値 `<v>` と同じ暫定方針）を返す。範囲としての妥当性（重複・件数）そのものの検証は行わず、[`resolve/column_width.rs`](../resolve/column_width.md) に委ねる(`<mergeCells>` と同じ分担)
 - `<f>`（数式）要素の内容はパース・保存せず読み飛ばす（要求仕様書のスコープ外。オープンクエスチョン2参照）
@@ -176,6 +226,9 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 - `<sheetFormatPr defaultColWidth="..">` が収集されること、および欠落時に `default_col_width: None` のままであることの確認
 - `<col>`/`<sheetFormatPr>` の不正な数値属性に対し `Error::InvalidPackage` を返すことの確認
 - `<f>` 要素を含むセル（数式セル）について、`<f>` の内容が無視され `<v>`（計算済みキャッシュ値）のみが `Cell` の値として採用されることの確認
+- `t="d"` セルについて、日付のみ・日付+時刻・時刻のみの3パターンそれぞれが正しい `CellValue::DateTime` として解決されることの確認（時刻のみの場合、日付部分がExcelの規約どおり1899-12-30になることを含む）。不正な形式（範囲外の数値、セグメント数不一致）に対し `Error::InvalidPackage` を返すことの確認(Issue #58。実例として `tests/fixtures/other/date_iso.xlsx` ——calamineテストコーパス由来——で3パターンとも確認済みだが、同ディレクトリは`.gitignore`対象のため、統合テスト自体は同じ3パターンを再現した手書きフィクスチャを用いる)
+- 末尾の `Z`/`+09:00` 等のUTC・オフセット指定子が読み捨てられること、小数秒(`10:10:10.500`)が整数秒へ切り捨てられること、秒省略(`10:10`)が0扱いになることの確認（PR #80レビュー指摘1）
+- `date1904 = true` のブックで時刻のみの `t="d"` セルを解決した場合、仮の日付が1899-12-30ではなく1904-01-01になることの確認（PR #80レビュー指摘2。`resolve/style.rs` の数値ベース時刻のみセルとの整合性の回帰テスト）
 
 ## 実装メモ
 
@@ -189,6 +242,6 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 1. ~~`PendingSharedString` / `PendingStyle` の配置場所の再検討~~ → **解決**: 両型の定義を本ファイル（`parse/worksheet.rs`）へ移設し、[`resolve/shared_strings.rs`](../resolve/shared_strings.md) / [`resolve/style.rs`](../resolve/style.md) 側がそれぞれを `use` する構造とした（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を反映）。詳細は依存関係セクション参照。
 2. **数式（`<f>` 要素）の扱い**: 現状は内容を一切パース・保存せず読み飛ばす方針（`<v>` の計算済みキャッシュ値のみを採用）を仮定している。数式文字列そのものをJSON出力に含める要求が将来生じた場合、`Cell` に `formula: Option<String>` を追加するか等は要求仕様書の詳細化と合わせて確定させる。
 3. **未知の `t` 属性値へのフォールバック方針**: 現状は生の `<v>` テキストをそのまま `CellValue::Text` として保持するフォールバックとしているが、[parse/workbook.md](workbook.md) の `state` 属性フォールバックと同様の考え方（データを失わない側へ倒す）である一方、明確な `Error` とすべきという意見もありうる。
-4. **`r` 属性省略セルの列位置逐次推論**: OOXMLの仕様上、`<c>` の `r` 属性は省略可能で、省略時は直前セルからの列位置の逐次推論が許容されている。本設計は現状これに対応せず `Error::MissingRequiredElement` とする簡略化を採用しているが、[model/sheet.md](../model/sheet.md) が既に述べる「サードパーティ製ツールが生成した `.xlsx` は仕様の緩い部分に依存しうる」という懸念を踏まえると、実際に `r` を省略する生成ツールが存在する場合は対応が必要になる。
+4. **`r` 属性省略セルの列位置逐次推論**: OOXMLの仕様上、`<c>` の `r` 属性は省略可能で、省略時は直前セルからの列位置の逐次推論が許容されている。本設計は現状これに対応せず `Error::MissingRequiredElement` とする簡略化を採用しているが、[model/sheet.md](../model/sheet.md) が既に述べる「サードパーティ製ツールが生成した `.xlsx` は仕様の緩い部分に依存しうる」という懸念を踏まえると、実際に `r` を省略する生成ツールが存在する場合は対応が必要になる。**実例を確認済み**: Issue #55の調査で使用した `tests/fixtures/other/minimal_package.xlsx`（calamineテストコーパス由来）の `sheetData` は `<c s="2" t="inlineStr">` のように `r` 属性を省略した `<c>` 要素を多数含んでおり、この懸念が既に現実のファイルで顕在化していることが確認できた。ただし本ファイルの対応はIssue #55（OPCルートリレーションシップ解決）のスコープ外であり、Issue [#79](https://github.com/MinamiyamaKotaro/xlsxparser/issues/79)として別途切り出した。本オープンクエスチョン自体は#79が解決するまで未解決のまま残る。
 5. **`Reader` の内部バッファサイズ・パフォーマンスチューニング**: [parse/mod.md オープンクエスチョン5](mod.md) と同一の論点。要求仕様書が想定する「方眼紙Excel」規模のシートに対する実測プロファイリングを踏まえて確定させる。
 6. ~~名前空間の扱い~~ → **解決**: [parse/mod.md オープンクエスチョン4](mod.md) で確定した「`quick_xml::NsReader` は採用せず文字列前方一致で簡略化する」方針に従う。`worksheet.xml` 自体の要素・属性（`row`, `c`, `v`, `is`, `t`, `s`, `r`, `mergeCells`, `mergeCell`, `ref`）に接頭辞は付かないため、本ファイルへの直接的な影響はない。

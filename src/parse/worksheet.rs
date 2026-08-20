@@ -7,7 +7,9 @@
 //! (shared strings, styles, merged ranges).
 
 use crate::error::Error;
-use crate::model::{Cell, CellRef, CellValue, ColWidthRange, MergedRegion, Sheet, StyleId};
+use crate::model::{
+    Cell, CellRef, CellValue, ColWidthRange, DateTimeValue, MergedRegion, Sheet, StyleId,
+};
 use crate::parse::{
     concat_rich_text, create_secure_reader, optional_attr, read_event, read_leaf_text,
     required_attr,
@@ -70,10 +72,18 @@ pub(crate) struct WorksheetParseOutput {
 /// `<c>`'s start tag is seen and fully consumed (inserted or discarded) by
 /// the time its end tag is processed, so no state survives from one cell —
 /// or one row — into the next.
+///
+/// `date1904` is `workbook.xml`'s `<workbookPr date1904="1"/>` flag,
+/// otherwise a purely Phase 4 (`resolve/style.rs`) concern — it reaches
+/// Phase 3 solely so a `t="d"` time-only cell's placeholder date (no date
+/// component exists in the ISO 8601 source text) can agree with what a
+/// numeric time-only cell in the same book would resolve to. See
+/// `parse_iso8601_datetime`'s doc comment (PR #80 review discussion).
 pub(crate) fn parse_worksheet(
     reader: impl BufRead,
     path: &str,
     sheet: &mut Sheet,
+    date1904: bool,
 ) -> Result<WorksheetParseOutput, Error> {
     let mut xml_reader = create_secure_reader(reader);
     let mut buf = Vec::new();
@@ -113,6 +123,7 @@ pub(crate) fn parse_worksheet(
                         style_id,
                         None,
                         None,
+                        date1904,
                     )?;
                 } else {
                     cur_ref = Some(cell_ref);
@@ -145,6 +156,7 @@ pub(crate) fn parse_worksheet(
                         cur_style.take(),
                         cur_value_text.take(),
                         cur_inline.take(),
+                        date1904,
                     )?;
                 }
             }
@@ -215,6 +227,7 @@ fn flush_cell(
     style_id: Option<u32>,
     value_text: Option<String>,
     inline_string: Option<String>,
+    date1904: bool,
 ) -> Result<(), Error> {
     let is_shared_string = cell_type.as_deref() == Some("s");
     let has_value = value_text.is_some() || inline_string.is_some();
@@ -228,6 +241,7 @@ fn flush_cell(
         value_text.as_deref(),
         inline_string,
         path,
+        date1904,
     )?;
     sheet.insert_cell(cell_ref, cell);
 
@@ -256,6 +270,7 @@ fn build_cell(
     value_text: Option<&str>,
     inline_string: Option<String>,
     path: &str,
+    date1904: bool,
 ) -> Result<Cell, Error> {
     let value = match cell_type {
         None | Some("n") => value_text
@@ -267,6 +282,12 @@ fn build_cell(
         Some("inlineStr") => inline_string.map(|s| CellValue::Text(Arc::from(s))),
         Some("b") => value_text.map(|s| CellValue::Boolean(s == "1")),
         Some("e") => value_text.map(|s| CellValue::Error(s.to_string())),
+        // ECMA-376 Part 1's `t="d"` extension (Issue #58): the `<v>` text is
+        // an ISO 8601 string rather than a serial number.
+        Some("d") => value_text
+            .map(|s| parse_iso8601_datetime(s, path, date1904))
+            .transpose()?
+            .map(CellValue::DateTime),
         // Unknown `t` value: falls back to keeping the raw text as Text
         // rather than dropping data.
         Some(_) => value_text.map(|s| CellValue::Text(Arc::from(s))),
@@ -278,6 +299,102 @@ fn parse_number(text: &str, path: &str) -> Result<f64, Error> {
     text.trim().parse::<f64>().map_err(|_| {
         Error::InvalidPackage(format!("invalid numeric cell value {text:?} in {path}"))
     })
+}
+
+/// Parses a `t="d"` cell's `<v>` text as ISO 8601 (Issue #58). Handles the
+/// three shapes real files use: date-only (`2021-01-01`), date+time
+/// (`2021-01-01T10:10:10`), and time-only (`10:10:10`), plus the following
+/// tolerances a spec-compliant (if less common) writer may still emit (PR
+/// #80 review):
+/// - a trailing UTC/offset designator (`Z`, `+09:00`, `-0500`) is dropped —
+///   `DateTimeValue` has no timezone field (mirroring Excel's own date
+///   system, which isn't timezone-aware either), so the wall-clock value is
+///   kept as-is rather than converted
+/// - fractional seconds (`10:10:10.500`) are truncated to whole seconds
+/// - seconds may be omitted entirely (`10:10`), defaulting to `:00`
+///
+/// A time-only value has no date component in the source, so it lands on
+/// Excel's own "time of day" convention: serial day 0, which is 1899-12-30
+/// under the default 1900 date system or 1904-01-01 under `date1904` —
+/// matching how `resolve/style.rs::serial_to_date_time` already decodes a
+/// fractional serial < 1 for numeric (non-ISO) cells in the same book. This
+/// is the reason this otherwise Phase-4-flavored flag reaches Phase 3 at
+/// all (see `parse_worksheet`'s doc comment).
+fn parse_iso8601_datetime(text: &str, path: &str, date1904: bool) -> Result<DateTimeValue, Error> {
+    let (date_part, time_part) = match text.split_once('T') {
+        Some((d, t)) => (Some(d), Some(t)),
+        None if text.contains(':') => (None, Some(text)),
+        None => (Some(text), None),
+    };
+
+    let (year, month, day) = match date_part {
+        Some(d) => {
+            let segments: Vec<&str> = d.split('-').collect();
+            let (y, mo, da) = match segments[..] {
+                [y, mo, da] => (y, mo, da),
+                _ => return Err(invalid_iso8601(text, path)),
+            };
+            let year = y.parse::<i32>().map_err(|_| invalid_iso8601(text, path))?;
+            let month = mo.parse::<u8>().map_err(|_| invalid_iso8601(text, path))?;
+            let day = da.parse::<u8>().map_err(|_| invalid_iso8601(text, path))?;
+            (year, month, day)
+        }
+        // Excel's own "time of day with no date" convention: serial day 0,
+        // whose calendar date itself depends on date1904 (matching
+        // resolve/style.rs's EPOCH_OFFSET_1900/EPOCH_OFFSET_1904).
+        None if date1904 => (1904, 1, 1),
+        None => (1899, 12, 30),
+    };
+
+    let (hour, minute, second) = match time_part {
+        Some(t) => {
+            // Drop a trailing timezone designator before splitting on ':'
+            // (see doc comment above) — restricted to this substring so a
+            // date-only value's '-' separators are never mistaken for a
+            // '-HH:MM' offset.
+            let t = t.strip_suffix('Z').unwrap_or(t);
+            let t = match t.rfind(['+', '-']) {
+                Some(idx) if idx > 0 => &t[..idx],
+                _ => t,
+            };
+            let segments: Vec<&str> = t.split(':').collect();
+            let (h, mi, se) = match segments[..] {
+                [h, mi, se] => (h, mi, se),
+                [h, mi] => (h, mi, "0"),
+                _ => return Err(invalid_iso8601(text, path)),
+            };
+            // Fractional seconds (e.g. "10.500") are truncated to whole
+            // seconds rather than rejected.
+            let se = se.split('.').next().unwrap_or(se);
+            let hour = h.parse::<u8>().map_err(|_| invalid_iso8601(text, path))?;
+            let minute = mi.parse::<u8>().map_err(|_| invalid_iso8601(text, path))?;
+            let second = se.parse::<u8>().map_err(|_| invalid_iso8601(text, path))?;
+            (hour, minute, second)
+        }
+        None => (0, 0, 0),
+    };
+
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return Err(invalid_iso8601(text, path));
+    }
+
+    Ok(DateTimeValue {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+    })
+}
+
+fn invalid_iso8601(text: &str, path: &str) -> Error {
+    Error::InvalidPackage(format!("invalid ISO 8601 cell value {text:?} in {path}"))
 }
 
 /// Parses a `<mergeCell ref="A1:C3"/>` reference into a `MergedRegion`. Only
@@ -301,7 +418,7 @@ mod tests {
 
     fn parse(xml: &[u8]) -> (Sheet, WorksheetParseOutput) {
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        let output = parse_worksheet(xml, "xl/worksheets/sheet1.xml", &mut sheet).unwrap();
+        let output = parse_worksheet(xml, "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap();
         (sheet, output)
     }
 
@@ -345,6 +462,181 @@ mod tests {
         assert_eq!(output.pending_shared_strings.len(), 1);
         assert_eq!(output.pending_shared_strings[0].cell_ref, cell_ref);
         assert_eq!(output.pending_shared_strings[0].index, 5);
+    }
+
+    #[test]
+    fn t_d_cell_resolves_all_three_iso8601_shapes() {
+        let xml = br#"<worksheet><sheetData><row r="1">
+<c r="A1" t="d"><v>2021-01-01</v></c>
+<c r="B1" t="d"><v>2021-01-01T10:10:10</v></c>
+<c r="C1" t="d"><v>10:10:10</v></c>
+</row></sheetData></worksheet>"#;
+        let (sheet, _output) = parse(xml);
+
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
+            Some(CellValue::DateTime(DateTimeValue {
+                year: 2021,
+                month: 1,
+                day: 1,
+                hour: 0,
+                minute: 0,
+                second: 0,
+            }))
+        );
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 2 }).unwrap().value,
+            Some(CellValue::DateTime(DateTimeValue {
+                year: 2021,
+                month: 1,
+                day: 1,
+                hour: 10,
+                minute: 10,
+                second: 10,
+            }))
+        );
+        // Time-only: no date component in the source, so it lands on
+        // Excel's "time of day" convention (serial day 0 = 1899-12-30).
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 3 }).unwrap().value,
+            Some(CellValue::DateTime(DateTimeValue {
+                year: 1899,
+                month: 12,
+                day: 30,
+                hour: 10,
+                minute: 10,
+                second: 10,
+            }))
+        );
+    }
+
+    #[test]
+    fn t_d_cell_with_utc_suffix_drops_the_z() {
+        // PR #80 review point 1: a trailing `Z` is a spec-valid UTC
+        // designator, not something ECMA-376 writers are barred from
+        // emitting. Dropped rather than rejected, since DateTimeValue has
+        // no timezone field to convert it into.
+        let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>2021-01-01T10:10:10Z</v></c></row></sheetData></worksheet>"#;
+        let (sheet, _output) = parse(xml);
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
+            Some(CellValue::DateTime(DateTimeValue {
+                year: 2021,
+                month: 1,
+                day: 1,
+                hour: 10,
+                minute: 10,
+                second: 10,
+            }))
+        );
+    }
+
+    #[test]
+    fn t_d_cell_with_offset_suffix_drops_the_offset() {
+        let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>2021-01-01T10:10:10+09:00</v></c></row></sheetData></worksheet>"#;
+        let (sheet, _output) = parse(xml);
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
+            Some(CellValue::DateTime(DateTimeValue {
+                year: 2021,
+                month: 1,
+                day: 1,
+                hour: 10,
+                minute: 10,
+                second: 10,
+            }))
+        );
+    }
+
+    #[test]
+    fn t_d_cell_with_fractional_seconds_truncates_to_whole_seconds() {
+        let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>2021-01-01T10:10:10.500</v></c></row></sheetData></worksheet>"#;
+        let (sheet, _output) = parse(xml);
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
+            Some(CellValue::DateTime(DateTimeValue {
+                year: 2021,
+                month: 1,
+                day: 1,
+                hour: 10,
+                minute: 10,
+                second: 10,
+            }))
+        );
+    }
+
+    #[test]
+    fn t_d_cell_with_omitted_seconds_defaults_to_zero() {
+        let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>10:10</v></c></row></sheetData></worksheet>"#;
+        let (sheet, _output) = parse(xml);
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
+            Some(CellValue::DateTime(DateTimeValue {
+                year: 1899,
+                month: 12,
+                day: 30,
+                hour: 10,
+                minute: 10,
+                second: 0,
+            }))
+        );
+    }
+
+    #[test]
+    fn t_d_cell_time_only_default_date_follows_date1904() {
+        // PR #80 review point 2: a time-only ISO date cell's placeholder
+        // date must agree with what a numeric time-only cell in the same
+        // book would resolve to (resolve/style.rs's EPOCH_OFFSET_1904).
+        let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>10:10:10</v></c></row></sheetData></worksheet>"#;
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, true).unwrap();
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
+            Some(CellValue::DateTime(DateTimeValue {
+                year: 1904,
+                month: 1,
+                day: 1,
+                hour: 10,
+                minute: 10,
+                second: 10,
+            }))
+        );
+    }
+
+    #[test]
+    fn t_d_cell_with_wrong_date_segment_count_is_an_error() {
+        let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>2021-01</v></c></row></sheetData></worksheet>"#;
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err =
+            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
+    }
+
+    #[test]
+    fn t_d_cell_with_wrong_time_segment_count_is_an_error() {
+        let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>10:10:10:10</v></c></row></sheetData></worksheet>"#;
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err =
+            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
+    }
+
+    #[test]
+    fn t_d_cell_with_out_of_range_component_is_an_error() {
+        let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>2021-13-01</v></c></row></sheetData></worksheet>"#;
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err =
+            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
+    }
+
+    #[test]
+    fn t_d_cell_with_malformed_time_is_an_error() {
+        let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>25:00:00</v></c></row></sheetData></worksheet>"#;
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err =
+            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
     }
 
     #[test]
@@ -516,7 +808,8 @@ mod tests {
     fn malformed_col_width_is_invalid_package() {
         let xml = br#"<worksheet><cols><col min="1" max="1" width="not-a-number"/></cols><sheetData></sheetData></worksheet>"#;
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        let err = parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet).unwrap_err();
+        let err =
+            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
         assert!(matches!(err, Error::InvalidPackage(_)));
     }
 
@@ -524,7 +817,8 @@ mod tests {
     fn cell_missing_r_is_an_error() {
         let xml = br#"<worksheet><sheetData><row r="1"><c t="n"><v>1</v></c></row></sheetData></worksheet>"#;
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        let err = parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet).unwrap_err();
+        let err =
+            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
         assert!(matches!(
             err,
             Error::MissingRequiredElement { name: "r", .. }
@@ -535,7 +829,8 @@ mod tests {
     fn malformed_cell_ref_is_invalid_cell_ref() {
         let xml = br#"<worksheet><sheetData><row r="1"><c r="1A"><v>1</v></c></row></sheetData></worksheet>"#;
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        let err = parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet).unwrap_err();
+        let err =
+            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
         assert!(matches!(err, Error::InvalidCellRef(_)));
     }
 
@@ -545,7 +840,8 @@ mod tests {
 <mergeCells><mergeCell ref="notarange"/></mergeCells>
 </worksheet>"#;
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        let err = parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet).unwrap_err();
+        let err =
+            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
         assert!(matches!(err, Error::InvalidCellRef(_)));
     }
 

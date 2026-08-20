@@ -78,10 +78,18 @@ pub(crate) struct WorksheetParseOutput {
 ///   [`resolve/shared_strings.rs`](../resolve/shared_strings.en.md) and
 ///   [`resolve/style.rs`](../resolve/style.en.md) both `expect()` the result
 ///   of `Sheet::get_mut` on the assumption that this invariant holds.
+///
+/// `date1904` is `workbook.xml`'s `<workbookPr date1904="1"/>` flag,
+/// otherwise a purely Phase 4 ([`resolve/style.rs`](../resolve/style.en.md))
+/// concern — it reaches Phase 3 solely so a `t="d"` time-only cell's
+/// placeholder date (no date component exists in the ISO 8601 source text)
+/// can agree with what a numeric time-only cell in the same book resolves
+/// to (PR #80 review point 2; see `parse_iso8601_datetime`'s doc comment).
 pub(crate) fn parse_worksheet(
     reader: impl BufRead,
     path: &str,
     sheet: &mut Sheet,
+    date1904: bool,
 ) -> Result<WorksheetParseOutput, Error> {
     let mut xml_reader = create_secure_reader(reader);
     let mut pending_shared_strings = Vec::new();
@@ -115,6 +123,7 @@ fn build_cell(
     style_id: Option<u32>,
     value_text: Option<&str>,
     inline_string: Option<String>,
+    date1904: bool,
 ) -> Result<Cell, Error> {
     let value = match cell_type {
         None | Some("n") => value_text.map(parse_number).transpose()?.map(CellValue::Number),
@@ -123,6 +132,12 @@ fn build_cell(
         Some("inlineStr") => inline_string.map(|s| CellValue::Text(Arc::from(s))),
         Some("b") => value_text.map(|s| s == "1").map(CellValue::Boolean),
         Some("e") => value_text.map(|s| CellValue::Error(s.to_string())),
+        // ECMA-376 Part 1's t="d" extension (Issue #58): <v>'s text is an
+        // ISO 8601 string rather than a serial number.
+        Some("d") => value_text
+            .map(|s| parse_iso8601_datetime(s, date1904))
+            .transpose()?
+            .map(CellValue::DateTime),
         // Unknown `t` value: falls back to keeping the raw text as Text
         // rather than dropping data — see Open Question 3.
         Some(_) => value_text.map(|s| CellValue::Text(Arc::from(s))),
@@ -135,12 +150,47 @@ fn parse_number(text: &str) -> Result<f64, Error> {
     let _ = text;
     unimplemented!()
 }
+
+/// Parses a `t="d"` cell's `<v>` text as ISO 8601 (Issue #58). Handles the
+/// three shapes observed in a real file
+/// (`tests/fixtures/other/date_iso.xlsx`, from calamine's test corpus) —
+/// date-only (`2021-01-01`), date+time (`2021-01-01T10:10:10`), and
+/// time-only (`10:10:10`) — plus the following spec-valid variations a
+/// writer other than the one that produced that fixture might still emit
+/// (PR #80 review point 1):
+/// - a trailing UTC/offset designator (`Z`, `+09:00`, `-0500`) is dropped —
+///   `DateTimeValue` has no timezone field (mirroring Excel's own date
+///   system, which isn't timezone-aware either), so the wall-clock value is
+///   kept as-is rather than converted
+/// - fractional seconds (`10:10:10.500`) are truncated to whole seconds
+/// - seconds may be omitted entirely (`10:10`), defaulting to `:00`
+///
+/// Anything else malformed (wrong segment count, an out-of-range number)
+/// still errors, as before.
+///
+/// A time-only value has no date component in the source text, so it lands
+/// on Excel's own "time of day with no date" convention: serial day 0,
+/// which is 1899-12-30 under the default 1900 date system or 1904-01-01
+/// under `date1904` — matching how
+/// [`resolve/style.rs`](../resolve/style.en.md)'s `serial_to_date_time`
+/// already decodes a fractional serial < 1 for numeric (non-ISO) cells in
+/// the same book (PR #80 review point 2). This is the reason this
+/// otherwise Phase-4-flavored flag reaches Phase 3 at all (see
+/// `parse_worksheet`'s doc comment). Phase 3 cannot reference
+/// `resolve/style.rs`'s private `EPOCH_OFFSET_1900`/`EPOCH_OFFSET_1904`
+/// constants directly (architecture.md design policy 2: `parse/` never
+/// depends on `resolve/`), so the same two placeholder dates are
+/// hardcoded again here — check both files when either changes.
+fn parse_iso8601_datetime(text: &str, date1904: bool) -> Result<DateTimeValue, Error> {
+    let _ = (text, date1904);
+    unimplemented!()
+}
 ```
 
 ## Dependencies
 
-- Depends on: [`parse/mod.rs`](mod.en.md) (`create_secure_reader`, `convert_xml_error`, `required_attr`, `concat_rich_text`), [`model/cell.rs`](../model/cell.en.md) (`Cell`, `CellRef`, `CellValue`), [`model/sheet.rs`](../model/sheet.en.md) (`Sheet::insert_cell`, `MergedRegion`), [`model/style.rs`](../model/style.en.md) (`StyleId`, used as `PendingStyle`'s field type), [`error.rs`](../error.en.md). Depends on no module under `resolve/`
-- Depended on by: `pipeline.rs` (Phase 3 — called once per sheet, passing the return value straight through to [`resolve::resolve_sheet`](../resolve/mod.en.md)), [`resolve/shared_strings.rs`](../resolve/shared_strings.en.md) (`use`s this file's `PendingSharedString`), [`resolve/style.rs`](../resolve/style.en.md) (same, `PendingStyle`), [`resolve/mod.rs`](../resolve/mod.en.md) (references both types in `resolve_sheet`'s signature)
+- Depends on: [`parse/mod.rs`](mod.en.md) (`create_secure_reader`, `convert_xml_error`, `required_attr`, `concat_rich_text`), [`model/cell.rs`](../model/cell.en.md) (`Cell`, `CellRef`, `CellValue`, `DateTimeValue`. `DateTimeValue` is a new dependency added for `t="d"` support (Issue #58) — a second construction path for the type [Issue #40](https://github.com/MinamiyamaKotaro/xlsxparser/issues/40) introduced, independent of the serial-value path (`resolve/style.rs`)), [`model/sheet.rs`](../model/sheet.en.md) (`Sheet::insert_cell`, `MergedRegion`), [`model/style.rs`](../model/style.en.md) (`StyleId`, used as `PendingStyle`'s field type), [`error.rs`](../error.en.md). Depends on no module under `resolve/`
+- Depended on by: `pipeline.rs` (Phase 3 — called once per sheet, passing the return value straight through to [`resolve::resolve_sheet`](../resolve/mod.en.md). `date1904` — a new argument added for `t="d"` support, Issue #58 / PR #80 review point 2 — is the same value `pipeline.rs` already read in Phase 1 from `parse_workbook_xml`, passed straight through; [pipeline.md](../pipeline.en.md) reflects this call now taking 4 arguments), [`resolve/shared_strings.rs`](../resolve/shared_strings.en.md) (`use`s this file's `PendingSharedString`), [`resolve/style.rs`](../resolve/style.en.md) (same, `PendingStyle`), [`resolve/mod.rs`](../resolve/mod.en.md) (references both types in `resolve_sheet`'s signature)
 
 **Why `PendingSharedString` / `PendingStyle` are defined here**: the original draft defined both types on the consumer side ([`resolve/shared_strings.rs`](../resolve/shared_strings.en.md) / [`resolve/style.rs`](../resolve/style.en.md)), with this file `use`-ing them in reverse — an unnatural "parser layer (lower) → resolve layer (higher)" dependency (acyclic, but against the spirit of architecture.md design policy 2, separating the I/O layer (`container`/`parse`) from domain logic (`resolve`)). Per the [PR #9 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204), both types were relocated to this file (`parse/worksheet.rs`), matching what they actually are: Phase 3's own output data. This makes the dependency direction fully one-directional (a DAG), unifying it with the pattern [`resolve/shared_strings.rs`](../resolve/shared_strings.en.md) already established by depending on `parse::shared_strings::SharedStringTable` (per [resolve/mod.md Dependencies](../resolve/mod.en.md)) — "`resolve/` depends on already-built structured data from `parse/`":
 
@@ -159,6 +209,7 @@ The structure now fully matches the spirit of architecture.md design policy 2: n
 - A `<c>` missing its `r` attribute (the cell reference, e.g. `"B12"`) returns `Error::MissingRequiredElement`. This design does not perform sequential column-position inference for cells omitted within a row (the schema technically permits inferring the next column from the previous cell when `r` is absent) — see Open Question 4
 - If `r`'s value is not well-formed A1 notation (`CellRef::from_a1` returns `Err`), that `Error::InvalidCellRef` propagates unchanged
 - If `<v>`'s numeric text cannot be parsed as `f64`, this returns `Error::InvalidPackage` (provisional; whether a more specific variant is warranted is left to a future revision of [error.md](../error.en.md))
+- If a `t="d"` cell's `<v>` text doesn't match any of the date-only / date+time / time-only shapes, or has an out-of-range numeric component (month 13, hour 24, etc.), returns `Error::InvalidPackage` (same provisional convention as the numeric `<v>` case above. Issue #58). Fractional seconds, a trailing UTC/offset designator, and an omitted seconds field are all tolerated rather than rejected (PR #80 review point 1 — see `parse_iso8601_datetime`'s doc comment)
 - If a `<mergeCell ref="...">`'s `ref` value is not in the `"A1:C3"` shape (two `:`-separated coordinates), or either coordinate is not well-formed A1 notation, `Error::InvalidCellRef` propagates. This file does not validate the range's soundness itself (start/end ordering, overlap with other ranges) — it simply appends to `merge_regions` and leaves validation to [`resolve/merge.rs`](../resolve/merge.en.md)
 - If a `<col>`'s `width`/`defaultColWidth` cannot be parsed as `f64`, or its `min`/`max` cannot be parsed as `u32`, returns `Error::InvalidPackage` (same provisional convention as the numeric `<v>` case above). This file does not validate range soundness (overlap, count) — that is [`resolve/column_width.rs`](../resolve/column_width.en.md)'s responsibility, same division of labor as `<mergeCells>`
 - `<f>` (formula) element content is neither parsed nor retained — it is skipped (outside the requirements' scope; see Open Question 2)
@@ -177,6 +228,9 @@ The structure now fully matches the spirit of architecture.md design policy 2: n
 - Verify that a `<c>` missing `r` returns `Error::MissingRequiredElement`
 - Verify that a malformed A1-notation `r` attribute or `mergeCell ref` attribute returns `Error::InvalidCellRef`
 - Verify that for a cell containing an `<f>` element (a formula cell), the `<f>` content is ignored and only `<v>` (the cached computed value) is used as the `Cell`'s value
+- Verify that `t="d"` cells resolve to the correct `CellValue::DateTime` for all three shapes — date-only, date+time, and time-only (including that the date component for a time-only value comes out as Excel's convention, 1899-12-30) — and that a malformed shape (wrong segment count, an out-of-range number) returns `Error::InvalidPackage` (Issue #58; all three shapes were confirmed against the real-world `tests/fixtures/other/date_iso.xlsx`, from calamine's test corpus, but that directory is `.gitignore`d and not part of this repo, so the integration test itself reproduces the same three shapes via a hand-authored fixture)
+- Verify that a trailing `Z`/`+09:00`-style UTC or offset designator is dropped, that fractional seconds (`10:10:10.500`) are truncated to whole seconds, and that an omitted seconds field (`10:10`) defaults to `:00` (PR #80 review point 1)
+- Verify that resolving a time-only `t="d"` cell in a `date1904 = true` book lands on the placeholder date 1904-01-01 rather than 1899-12-30 (PR #80 review point 2 — a regression test for consistency with `resolve/style.rs`'s numeric time-only cell handling)
 - Verify that `<cols>` entries with a `width` attribute are collected into `ColWidthRange`s with correct `min`/`max`/`width`, that a `<col>` without `width` is skipped, and that a single `<col min="1" max="16384" .../>` (the realistic worst case) is collected as exactly one range rather than expanded
 - Verify that `<sheetFormatPr defaultColWidth="..">` is collected, and that its absence leaves `default_col_width: None`
 - Verify that a malformed `<col>`/`<sheetFormatPr>` numeric attribute returns `Error::InvalidPackage`
@@ -193,6 +247,6 @@ The structure now fully matches the spirit of architecture.md design policy 2: n
 1. ~~Reconsidering where `PendingSharedString` / `PendingStyle` live~~ → **Resolved**: both types' definitions were relocated to this file (`parse/worksheet.rs`), with [`resolve/shared_strings.rs`](../resolve/shared_strings.en.md) / [`resolve/style.rs`](../resolve/style.en.md) each `use`-ing them (reflects the [PR #9 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)). See Dependencies for details.
 2. **Handling formulas (`<f>` elements)**: currently assumes their content is never parsed or retained at all (only `<v>`'s cached computed value is used). If a future requirement needs the formula text itself in the JSON output, whether to add `formula: Option<String>` to `Cell` or otherwise is to be settled together with a more detailed requirements pass.
 3. **Fallback policy for an unrecognized `t` attribute value**: currently falls back to keeping the raw `<v>` text as `CellValue::Text` as-is. This follows the same philosophy as [parse/workbook.md](workbook.en.md)'s `state`-attribute fallback (err on the side of not losing data), but there is a case for treating it as a hard `Error` instead.
-4. **Sequential column-position inference for cells omitting `r`**: per the OOXML spec, a `<c>`'s `r` attribute is optional, and when absent, sequential inference of column position from the preceding cell is permitted. This design currently does not support that, adopting the simplification of returning `Error::MissingRequiredElement` instead. Given [model/sheet.md](../model/sheet.en.md)'s already-noted concern that "`.xlsx` files generated by third-party tools may rely on looser parts of the spec," support may become necessary if a generator that actually omits `r` is encountered in practice.
+4. **Sequential column-position inference for cells omitting `r`**: per the OOXML spec, a `<c>`'s `r` attribute is optional, and when absent, sequential inference of column position from the preceding cell is permitted. This design currently does not support that, adopting the simplification of returning `Error::MissingRequiredElement` instead. Given [model/sheet.md](../model/sheet.en.md)'s already-noted concern that "`.xlsx` files generated by third-party tools may rely on looser parts of the spec," support may become necessary if a generator that actually omits `r` is encountered in practice. **Confirmed in the wild**: `tests/fixtures/other/minimal_package.xlsx` (from calamine's test corpus, used while investigating Issue #55) has a `sheetData` full of `<c>` elements missing `r` (e.g. `<c s="2" t="inlineStr">`), confirming this concern is already live against a real file. Fixing it, however, is out of scope for Issue #55 (OPC root-relationship resolution) — tracked separately as Issue [#79](https://github.com/MinamiyamaKotaro/xlsxparser/issues/79) — and this open question itself remains unresolved.
 5. **`Reader` internal buffer size / performance tuning**: same topic as [parse/mod.md Open Question 5](mod.en.md). To be settled based on measured profiling against the "grid-paper Excel" sheet sizes the requirements target.
 6. ~~Namespace handling~~ → **Resolved**: follows the policy [parse/mod.md Open Question 4](mod.en.md) settled on — plain string-prefix matching, no `quick_xml::NsReader`. `worksheet.xml`'s own elements and attributes (`row`, `c`, `v`, `is`, `t`, `s`, `r`, `mergeCells`, `mergeCell`, `ref`) carry no prefix, so this file sees no direct impact.
