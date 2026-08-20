@@ -102,13 +102,50 @@ pub(crate) fn parse_worksheet(
     let mut cur_value_text: Option<String> = None;
     let mut cur_inline: Option<String> = None;
 
+    // Row/column position inference for `<row>`/`<c>` elements that omit
+    // their optional `r` attribute (Issue #79 — ECMA-376 Part 1 §18.3.1.4/
+    // §18.3.1.73 both mark `r` `use="optional"`, with the omitted position
+    // inferred from context: a `<row>` without `r` is the row right after
+    // the previous one, a `<c>` without `r` is the column right after the
+    // previous cell in the same row). `cur_row == 0` doubles as "no `<row>`
+    // seen yet".
+    let mut cur_row: u32 = 0;
+    let mut cur_col: u32 = 0;
+
     loop {
         let event = read_event(&mut xml_reader, &mut buf, path)?;
         match &event {
+            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"row" => {
+                cur_row = match optional_attr(e, path, "r")? {
+                    Some(r) => parse_row_r_attr(&r, path)?,
+                    None => cur_row + 1,
+                };
+                if cur_row == 0 || cur_row > CellRef::MAX_ROW {
+                    return Err(Error::InvalidCellRef(format!("row {cur_row} in {path}")));
+                }
+                cur_col = 0;
+            }
             Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"c" => {
                 let is_empty = matches!(&event, Event::Empty(_));
-                let r = required_attr(e, path, "r")?;
-                let cell_ref = CellRef::from_a1(&r)?;
+                let cell_ref = match optional_attr(e, path, "r")? {
+                    Some(r) => {
+                        let cell_ref = CellRef::from_a1(&r)?;
+                        cur_col = cell_ref.col;
+                        cell_ref
+                    }
+                    None => {
+                        cur_col += 1;
+                        if cur_row == 0 || cur_col > CellRef::MAX_COL {
+                            return Err(Error::InvalidCellRef(format!(
+                                "row {cur_row}, col {cur_col} in {path}"
+                            )));
+                        }
+                        CellRef {
+                            row: cur_row,
+                            col: cur_col,
+                        }
+                    }
+                };
                 let cell_type = optional_attr(e, path, "t")?;
                 let style_id = optional_attr(e, path, "s")?.and_then(|s| s.parse::<u32>().ok());
 
@@ -194,6 +231,18 @@ pub(crate) fn parse_worksheet(
         merge_regions,
         drawing_r_id,
     })
+}
+
+/// Parses a `<row r="...">` attribute value as `u32`. Unlike
+/// [`parse_u32_attr`] (used for `<col>`/`<sheetFormatPr>`), a malformed
+/// value here is `Error::InvalidCellRef` rather than `Error::InvalidPackage`
+/// — `r` is a coordinate, same as `<c r="...">`'s, so a non-numeric value
+/// is reported the same way `CellRef::from_a1` reports one, rather than as
+/// a generic package-level error (PR #81 review).
+fn parse_row_r_attr(value: &str, path: &str) -> Result<u32, Error> {
+    value
+        .parse()
+        .map_err(|_| Error::InvalidCellRef(format!("row r={value:?} in {path}")))
 }
 
 /// Parses a `<col>`/`<sheetFormatPr>` numeric attribute value as `u32`,
@@ -814,15 +863,152 @@ mod tests {
     }
 
     #[test]
-    fn cell_missing_r_is_an_error() {
-        let xml = br#"<worksheet><sheetData><row r="1"><c t="n"><v>1</v></c></row></sheetData></worksheet>"#;
+    fn cell_missing_r_infers_sequential_columns() {
+        // Issue #79: `r` is optional per ECMA-376 §18.3.1.4; when omitted,
+        // the column is inferred as one past the previous cell in the row.
+        // Mirrors the exact shape of tests/fixtures/other/minimal_package.xlsx
+        // (calamine test corpus, not committed — see that directory's
+        // .gitignore entry): every <row> carries `r`, no <c> does.
+        let xml = br#"<worksheet><sheetData><row r="1">
+<c t="n"><v>1</v></c>
+<c t="n"><v>2</v></c>
+<c t="n"><v>3</v></c>
+</row></sheetData></worksheet>"#;
+        let (sheet, _output) = parse(xml);
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
+            Some(CellValue::Number(1.0))
+        );
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 2 }).unwrap().value,
+            Some(CellValue::Number(2.0))
+        );
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 3 }).unwrap().value,
+            Some(CellValue::Number(3.0))
+        );
+    }
+
+    #[test]
+    fn cell_missing_r_after_explicit_r_resumes_from_that_column() {
+        // A later cell that does carry `r` is authoritative; a subsequent
+        // omitted-`r` cell resumes counting from there, not from the start
+        // of the row.
+        let xml = br#"<worksheet><sheetData><row r="1">
+<c t="n"><v>1</v></c>
+<c r="E1" t="n"><v>5</v></c>
+<c t="n"><v>6</v></c>
+</row></sheetData></worksheet>"#;
+        let (sheet, _output) = parse(xml);
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
+            Some(CellValue::Number(1.0))
+        );
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 5 }).unwrap().value,
+            Some(CellValue::Number(5.0))
+        );
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 6 }).unwrap().value,
+            Some(CellValue::Number(6.0))
+        );
+    }
+
+    #[test]
+    fn row_missing_r_infers_sequential_row() {
+        let xml = br#"<worksheet><sheetData>
+<row r="1"><c t="n"><v>1</v></c></row>
+<row><c t="n"><v>2</v></c></row>
+</sheetData></worksheet>"#;
+        let (sheet, _output) = parse(xml);
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
+            Some(CellValue::Number(1.0))
+        );
+        assert_eq!(
+            sheet.get(CellRef { row: 2, col: 1 }).unwrap().value,
+            Some(CellValue::Number(2.0))
+        );
+    }
+
+    #[test]
+    fn cell_missing_r_with_no_enclosing_row_is_invalid_cell_ref() {
+        // Malformed nesting (schema-invalid, but this SAX-style parser does
+        // not validate structure): a <c> with no <row> at all has no row
+        // context to infer a position from.
+        let xml = br#"<worksheet><sheetData><c t="n"><v>1</v></c></sheetData></worksheet>"#;
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
         let err =
             parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
-        assert!(matches!(
-            err,
-            Error::MissingRequiredElement { name: "r", .. }
-        ));
+        assert!(matches!(err, Error::InvalidCellRef(_)));
+    }
+
+    #[test]
+    fn cell_missing_r_beyond_max_col_is_invalid_cell_ref() {
+        // Security review docs/security/code-review.md Finding 2: an
+        // inferred column must be bounded the same way `CellRef::from_a1`
+        // already bounds an explicit one, or an attacker could inflate
+        // `Sheet::max_col` (and json.rs's `maxCol`) far past
+        // `CellRef::MAX_COL` using nothing but MAX_COL + 1 empty <c/>
+        // elements omitting `r` — no `r`-based coordinate ever appears in
+        // the input for `CellRef::from_a1`'s own check to catch.
+        let mut cells = String::new();
+        for _ in 0..=CellRef::MAX_COL {
+            cells.push_str("<c/>");
+        }
+        let xml =
+            format!(r#"<worksheet><sheetData><row r="1">{cells}</row></sheetData></worksheet>"#);
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err = parse_worksheet(
+            xml.as_bytes(),
+            "xl/worksheets/sheet1.xml",
+            &mut sheet,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidCellRef(_)));
+    }
+
+    #[test]
+    fn row_r_attribute_non_numeric_is_invalid_cell_ref() {
+        // PR #81 review: a non-numeric <row r="..."> used to fall through
+        // parse_u32_attr and surface as Error::InvalidPackage, inconsistent
+        // with how a malformed <c r="..."> is reported via
+        // CellRef::from_a1's Error::InvalidCellRef.
+        let xml = br#"<worksheet><sheetData><row r="abc"><c t="n"><v>1</v></c></row></sheetData></worksheet>"#;
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err =
+            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
+        assert!(matches!(err, Error::InvalidCellRef(_)));
+    }
+
+    #[test]
+    fn row_r_attribute_of_zero_is_invalid_cell_ref() {
+        // Rows are 1-based, same as CellRef::from_a1 already enforces for
+        // an explicit <c r="...">; an explicit <row r="0"> must be rejected
+        // the same way rather than silently becoming a valid row.
+        let xml = br#"<worksheet><sheetData><row r="0"><c t="n"><v>1</v></c></row></sheetData></worksheet>"#;
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err =
+            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
+        assert!(matches!(err, Error::InvalidCellRef(_)));
+    }
+
+    #[test]
+    fn row_r_attribute_beyond_max_row_is_invalid_cell_ref() {
+        let xml = format!(
+            r#"<worksheet><sheetData><row r="{}"><c t="n"><v>1</v></c></row></sheetData></worksheet>"#,
+            CellRef::MAX_ROW + 1
+        );
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err = parse_worksheet(
+            xml.as_bytes(),
+            "xl/worksheets/sheet1.xml",
+            &mut sheet,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidCellRef(_)));
     }
 
     #[test]

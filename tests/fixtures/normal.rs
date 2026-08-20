@@ -389,3 +389,38 @@ pub fn workbook_at_package_root() -> Vec<u8> {
         ("sheet1.xml", worksheet_xml(rows, "").as_bytes()),
     ])
 }
+
+/// Every `<c>` in a row omits its optional `r` attribute, relying entirely
+/// on positional inference (Issue #79, confirmed against calamine's
+/// `minimal_package.xlsx` test-corpus fixture — not committed to this
+/// repo, see `tests/fixtures/other`'s `.gitignore` entry, whose
+/// `sheetData` has this exact shape: every `<row>` carries `r`, no `<c>`
+/// does). Row 2 also exercises an explicit-`r` cell resuming a later
+/// omitted-`r` cell from that column, rather than restarting at column 1.
+pub fn cells_without_r_attribute() -> Vec<u8> {
+    let rows = r#"<row r="1">
+  <c t="str"><v>A1</v></c>
+  <c t="str"><v>B1</v></c>
+  <c t="str"><v>C1</v></c>
+</row>
+<row r="2">
+  <c t="str"><v>A2</v></c>
+  <c r="C2" t="str"><v>C2</v></c>
+  <c t="str"><v>D2</v></c>
+</row>"#;
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[("rId1", "worksheet", "worksheets/sheet1.xml")]).as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(rows, "").as_bytes(),
+        ),
+    ])
+}
