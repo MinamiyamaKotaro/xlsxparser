@@ -213,7 +213,7 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 ## エラー処理方針
 
 - XMLとして構文的に不正な場合は [`convert_xml_error`](mod.md) を通じて `Error::XmlParse` または `Error::ZipBombDetected` に変換する
-- `<row>`/`<c>` の `r` 属性はいずれも省略可能で、省略時は直前の行/セルから暗黙的に位置を推論する（Issue #79。旧オープンクエスチョン4を解決）。`<row r="0">` や `MAX_ROW` 超過、推論後の列が `MAX_COL` を超える場合は `Error::InvalidCellRef` を返す（`CellRef::from_a1` の上限チェックと同じ方針。行の外(`<row>` を一度も見ていない状態)で `<c>` の `r` が省略された場合も同様）
+- `<row>`/`<c>` の `r` 属性はいずれも省略可能で、省略時は直前の行/セルから暗黙的に位置を推論する（Issue #79。旧オープンクエスチョン4を解決）。`<row r="...">` の値が数値としてパースできない場合・`0` の場合・`MAX_ROW` を超える場合、および推論後の列が `MAX_COL` を超える場合は `Error::InvalidCellRef` を返す（`CellRef::from_a1` の上限チェックと同じ方針。行の外(`<row>` を一度も見ていない状態)で `<c>` の `r` が省略された場合も同様）。`<row>` の `r` が数値としてパースできない場合を `<col>`/`sheetFormatPr` と同じ `Error::InvalidPackage` ではなく `Error::InvalidCellRef` とするのは、`r` がここでも座標(セル参照と同種の情報)であり、`<c r="...">` の不正値と同じ扱いに揃えるため(PR #81レビュー)。エラーメッセージには元の属性値の文字列表現と `path` を含める
 - `r` 属性の値が不正なA1形式（`CellRef::from_a1` が `Err` を返す）の場合はそのまま `Error::InvalidCellRef` を伝播する
 - `<v>` の数値テキストが `f64` としてパースできない場合は `Error::InvalidPackage`（暫定。より専用のバリアントを設けるかは [error.md](../error.md) 側の見直しに委ねる）とする
 - `t="d"` セルの `<v>` テキストが日付のみ・日付+時刻・時刻のみのいずれの形にも一致しない、または各数値要素の範囲が不正（月13、時24等）な場合は `Error::InvalidPackage`（上記の数値 `<v>` と同じ暫定方針。Issue #58）。小数秒・末尾のUTC/オフセット指定子・秒の省略はエラーにせず許容する（PR #80レビュー指摘1。`parse_iso8601_datetime` のdocコメント参照）
@@ -234,7 +234,7 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 - `<mergeCells>` 内の複数 `<mergeCell ref="...">` から、`start`/`end` が正しい `MergedRegion` のリストが得られることの確認（妥当性検証自体は行わないため、開始・終了が逆転した不正な範囲もそのまま `Vec` へ含まれることの確認を含む。検証は [resolve/merge.md テスト方針](../resolve/merge.md) 側の責務）
 - `r` 属性を欠く `<c>` が、同じ行内の直前セルの次列として正しく位置推論されることの確認。明示的な `r` を持つセルの直後に省略セルが続く場合、行頭からではなくその明示位置の次列から数え直されることの確認（Issue #79）
 - `r` 属性を欠く `<row>` が、直前行の次番号として正しく位置推論されることの確認（Issue #79）
-- `<row>` を一度も見ていない状態で `r` を欠く `<c>` が現れた場合、`<row r="0">` の場合、`<row>` の `r` が `CellRef::MAX_ROW` を超える場合、および省略推論後の列が `CellRef::MAX_COL` を超える場合(セキュリティレビュー Finding 2 と同じ攻撃面の回帰テスト)に、それぞれ `Error::InvalidCellRef` を返すことの確認（Issue #79）
+- `<row>` を一度も見ていない状態で `r` を欠く `<c>` が現れた場合、`<row r="...">` が数値としてパースできない場合、`<row r="0">` の場合、`<row>` の `r` が `CellRef::MAX_ROW` を超える場合、および省略推論後の列が `CellRef::MAX_COL` を超える場合(セキュリティレビュー Finding 2 と同じ攻撃面の回帰テスト)に、それぞれ `Error::InvalidCellRef` を返すことの確認（Issue #79。数値パース失敗のケースはPR #81レビューを受けて追加——`Error::InvalidPackage` になっていた旧挙動との回帰テスト）
 - 不正なA1形式の `r` 属性・`mergeCell ref` 属性に対し `Error::InvalidCellRef` を返すことの確認
 - `width` 属性を持つ `<cols>` の各エントリが、正しい `min`/`max`/`width` の `ColWidthRange` として収集されることの確認。`width` を持たない `<col>` はスキップされることの確認。単一の `<col min="1" max="16384" .../>`（実データの最悪ケース）が展開されず1件として収集されることの確認
 - `<sheetFormatPr defaultColWidth="..">` が収集されること、および欠落時に `default_col_width: None` のままであることの確認

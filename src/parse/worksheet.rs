@@ -116,13 +116,12 @@ pub(crate) fn parse_worksheet(
         let event = read_event(&mut xml_reader, &mut buf, path)?;
         match &event {
             Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"row" => {
-                let row_attr = optional_attr(e, path, "r")?;
-                cur_row = match row_attr {
-                    Some(r) => parse_u32_attr(&r, "r", path)?,
+                cur_row = match optional_attr(e, path, "r")? {
+                    Some(r) => parse_row_r_attr(&r, path)?,
                     None => cur_row + 1,
                 };
                 if cur_row == 0 || cur_row > CellRef::MAX_ROW {
-                    return Err(Error::InvalidCellRef(cur_row.to_string()));
+                    return Err(Error::InvalidCellRef(format!("row {cur_row} in {path}")));
                 }
                 cur_col = 0;
             }
@@ -138,7 +137,7 @@ pub(crate) fn parse_worksheet(
                         cur_col += 1;
                         if cur_row == 0 || cur_col > CellRef::MAX_COL {
                             return Err(Error::InvalidCellRef(format!(
-                                "row {cur_row}, col {cur_col}"
+                                "row {cur_row}, col {cur_col} in {path}"
                             )));
                         }
                         CellRef {
@@ -232,6 +231,18 @@ pub(crate) fn parse_worksheet(
         merge_regions,
         drawing_r_id,
     })
+}
+
+/// Parses a `<row r="...">` attribute value as `u32`. Unlike
+/// [`parse_u32_attr`] (used for `<col>`/`<sheetFormatPr>`), a malformed
+/// value here is `Error::InvalidCellRef` rather than `Error::InvalidPackage`
+/// — `r` is a coordinate, same as `<c r="...">`'s, so a non-numeric value
+/// is reported the same way `CellRef::from_a1` reports one, rather than as
+/// a generic package-level error (PR #81 review).
+fn parse_row_r_attr(value: &str, path: &str) -> Result<u32, Error> {
+    value
+        .parse()
+        .map_err(|_| Error::InvalidCellRef(format!("row r={value:?} in {path}")))
 }
 
 /// Parses a `<col>`/`<sheetFormatPr>` numeric attribute value as `u32`,
@@ -955,6 +966,19 @@ mod tests {
             false,
         )
         .unwrap_err();
+        assert!(matches!(err, Error::InvalidCellRef(_)));
+    }
+
+    #[test]
+    fn row_r_attribute_non_numeric_is_invalid_cell_ref() {
+        // PR #81 review: a non-numeric <row r="..."> used to fall through
+        // parse_u32_attr and surface as Error::InvalidPackage, inconsistent
+        // with how a malformed <c r="..."> is reported via
+        // CellRef::from_a1's Error::InvalidCellRef.
+        let xml = br#"<worksheet><sheetData><row r="abc"><c t="n"><v>1</v></c></row></sheetData></worksheet>"#;
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err =
+            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
         assert!(matches!(err, Error::InvalidCellRef(_)));
     }
 
