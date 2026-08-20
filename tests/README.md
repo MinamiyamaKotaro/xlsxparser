@@ -72,7 +72,12 @@ real file is what *found* the bug, but the committed test is what
   transparently across every coordinate it covers, all four sheet
   visibility states (including an empty sheet) enumerated together,
   embedded images (single-cell and two-cell anchors, grouped/rotated,
-  hyperlinks), and the extreme-sparse shape (`A1` + `XFD1048576`, Excel's
+  hyperlinks), cell hyperlinks (Issue #95 — external with a tooltip,
+  `location`-only internal, resolved through a real openpyxl-authored
+  file rather than hand-authored XML; incidentally confirms parsing is
+  indifferent to openpyxl declaring `xmlns:r` inline on the `<hyperlink>`
+  element, a placement none of the hand-authored fixtures happen to use
+  either), and the extreme-sparse shape (`A1` + `XFD1048576`, Excel's
   actual opposite corners) that motivates the sparse `HashMap` storage
   model in the first place.
 - **Load** (`load.rs` / `real_load.rs`): 300,000 cells in a fully-packed

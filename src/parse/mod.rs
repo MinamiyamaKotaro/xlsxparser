@@ -20,7 +20,7 @@ pub(crate) use shared_strings::{parse_shared_strings, SharedStringTable};
 pub(crate) use styles::parse_styles;
 pub(crate) use theme::parse_theme;
 pub(crate) use workbook::parse_workbook_xml;
-pub(crate) use worksheet::{parse_worksheet, PendingSharedString, PendingStyle};
+pub(crate) use worksheet::{parse_worksheet, PendingHyperlink, PendingSharedString, PendingStyle};
 
 use crate::error::Error;
 use quick_xml::events::{BytesStart, Event};

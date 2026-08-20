@@ -33,6 +33,31 @@ impl MergedRegion {
     pub fn col_span(&self) -> u32 { debug_assert!(self.start.col <= self.end.col); self.end.col - self.start.col + 1 }
 }
 
+/// A cell's hyperlink (Issue #95) — kept raw/unresolved, the same "diff,
+/// not display" philosophy `ColorRef` follows (Issue #75): this library
+/// never checks a target's existence and never performs an HTTP request.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Hyperlink {
+    pub target: Option<String>,
+    pub location: Option<String>,
+    pub tooltip: Option<String>,
+}
+
+/// A hyperlink's applicable range (Issue #95) — `start`/`end` mirror
+/// `MergedRegion`'s shape exactly (a single-cell `ref` has `start ==
+/// end`), for the same "hold a range, don't expand it" reason: a
+/// `<hyperlink ref="A1:XFD1048576">` must cost O(1), not O(row_span *
+/// col_span), the same amplification `insert_merge` already closed off
+/// (`insert_merge_on_huge_region_does_not_hang`). `pub(crate)` — unlike
+/// `MergedRegion`, never returned to library consumers; `Sheet` only
+/// exposes the final per-cell `Hyperlink` via `hyperlink_at`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HyperlinkRange {
+    pub start: CellRef,
+    pub end: CellRef,
+    pub hyperlink: Hyperlink,
+}
+
 /// A sheet's visibility (`workbook.xml`'s `<sheet state="...">`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SheetVisibility {
@@ -56,6 +81,11 @@ pub struct Sheet {
     /// on each cell insertion; does not depend on the `<dimension>` element's value.
     pub max_row: u32,
     pub max_col: u32,
+    /// origin cell coordinate -> hyperlink (Issue #95), populated once by
+    /// `finalize_hyperlinks`. `HashMap`, same as `merged_regions` — never
+    /// iterated directly to produce output order, only looked up per cell
+    /// while walking `iter_cells`'s already-deterministic order.
+    hyperlinks: HashMap<CellRef, Hyperlink>,
 }
 
 impl Sheet {
@@ -73,6 +103,7 @@ impl Sheet {
             merged_regions: HashMap::new(),
             max_row: 0,
             max_col: 0,
+            hyperlinks: HashMap::new(),
         }
     }
 
@@ -240,6 +271,91 @@ impl Sheet {
     pub fn iter_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
         self.cells.iter().map(|(&r, c)| (r, c))
     }
+
+    /// Backfills a blank placeholder cell at `r` if none exists yet
+    /// (Issue #95) — same reasoning as `insert_merge`'s origin backfill.
+    fn backfill_blank_cell(&mut self, r: CellRef) {
+        if !self.cells.contains_key(&r) {
+            self.insert_cell(r, Cell { value: None, style: None });
+        }
+    }
+
+    /// Registers every validated hyperlink range at once (called by
+    /// `resolve::hyperlink::resolve` after overlap validation — see
+    /// resolve/hyperlink.md). Backfills each range's own origin cell, then
+    /// resolves every cell key already in `cells` (this backfill included)
+    /// to its covering range's `Hyperlink` in a single sweep-line pass —
+    /// same Start/End/Query shape as `finalize_merges`, O((C + H) log
+    /// (C + H)) for C cells and H ranges, never O(C * H). See the note
+    /// after the code block for why a covered cell is keyed by its own
+    /// coordinate rather than folded into the range's origin the way a
+    /// merge's virtual cells are.
+    pub(crate) fn finalize_hyperlinks(&mut self, ranges: Vec<HyperlinkRange>) {
+        if ranges.is_empty() {
+            return;
+        }
+        for range in &ranges {
+            self.backfill_blank_cell(range.start);
+        }
+
+        enum SweepEvent {
+            Start(usize), // index into `ranges`
+            End(usize),
+            Query(CellRef),
+        }
+
+        let mut events: Vec<(u32, u8, SweepEvent)> = Vec::new();
+        for (i, range) in ranges.iter().enumerate() {
+            events.push((range.start.row, 0, SweepEvent::Start(i)));
+            events.push((range.end.row + 1, 0, SweepEvent::End(i)));
+        }
+        for &coord in self.cells.keys() {
+            events.push((coord.row, 2, SweepEvent::Query(coord)));
+        }
+        events.sort_by_key(|(row, kind_rank, event)| {
+            let start_end_rank = match event {
+                SweepEvent::End(_) => 0,
+                SweepEvent::Start(_) => 1,
+                SweepEvent::Query(_) => *kind_rank,
+            };
+            (*row, start_end_rank)
+        });
+
+        let mut active: Vec<usize> = Vec::new(); // indices into `ranges`, sorted by start.col
+        for (_, _, event) in &events {
+            match event {
+                SweepEvent::Start(i) => {
+                    let col = ranges[*i].start.col;
+                    let pos = active.partition_point(|&j| ranges[j].start.col < col);
+                    active.insert(pos, *i);
+                }
+                SweepEvent::End(i) => {
+                    let col = ranges[*i].start.col;
+                    let pos = active.partition_point(|&j| ranges[j].start.col < col);
+                    active.remove(pos);
+                }
+                SweepEvent::Query(coord) => {
+                    let pos = active.partition_point(|&j| ranges[j].start.col <= coord.col);
+                    if pos == 0 {
+                        continue;
+                    }
+                    let candidate = active[pos - 1];
+                    let range = &ranges[candidate];
+                    if coord.col <= range.end.col {
+                        self.hyperlinks.insert(*coord, range.hyperlink.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Retrieves, in O(1), the hyperlink registered at cell `origin`.
+    /// Mirrors `merged_region_at`'s convention (no merge-origin resolution
+    /// here — `json.rs` only ever calls this with coordinates already
+    /// yielded by `iter_cells`).
+    pub fn hyperlink_at(&self, origin: CellRef) -> Option<&Hyperlink> {
+        self.hyperlinks.get(&origin)
+    }
 }
 ```
 
@@ -269,10 +385,18 @@ Issue #87's PoC (`massive_dense_accounting.xlsx`, 300,000 cells; measured with a
 
 `merged_regions` (an internal-only O(1)/O(N) lookup keyed by origin cell, whose iteration order is never reflected in `json.rs`'s output) is intentionally left as `HashMap` — out of scope for this fix.
 
+**Feature: hyperlinks (Issue #95).** `Sheet` also holds `hyperlinks: HashMap<CellRef, Hyperlink>`, populated once by `finalize_hyperlinks` — called by `resolve::hyperlink::resolve` (see [resolve/hyperlink.md](../resolve/hyperlink.en.md)) after it validates a batch of `HyperlinkRange`s for reversed start/end and mutual overlap. `<hyperlink ref="A1:C3">` (unlike `<mergeCell>`) is not necessarily a merged region — OOXML lets one hyperlink apply to a rectangular selection of otherwise-independent cells, so every covered cell must carry the hyperlink independently in JSON output rather than collapsing into the range's origin the way a merge's virtual cells do.
+
+This ruled out simply reusing `resolve_origin`'s pattern (`get`/`get_mut` resolving a virtual coordinate to one shared origin `Cell`): a first draft did exactly that — geometric bounding-box pre-check, then a linear `.find()` over the range list per query — and turned out to be `resolve_origin`'s *pre-Issue-#43* shape exactly, reintroducing the same O(cells × ranges) cost `finalize_merges`'s sweep-line rewrite eliminated for merges (caught during design review, before implementation — see `resolve/hyperlink.md`'s Testing Strategy for the regression this would otherwise have reproduced). `finalize_hyperlinks` instead runs the same sweep once, but on a match inserts directly into `hyperlinks` keyed by the *query* coordinate (every covered cell independently) rather than dropping non-origin keys the way `finalize_merges` does — the origin cell itself picks up its own entry through the same pass, since `backfill_blank_cell` already guaranteed it exists in `cells` before the sweep runs. (A first pass buffered matches into an intermediate `Vec` before a second loop inserted them into `hyperlinks`, out of an unexamined habit of not mutating `self` mid-sweep; a Copilot PR review comment on PR #96 pointed out nothing in the loop actually borrows `self.hyperlinks` elsewhere — `ranges`/`active`/`events` are all sweep-local — so the insert moved directly into the `Query` arm, dropping the buffer and the second pass entirely.)
+
+Only a range's own origin cell is backfilled (mirrors `insert_merge` exactly) — a cell elsewhere in the range that has no value/style/hyperlink-independent reason to exist stays un-materialized and therefore invisible to `iter_cells`/JSON output, even though Excel would still show it as clickable. Backfilling every covered cell was considered and rejected: it would reopen the same O(row_span * col_span) amplification `insert_merge`'s `merge_aliases` removal (see the note above) closed for merges, since nothing bounds how large a legitimately-`MAX_HYPERLINKS_PER_SHEET`-sized range can be. Accepted as a known limitation (see `resolve/hyperlink.md`'s Open Questions) rather than solved speculatively.
+
+`Sheet::hyperlink_at`, unlike `get`, does not resolve a merge origin — mirrors `merged_region_at`'s convention (`json.rs` only ever calls either with a coordinate `iter_cells` already yielded, which is always an origin by construction).
+
 ## Dependencies
 
 - Depends on: [`model/cell.rs`](cell.en.md) (`Cell`, `CellRef`)
-- Depended on by: `model::Workbook` (holds multiple sheets), [`pipeline.rs`](../pipeline.en.md) (constructs sheets via `Sheet::new`; Phase 3.5 calls `set_images` — see [parse/drawing.md](../parse/drawing.en.md)), `resolve/merge.rs` (calls `insert_merge` to register merged cells, then `finalize_merges` once all of them are registered), `resolve/shared_strings.rs` / `resolve/style.rs` (rewrite a cell's value/style with resolved data via `get_mut`), `resolve/column_width.rs` (calls `set_col_widths` once validated), [`json.rs`](../json.en.md) (assembles JSON from `iter_cells`, `merged_region_at`, `col_width_ranges`, `default_col_width`, `images`), `parse/worksheet.rs` (inserts parsed data via `insert_cell`)
+- Depended on by: `model::Workbook` (holds multiple sheets), [`pipeline.rs`](../pipeline.en.md) (constructs sheets via `Sheet::new`; Phase 3.5 calls `set_images` — see [parse/drawing.md](../parse/drawing.en.md)), `resolve/merge.rs` (calls `insert_merge` to register merged cells, then `finalize_merges` once all of them are registered), `resolve/shared_strings.rs` / `resolve/style.rs` (rewrite a cell's value/style with resolved data via `get_mut`), `resolve/column_width.rs` (calls `set_col_widths` once validated), [`resolve/hyperlink.rs`](../resolve/hyperlink.en.md) (calls `finalize_hyperlinks` once, after validating a batch), [`json.rs`](../json.en.md) (assembles JSON from `iter_cells`, `merged_region_at`, `col_width_ranges`, `default_col_width`, `images`, `hyperlink_at`), `parse/worksheet.rs` (inserts parsed data via `insert_cell`)
 
 The `cells` / `merged_regions` fields themselves stay fully private — not even `pub(crate)` — and writes to these internal data structures are restricted to `insert_cell` / `insert_merge` / `get_mut` / `finalize_merges`. The alternative of making the fields directly `pub(crate)` (as originally suggested in review) was also considered, but that would require every caller across multiple `resolve/` modules to individually remember to keep `max_row`/`max_col` up to date and to backfill a merge's origin cell — scattering the invariant across the crate. Restricting writes to these methods keeps the invariant contained inside `Sheet` itself, so callers don't need to worry about correctness.
 
@@ -302,6 +426,11 @@ The `cells` / `merged_regions` fields themselves stay fully private — not even
 - **`column_width` returns `None` with no ranges and no `defaultColWidth`**, **binary search correctness across multiple ranges** (including boundary values: inside a range, in a gap between ranges, falling back to `defaultColWidth`), **`col_width_ranges`/`default_col_width` expose the raw values for JSON output** (Issue #39; detailed validation lives in `resolve::column_width`'s own test suite)
 - **`images()` exposes the raw `Vec` set by `set_images`, unmodified** (Issue #65; per-anchor resolution correctness lives in `parse::drawing`'s and `pipeline.rs`'s own test suites)
 - **Verifying `iter_cells`'s iteration order is deterministic — row-major, then column-major, following `CellRef`'s `Ord` — regardless of insertion order** (Issue #87; the guarantee that comes from `cells` being a `BTreeMap`. [`tests/normal.rs`'s `json_cells_array_is_sorted_by_row_then_col_regardless_of_source_order`](../../../tests/normal.rs) uses a fixture whose insertion order is deliberately scrambled, modeling a real file whose XML appearance order is not row/column-ascending)
+- **`finalize_hyperlinks` on an empty range list is a no-op** (Issue #95; the common case must stay cheap, mirrors `finalize_merges`)
+- **`finalize_hyperlinks` backfills a blank placeholder at a range's origin cell, and it is then retrievable via `hyperlink_at`/`iter_cells`** (mirrors `insert_merge_backfills_blank_origin_cell`)
+- **A hyperlink range spanning multiple already-populated cells (not merged) attaches the hyperlink to every one of them independently, not just the origin** — the core correctness requirement `resolve_origin`-style resolution could not satisfy without also reintroducing its pre-#43 cost (see the "Feature: hyperlinks" note above)
+- **A fully blank cell inside a hyperlink range, other than the origin, does not appear in `iter_cells`/JSON output** — pins down the accepted limitation described above, so a future change to backfill it is a deliberate decision, not an accidental regression
+- **End-to-end regression, same shape as the merge one**: a sheet with `MAX_HYPERLINKS_PER_SHEET` ranges arranged to maximize simultaneous row activity, plus many unrelated cells, completes without cost proportional to cells × ranges (lives in `resolve::hyperlink`'s own test suite via `pipeline.rs` — see [resolve/hyperlink.md](../resolve/hyperlink.en.md))
 
 ## Open Questions
 
@@ -311,3 +440,4 @@ The `cells` / `merged_regions` fields themselves stay fully private — not even
 4. **Other `worksheet.xml` metadata such as frozen rows/columns**: Not explicitly covered by the requirements spec, but if things like `freezePane` are handled in the future, whether to hold them on `Sheet` or split them into a separate type is undecided (currently out of scope and not included in the type). Visibility is resolved (see Open Question 1 of workbook.md).
 5. ~~Crate-internal access to private fields~~ → **Resolved**: rather than making fields like `cells` directly `pub(crate)`, `Sheet` implements the narrow API `insert_cell` / `insert_merge` / `get_mut` and disallows direct access from anywhere else (finalized following the [PR #5 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948259819); see the Dependencies section for the comparison against directly exposing the fields).
 6. ~~Container type for `cells` (`HashMap` vs. `BTreeMap`)~~ → **Resolved**: adopted `BTreeMap<CellRef, Cell>` (Issue #87). Because `iter_cells`'s iteration order feeds `json.rs`'s `cells` array directly, `HashMap`'s per-process random hash seed meant re-parsing the same file could shuffle unrelated cells in the output, which showed up as spurious noise in a textual diff of two JSON snapshots. PoC measurements (see the note after the code block) confirmed `BTreeMap` doesn't lose on CPU or peak memory either — it's ahead on both — before finalizing the switch. `merged_regions` is out of scope (stays `HashMap`) since its order never reaches JSON output.
+7. **Hyperlink range interaction with merged regions, and `finalize_hyperlinks` vs. `finalize_merges` ordering**: see [resolve/hyperlink.md](../resolve/hyperlink.en.md)'s own Open Questions 1-2 — both concern this file's behavior but are tracked there since they're really about `resolve::hyperlink::resolve`'s call-site ordering in `pipeline.rs`, not about `Sheet`'s API surface itself.

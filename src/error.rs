@@ -164,6 +164,33 @@ pub enum Error {
     #[error("too many column width ranges in one sheet: {count} exceeds limit {limit}")]
     TooManyColumnWidthRanges { count: usize, limit: usize },
 
+    /// A hyperlink range is invalid (overlaps another hyperlink range, or
+    /// its start/end coordinates are inverted). Mirrors
+    /// `InvalidMergedRange`'s shape exactly (Issue #95); overlap is
+    /// rejected rather than resolved via a tie-break because
+    /// `Sheet::finalize_hyperlinks`'s sweep-line resolution depends on
+    /// active ranges at any row having disjoint column spans — the same
+    /// precondition `finalize_merges` already relies on from
+    /// `resolve::merge`'s own overlap validation.
+    #[error("invalid hyperlink range {start}:{end}: {reason}")]
+    InvalidHyperlinkRange {
+        start: String,
+        end: String,
+        reason: String,
+    },
+
+    /// The number of `<hyperlink>` entries in a single sheet exceeded
+    /// `resolve::hyperlink::MAX_HYPERLINKS_PER_SHEET` (Issue #95).
+    /// `resolve::hyperlink::resolve`'s overlap check is O(N^2) in the
+    /// number of ranges, the same shape as `resolve::merge`'s — so N
+    /// itself, not just the XML byte size the Zip Bomb cap already
+    /// bounds, must be bounded independently (mirrors
+    /// `TooManyMergedRanges`'s reasoning; the cap value is deliberately
+    /// the same as `MAX_MERGE_REGIONS` too, reusing its already-measured
+    /// cost curve rather than re-deriving one).
+    #[error("too many hyperlinks in one sheet: {count} exceeds limit {limit}")]
+    TooManyHyperlinks { count: usize, limit: usize },
+
     // --- Phase 5: JSON generation ---
     /// JSON serialization failed (wraps the error `serde_json` returns).
     /// `source` is type-erased for the same reason as `XmlParse::source`. In

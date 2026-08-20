@@ -499,6 +499,31 @@ def houganshi_merged():
     return path
 
 
+def cell_hyperlinks():
+    """Cell hyperlinks (Issue #95): an external URL with a tooltip (A2,
+    the common case — openpyxl's `cell.hyperlink = "..."` API), and a
+    `location`-only internal jump with no `r:id` at all (A3, via
+    `openpyxl.worksheet.hyperlink.Hyperlink`). Real openpyxl output
+    declares `xmlns:r` inline on the `<hyperlink>` element itself rather
+    than on the `<worksheet>` root — a real-world XML shape none of
+    xlsxparser's hand-authored fixtures happen to exercise, since they
+    always declare `xmlns:r` at the root instead.
+    """
+    from openpyxl.worksheet.hyperlink import Hyperlink
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws["A2"] = "click me"
+    ws["A2"].hyperlink = "https://example.com/"
+    ws["A2"].hyperlink.tooltip = "Visit example"
+    ws["A3"] = "jump"
+    ws["A3"].hyperlink = Hyperlink(ref="A3", location="Sheet1!A1")
+    path = os.path.join(COMPLEX_DIR, "cell_hyperlinks.xlsx")
+    wb.save(path)
+    return path
+
+
 def multi_sheet_states():
     """Visible / hidden / veryHidden / empty sheets in one workbook."""
     wb = openpyxl.Workbook()
@@ -837,6 +862,7 @@ def main():
     for fn in (
         basic_types,
         houganshi_merged,
+        cell_hyperlinks,
         multi_sheet_states,
         embedded_image,
         embedded_image_one_cell,

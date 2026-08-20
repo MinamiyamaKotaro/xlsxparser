@@ -7,7 +7,7 @@
 use crate::error::Error;
 use crate::model::{
     Alignment, AnchorMarker, Cell, CellRef, CellValue, ColWidthRange, ColorRef, DateTimeValue,
-    Image, ImageAnchor, Sheet, SheetVisibility, Workbook,
+    Hyperlink, Image, ImageAnchor, Sheet, SheetVisibility, Workbook,
 };
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Serialize, Serializer};
@@ -168,10 +168,36 @@ struct JsonCell {
     /// docs/design/model/sheet.en.md's "Feature: column width" note).
     #[serde(skip_serializing_if = "Option::is_none")]
     style: Option<JsonStyle>,
+    /// Omitted entirely when the cell carries no hyperlink at all (Issue
+    /// #95) — same "no empty placeholder" convention as `style`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hyperlink: Option<JsonHyperlink>,
 }
 
 fn is_one(n: &u32) -> bool {
     *n == 1
+}
+
+/// `model::Hyperlink`'s JSON form (Issue #95). Every field mirrors the
+/// model 1:1, kept in the same raw/unresolved form — see `Hyperlink`'s own
+/// doc comment for why (Issue #75's `ColorRef` precedent).
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct JsonHyperlink {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tooltip: Option<String>,
+}
+
+fn hyperlink_to_json(h: &Hyperlink) -> JsonHyperlink {
+    JsonHyperlink {
+        target: h.target.clone(),
+        location: h.location.clone(),
+        tooltip: h.tooltip.clone(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -271,6 +297,7 @@ fn cell_to_json(sheet: &Sheet, cell_ref: CellRef, cell: &Cell) -> JsonCell {
             fill_fg_color: s.fill_fg_color.as_ref().map(color_ref_to_json),
             fill_bg_color: s.fill_bg_color.as_ref().map(color_ref_to_json),
         }),
+        hyperlink: sheet.hyperlink_at(cell_ref).map(hyperlink_to_json),
     }
 }
 
@@ -663,6 +690,46 @@ mod tests {
 
         assert!(cell_json["style"].get("fillFgColor").is_none());
         assert!(cell_json["style"].get("fillBgColor").is_none());
+    }
+
+    #[test]
+    fn cell_with_hyperlink_reports_it_nested_and_omits_absent_fields() {
+        let mut sheet = sheet_with_one_cell("Sheet1", Some(CellValue::Number(1.0)));
+        sheet.finalize_hyperlinks(vec![crate::model::HyperlinkRange {
+            start: CellRef { row: 1, col: 1 },
+            end: CellRef { row: 1, col: 1 },
+            hyperlink: crate::model::Hyperlink {
+                target: Some("https://example.com/".to_string()),
+                location: None,
+                tooltip: Some("Visit example".to_string()),
+            },
+        }]);
+        let workbook = Workbook::new(vec![sheet], None);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cell_json = &parsed["sheets"][0]["cells"][0];
+
+        assert_eq!(
+            cell_json["hyperlink"],
+            serde_json::json!({
+                "target": "https://example.com/",
+                "tooltip": "Visit example"
+            })
+        );
+        assert!(cell_json["hyperlink"].get("location").is_none());
+    }
+
+    #[test]
+    fn cell_without_hyperlink_omits_the_field_entirely() {
+        let sheet = sheet_with_one_cell("Sheet1", Some(CellValue::Number(1.0)));
+        let workbook = Workbook::new(vec![sheet], None);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cell_json = &parsed["sheets"][0]["cells"][0];
+
+        assert!(cell_json.get("hyperlink").is_none());
     }
 
     #[test]

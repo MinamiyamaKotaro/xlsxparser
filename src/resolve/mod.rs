@@ -7,6 +7,7 @@
 
 mod color;
 mod column_width;
+pub(crate) mod hyperlink;
 mod merge;
 mod shared_strings;
 mod style;

@@ -100,6 +100,40 @@ fn real_houganshi_merged_xlsx_resolves_the_whole_region_to_the_anchor() {
 }
 
 #[test]
+fn real_cell_hyperlinks_xlsx_resolves_external_and_location_only_hyperlinks() {
+    // scripts/generate_real_fixtures.py's cell_hyperlinks(): a real,
+    // openpyxl-authored external hyperlink (assigned relationship id,
+    // TargetMode="External", tooltip) plus a location-only internal jump
+    // with no r:id at all, resolved end to end through actual ZIP/XML
+    // bytes rather than the hand-authored snippets pipeline.rs's own unit
+    // tests use — the standard rationale this whole file exists for (see
+    // its module doc). Notably, openpyxl happens to declare xmlns:r
+    // inline on the <hyperlink> element itself, rather than anywhere
+    // hand-authored fixtures in this repo ever place it (they never
+    // declare it at all) — parse/worksheet.rs's plain string-prefix
+    // attribute matching (parse/mod.md Open Question 4's policy) is
+    // indifferent to either shape by design, and this pins that down
+    // against a real writer's actual output instead of leaving it an
+    // untested assumption.
+    let workbook = parse_workbook(fixture_path("complex/cell_hyperlinks.xlsx")).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    let external = sheet
+        .hyperlink_at(CellRef { row: 2, col: 1 })
+        .expect("A2 must carry a hyperlink");
+    assert_eq!(external.target.as_deref(), Some("https://example.com/"));
+    assert_eq!(external.location, None);
+    assert_eq!(external.tooltip.as_deref(), Some("Visit example"));
+
+    let internal = sheet
+        .hyperlink_at(CellRef { row: 3, col: 1 })
+        .expect("A3 must carry a hyperlink");
+    assert_eq!(internal.target, None);
+    assert_eq!(internal.location.as_deref(), Some("Sheet1!A1"));
+    assert_eq!(internal.tooltip, None);
+}
+
+#[test]
 fn real_multi_sheet_states_xlsx_enumerates_every_visibility() {
     let workbook = parse_workbook(fixture_path("complex/multi_sheet_states.xlsx")).unwrap();
     let sheets = workbook.sheets();

@@ -13,8 +13,9 @@ mod workbook;
 
 pub use cell::{Cell, CellRef, CellValue, DateTimeValue};
 pub use color::{Rgb, ThemePalette};
+pub(crate) use sheet::HyperlinkRange;
 pub use sheet::{
-    AnchorMarker, ColWidthRange, Image, ImageAnchor, ImageExtent, MergedRegion, Sheet,
+    AnchorMarker, ColWidthRange, Hyperlink, Image, ImageAnchor, ImageExtent, MergedRegion, Sheet,
     SheetVisibility,
 };
 pub use style::{Alignment, ColorRef, Font, ResolvedStyle, StyleId, StyleSheet};

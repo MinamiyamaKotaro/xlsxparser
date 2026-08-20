@@ -100,6 +100,47 @@ pub struct ImageExtent {
     pub cy: i64,
 }
 
+/// A cell's hyperlink (`<hyperlinks><hyperlink .../></hyperlinks>`, Issue
+/// #95). Kept in raw form — the target/location strings exactly as `_rels`/
+/// the XML attribute state them — never validated or resolved, the same
+/// "diff, not display" philosophy `ColorRef` already follows (Issue #75):
+/// this library never checks that a target URL/part actually exists and
+/// never performs an HTTP request, so `target`/`location` can equally
+/// describe a link that's since gone dead — which is exactly the kind of
+/// change a diff should surface, not hide.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Hyperlink {
+    /// The relationship's raw Target string, resolved from `r:id` against
+    /// the worksheet's own `_rels` (the same map Issue #65's image
+    /// resolution already loads) — an external URL verbatim, or an
+    /// Internal-relationship-resolved part path. `None` when `<hyperlink>`
+    /// has no `r:id` at all (a `location`-only internal jump) or when the
+    /// `r:id` doesn't resolve against `_rels` (a malformed file).
+    pub target: Option<String>,
+    /// `location` attribute verbatim (e.g. `"'Sheet2'!A1"`, a defined
+    /// name) — an in-workbook jump target, present alongside or instead of
+    /// `target`. Never parsed or validated as a real sheet/cell reference.
+    pub location: Option<String>,
+    /// `tooltip` attribute verbatim (the ScreenTip text), if present.
+    pub tooltip: Option<String>,
+}
+
+/// A hyperlink's applicable range (Issue #95) — `start`/`end` mirror
+/// `MergedRegion`'s shape exactly (a single-cell `ref` has `start ==
+/// end`), for the same "hold a range, don't expand it" reason: a
+/// `<hyperlink ref="A1:XFD1048576">` must cost O(1), not O(row_span *
+/// col_span), the same amplification `insert_merge`'s `merge_aliases`
+/// removal already closed off for merges
+/// (`insert_merge_on_huge_region_does_not_hang`). `pub(crate)` — unlike
+/// `MergedRegion`, never returned to library consumers; `Sheet` only
+/// exposes the final per-cell `Hyperlink` via `hyperlink_at`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HyperlinkRange {
+    pub start: CellRef,
+    pub end: CellRef,
+    pub hyperlink: Hyperlink,
+}
+
 /// A sheet's visibility (`workbook.xml`'s `<sheet state="...">`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SheetVisibility {
@@ -179,6 +220,13 @@ pub struct Sheet {
     /// boundaries, and unlike a merged region's data, an image isn't
     /// "owned" by whichever cell it happens to overlap.
     images: Vec<Image>,
+    /// origin cell coordinate -> hyperlink (Issue #95). `HashMap` rather
+    /// than `BTreeMap`, same as `merged_regions`: unlike `cells`, this is
+    /// never iterated directly to produce output order — `json.rs` only
+    /// ever looks it up per cell, keyed, while walking `iter_cells`'s
+    /// already-deterministic `BTreeMap` order, so a `HashMap`'s randomized
+    /// iteration order never leaks into the JSON.
+    hyperlinks: HashMap<CellRef, Hyperlink>,
 }
 
 impl Sheet {
@@ -196,6 +244,7 @@ impl Sheet {
             col_widths: Vec::new(),
             default_col_width: None,
             images: Vec::new(),
+            hyperlinks: HashMap::new(),
         }
     }
 
@@ -470,6 +519,136 @@ impl Sheet {
     /// the same sparse-output rationale as `col_width_ranges`.
     pub fn images(&self) -> &[Image] {
         &self.images
+    }
+
+    /// Backfills a blank placeholder cell at `r` if none exists yet
+    /// (Issue #95) — same reasoning as `insert_merge`'s origin backfill.
+    fn backfill_blank_cell(&mut self, r: CellRef) {
+        if !self.cells.contains_key(&r) {
+            self.insert_cell(
+                r,
+                Cell {
+                    value: None,
+                    style: None,
+                },
+            );
+        }
+    }
+
+    /// Registers every validated hyperlink range at once (Issue #95;
+    /// called by `resolve::hyperlink::resolve` after it validates the
+    /// batch for reversed start/end and mutual overlap). Backfills each
+    /// range's own origin cell, then resolves every cell key already in
+    /// `cells` (this backfill included) to its covering range's
+    /// `Hyperlink` in a single sweep-line pass — same Start/End/Query
+    /// shape as `finalize_merges`, O((C + H) log (C + H)) for C cells and
+    /// H ranges, never O(C * H).
+    ///
+    /// Unlike `finalize_merges` (which drops every non-origin key), a
+    /// match here inserts into `hyperlinks` keyed by the *query*
+    /// coordinate itself: `<hyperlink ref="A1:C3">` is not necessarily a
+    /// merge, so every covered cell must carry the hyperlink
+    /// independently in JSON output rather than collapsing into the
+    /// range's origin. The origin cell picks up its own entry through the
+    /// same pass, since `backfill_blank_cell` above already guaranteed it
+    /// exists in `cells` before the sweep runs.
+    ///
+    /// Only a range's own origin is backfilled — a cell elsewhere in the
+    /// range with no value/style of its own stays un-materialized and
+    /// therefore invisible to `iter_cells`/JSON output, even though Excel
+    /// would still show it as clickable. Deliberate, accepted limitation
+    /// (see docs/design/resolve/hyperlink.en.md's Open Questions):
+    /// backfilling every covered cell would reopen the same O(row_span *
+    /// col_span) amplification `insert_merge`'s `merge_aliases` removal
+    /// closed off for merges, since nothing bounds how large a
+    /// legitimately-sized range can be.
+    ///
+    /// Preconditions (enforced by the caller, `resolve::hyperlink::
+    /// resolve`, not here): `ranges` contains no two mutually-overlapping
+    /// ranges, and every range has `start <= end`. Both are required for
+    /// the sweep's column-sorted-active-set shortcut to be sound — the
+    /// same precondition `finalize_merges` relies on from
+    /// `resolve::merge`'s own validation.
+    pub(crate) fn finalize_hyperlinks(&mut self, ranges: Vec<HyperlinkRange>) {
+        if ranges.is_empty() {
+            return;
+        }
+        for range in &ranges {
+            self.backfill_blank_cell(range.start);
+        }
+
+        enum SweepEvent {
+            /// Fired at `ranges[i].start.row`.
+            Start(usize),
+            /// Fired at `ranges[i].end.row + 1`.
+            End(usize),
+            /// Fired at the row of a cell coordinate to resolve.
+            Query(CellRef),
+        }
+
+        let mut events: Vec<(u32, u8, SweepEvent)> =
+            Vec::with_capacity(ranges.len() * 2 + self.cells.len());
+        for (i, range) in ranges.iter().enumerate() {
+            events.push((range.start.row, 0, SweepEvent::Start(i)));
+            events.push((range.end.row + 1, 0, SweepEvent::End(i)));
+        }
+        for &coord in self.cells.keys() {
+            events.push((coord.row, 2, SweepEvent::Query(coord)));
+        }
+        // Tie-break: at the same row, End/Start (rank 0/1 below) must be
+        // applied before any Query at that row sees the active set.
+        events.sort_by_key(|(row, kind_rank, event)| {
+            let start_end_rank = match event {
+                SweepEvent::End(_) => 0,
+                SweepEvent::Start(_) => 1,
+                SweepEvent::Query(_) => *kind_rank,
+            };
+            (*row, start_end_rank)
+        });
+
+        // Ranges active at the current sweep row, holding each range's
+        // index into `ranges`, sorted by that range's `start.col`.
+        // Disjoint column spans are guaranteed by the caller's overlap
+        // validation, so at most one active entry can ever contain a
+        // given query column.
+        let mut active: Vec<usize> = Vec::new();
+
+        for (_, _, event) in &events {
+            match event {
+                SweepEvent::Start(i) => {
+                    let col = ranges[*i].start.col;
+                    let pos = active.partition_point(|&j| ranges[j].start.col < col);
+                    active.insert(pos, *i);
+                }
+                SweepEvent::End(i) => {
+                    let col = ranges[*i].start.col;
+                    let pos = active.partition_point(|&j| ranges[j].start.col < col);
+                    debug_assert_eq!(active.get(pos), Some(i));
+                    active.remove(pos);
+                }
+                SweepEvent::Query(coord) => {
+                    let pos = active.partition_point(|&j| ranges[j].start.col <= coord.col);
+                    if pos == 0 {
+                        continue;
+                    }
+                    let candidate = active[pos - 1];
+                    let range = &ranges[candidate];
+                    if coord.col <= range.end.col {
+                        self.hyperlinks.insert(*coord, range.hyperlink.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Retrieves, in O(1), the hyperlink registered at cell `origin`.
+    /// Mirrors `merged_region_at`'s convention exactly (no merge-origin
+    /// resolution here — `json.rs` only ever calls this with coordinates
+    /// already yielded by `iter_cells`, which are origins by
+    /// construction); a caller starting from an arbitrary/virtual
+    /// coordinate should resolve it via `get`/`iter_cells` first.
+    pub fn hyperlink_at(&self, origin: CellRef) -> Option<&Hyperlink> {
+        self.hyperlinks.get(&origin)
     }
 }
 
