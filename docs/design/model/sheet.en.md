@@ -322,7 +322,6 @@ impl Sheet {
         });
 
         let mut active: Vec<usize> = Vec::new(); // indices into `ranges`, sorted by start.col
-        let mut matches: Vec<(CellRef, Hyperlink)> = Vec::new();
         for (_, _, event) in &events {
             match event {
                 SweepEvent::Start(i) => {
@@ -343,13 +342,10 @@ impl Sheet {
                     let candidate = active[pos - 1];
                     let range = &ranges[candidate];
                     if coord.col <= range.end.col {
-                        matches.push((*coord, range.hyperlink.clone()));
+                        self.hyperlinks.insert(*coord, range.hyperlink.clone());
                     }
                 }
             }
-        }
-        for (coord, hyperlink) in matches {
-            self.hyperlinks.insert(coord, hyperlink);
         }
     }
 
@@ -391,7 +387,7 @@ Issue #87's PoC (`massive_dense_accounting.xlsx`, 300,000 cells; measured with a
 
 **Feature: hyperlinks (Issue #95).** `Sheet` also holds `hyperlinks: HashMap<CellRef, Hyperlink>`, populated once by `finalize_hyperlinks` — called by `resolve::hyperlink::resolve` (see [resolve/hyperlink.md](../resolve/hyperlink.en.md)) after it validates a batch of `HyperlinkRange`s for reversed start/end and mutual overlap. `<hyperlink ref="A1:C3">` (unlike `<mergeCell>`) is not necessarily a merged region — OOXML lets one hyperlink apply to a rectangular selection of otherwise-independent cells, so every covered cell must carry the hyperlink independently in JSON output rather than collapsing into the range's origin the way a merge's virtual cells do.
 
-This ruled out simply reusing `resolve_origin`'s pattern (`get`/`get_mut` resolving a virtual coordinate to one shared origin `Cell`): a first draft did exactly that — geometric bounding-box pre-check, then a linear `.find()` over the range list per query — and turned out to be `resolve_origin`'s *pre-Issue-#43* shape exactly, reintroducing the same O(cells × ranges) cost `finalize_merges`'s sweep-line rewrite eliminated for merges (caught during design review, before implementation — see `resolve/hyperlink.md`'s Testing Strategy for the regression this would otherwise have reproduced). `finalize_hyperlinks` instead runs the same sweep once, but on a match inserts into `hyperlinks` keyed by the *query* coordinate (every covered cell independently) rather than dropping non-origin keys the way `finalize_merges` does — the origin cell itself picks up its own entry through the same pass, since `backfill_blank_cell` already guaranteed it exists in `cells` before the sweep runs.
+This ruled out simply reusing `resolve_origin`'s pattern (`get`/`get_mut` resolving a virtual coordinate to one shared origin `Cell`): a first draft did exactly that — geometric bounding-box pre-check, then a linear `.find()` over the range list per query — and turned out to be `resolve_origin`'s *pre-Issue-#43* shape exactly, reintroducing the same O(cells × ranges) cost `finalize_merges`'s sweep-line rewrite eliminated for merges (caught during design review, before implementation — see `resolve/hyperlink.md`'s Testing Strategy for the regression this would otherwise have reproduced). `finalize_hyperlinks` instead runs the same sweep once, but on a match inserts directly into `hyperlinks` keyed by the *query* coordinate (every covered cell independently) rather than dropping non-origin keys the way `finalize_merges` does — the origin cell itself picks up its own entry through the same pass, since `backfill_blank_cell` already guaranteed it exists in `cells` before the sweep runs. (A first pass buffered matches into an intermediate `Vec` before a second loop inserted them into `hyperlinks`, out of an unexamined habit of not mutating `self` mid-sweep; a Copilot PR review comment on PR #96 pointed out nothing in the loop actually borrows `self.hyperlinks` elsewhere — `ranges`/`active`/`events` are all sweep-local — so the insert moved directly into the `Query` arm, dropping the buffer and the second pass entirely.)
 
 Only a range's own origin cell is backfilled (mirrors `insert_merge` exactly) — a cell elsewhere in the range that has no value/style/hyperlink-independent reason to exist stays un-materialized and therefore invisible to `iter_cells`/JSON output, even though Excel would still show it as clickable. Backfilling every covered cell was considered and rejected: it would reopen the same O(row_span * col_span) amplification `insert_merge`'s `merge_aliases` removal (see the note above) closed for merges, since nothing bounds how large a legitimately-`MAX_HYPERLINKS_PER_SHEET`-sized range can be. Accepted as a known limitation (see `resolve/hyperlink.md`'s Open Questions) rather than solved speculatively.
 

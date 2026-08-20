@@ -336,7 +336,6 @@ impl Sheet {
         });
 
         let mut active: Vec<usize> = Vec::new(); // rangesへのインデックス、start.col順
-        let mut matches: Vec<(CellRef, Hyperlink)> = Vec::new();
         for (_, _, event) in &events {
             match event {
                 SweepEvent::Start(i) => {
@@ -357,13 +356,10 @@ impl Sheet {
                     let candidate = active[pos - 1];
                     let range = &ranges[candidate];
                     if coord.col <= range.end.col {
-                        matches.push((*coord, range.hyperlink.clone()));
+                        self.hyperlinks.insert(*coord, range.hyperlink.clone());
                     }
                 }
             }
-        }
-        for (coord, hyperlink) in matches {
-            self.hyperlinks.insert(coord, hyperlink);
         }
     }
 
@@ -405,7 +401,7 @@ Issue #87のPoC（`massive_dense_accounting.xlsx`、30万セル、カスタム�
 
 **機能: ハイパーリンク(Issue #95)。** `Sheet` は `hyperlinks: HashMap<CellRef, Hyperlink>` も保持し、`finalize_hyperlinks` が一度だけ設定する——`resolve::hyperlink::resolve`(重複と開始・終了座標の大小関係を検証済みの`HyperlinkRange`バッチを渡す。[resolve/hyperlink.md](../resolve/hyperlink.md)参照)から呼ばれる。`<hyperlink ref="A1:C3">` は(`<mergeCell>`と異なり)必ずしも結合範囲ではない——OOXMLでは、互いに独立した複数セルの矩形選択に対して1つのハイパーリンクを適用できるため、カバーされた各セルは結合の仮想セルのように起点へ畳み込まれるのではなく、それぞれ独立してJSON出力上でハイパーリンクを持たなければならない。
 
-これにより、`resolve_origin`のパターン(仮想座標を1つの共有起点`Cell`へ解決する`get`/`get_mut`方式)をそのまま流用する案は却下された: 最初のドラフトはまさにそれ(幾何学的バウンディングボックスによる事前チェック→クエリごとに範囲リストを線形`.find()`)を行っており、これは`resolve_origin`の**Issue #43修正前**の形そのものであり、`finalize_merges`のスイープライン書き換えが結合セルについて解消したはずのO(セル数 × 範囲数)のコストを再導入してしまうことが設計レビューの段階(実装前)で判明した(この再導入を防ぐ回帰テストについては`resolve/hyperlink.md`のテスト方針参照)。`finalize_hyperlinks`は代わりに同じスイープを一度だけ実行するが、一致した際に**クエリ**座標(カバーされた各セルそれぞれ)をキーとして`hyperlinks`へ挿入する——`finalize_merges`のように非起点キーを削除するのではない。起点セル自身も、スイープが走る前に`backfill_blank_cell`がその存在を既に保証しているため、同じパスの中で自然に自分自身のエントリを得る。
+これにより、`resolve_origin`のパターン(仮想座標を1つの共有起点`Cell`へ解決する`get`/`get_mut`方式)をそのまま流用する案は却下された: 最初のドラフトはまさにそれ(幾何学的バウンディングボックスによる事前チェック→クエリごとに範囲リストを線形`.find()`)を行っており、これは`resolve_origin`の**Issue #43修正前**の形そのものであり、`finalize_merges`のスイープライン書き換えが結合セルについて解消したはずのO(セル数 × 範囲数)のコストを再導入してしまうことが設計レビューの段階(実装前)で判明した(この再導入を防ぐ回帰テストについては`resolve/hyperlink.md`のテスト方針参照)。`finalize_hyperlinks`は代わりに同じスイープを一度だけ実行するが、一致した際に**クエリ**座標(カバーされた各セルそれぞれ)をキーとして`hyperlinks`へ直接挿入する——`finalize_merges`のように非起点キーを削除するのではない。起点セル自身も、スイープが走る前に`backfill_blank_cell`がその存在を既に保証しているため、同じパスの中で自然に自分自身のエントリを得る。(最初の実装は一致結果を中間`Vec`にバッファし、その後の2回目のループで`hyperlinks`へ挿入していた——スイープ中に`self`を変更しないという、特に検証していない習慣によるもの。PR #96のCopilot PRレビューが、ループ内のどこも`self.hyperlinks`を他所で借用していない(`ranges`/`active`/`events`はいずれもスイープ内ローカル)ことを指摘したため、挿入を`Query`アーム内へ直接移し、バッファと2回目のループの両方を削除した。)
 
 補完(バックフィル)するのは範囲自身の起点セルのみである(`insert_merge`をそのまま踏襲)——範囲内の他のセルで、値・スタイル・ハイパーリンク以外の理由で存在すべき根拠が無いものは実体化されないままとなり、`iter_cells`/JSON出力からは見えない(Excel上ではクリック可能に表示されるにもかかわらず)。範囲内の全セルを補完する案も検討したが却下した——正当に`MAX_HYPERLINKS_PER_SHEET`規模まで許容される範囲がどれだけ大きくなり得るかに上限が無いため、`insert_merge`から`merge_aliases`を廃止した際(上記の注記参照)に結合セルについて塞いだのと同じO(row_span × col_span)の増幅を再び開けてしまう。これは既知の制限として受け入れており(`resolve/hyperlink.md`のオープンクエスチョン参照)、投機的に解決はしていない。
 

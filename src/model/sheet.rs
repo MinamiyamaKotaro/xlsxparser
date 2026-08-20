@@ -612,7 +612,6 @@ impl Sheet {
         // validation, so at most one active entry can ever contain a
         // given query column.
         let mut active: Vec<usize> = Vec::new();
-        let mut matches: Vec<(CellRef, Hyperlink)> = Vec::new();
 
         for (_, _, event) in &events {
             match event {
@@ -635,14 +634,10 @@ impl Sheet {
                     let candidate = active[pos - 1];
                     let range = &ranges[candidate];
                     if coord.col <= range.end.col {
-                        matches.push((*coord, range.hyperlink.clone()));
+                        self.hyperlinks.insert(*coord, range.hyperlink.clone());
                     }
                 }
             }
-        }
-
-        for (coord, hyperlink) in matches {
-            self.hyperlinks.insert(coord, hyperlink);
         }
     }
 
