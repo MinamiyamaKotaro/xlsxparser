@@ -205,19 +205,23 @@ pub(crate) fn lookup_indexed_color(index: u32) -> Option<Rgb> {
 /// `ST_UnsignedIntHex` — the only form `<fgColor rgb="..">` ever legally
 /// takes) into an `Rgb`, discarding the two alpha digits. `ColorRef::Rgb`
 /// never validates its value at parse time and keeps it verbatim, so this
-/// returns `None` for anything that isn't exactly 8 ASCII hex digits,
+/// returns `None` for anything that isn't exactly 8 valid hex digits,
 /// rather than panicking.
 ///
-/// The `is_ascii()` check must happen *before* slicing `&s[2..]` — `len()`
-/// counts bytes, not chars, so an 8-*byte* string containing multi-byte
-/// UTF-8 (e.g. a crafted `rgb="ééé"`-shaped value from an untrusted file)
-/// can have byte index 2 land mid-codepoint, which would panic were the
-/// slice taken first.
+/// Parses the *entire* 8-digit string as one `u32` — rather than slicing
+/// off the leading 2 alpha digits and parsing only the remaining 6 —
+/// for two reasons: it validates the alpha digits are hex too (a value
+/// like `"GGFF0000"` must be rejected as malformed, not silently accepted
+/// just because the RGB tail happens to parse), and it avoids any string
+/// slicing at all, sidestepping the char-boundary panic risk `&s[2..]`
+/// would otherwise carry (`len()` counts bytes, not chars, so an 8-*byte*
+/// string containing multi-byte UTF-8 can have byte index 2 land
+/// mid-codepoint). The alpha byte is simply never read out of `v`.
 fn parse_argb_hex(s: &str) -> Option<Rgb> {
     if s.len() != 8 || !s.is_ascii() {
         return None;
     }
-    let v = u32::from_str_radix(&s[2..], 16).ok()?;
+    let v = u32::from_str_radix(s, 16).ok()?;
     Some(Rgb {
         r: ((v >> 16) & 0xFF) as u8,
         g: ((v >> 8) & 0xFF) as u8,
@@ -376,14 +380,25 @@ mod tests {
     }
 
     #[test]
+    fn resolve_color_rgb_variant_invalid_alpha_digits_is_none() {
+        // The alpha digits are discarded from the *returned* Rgb, but they
+        // must still be validated as hex — "GGFF0000" must not silently
+        // resolve just because its RGB tail happens to parse.
+        let color = ColorRef::Rgb(Arc::from("GGFF0000"));
+        assert_eq!(resolve_color(&color, None), None);
+    }
+
+    #[test]
     fn resolve_color_rgb_variant_multibyte_utf8_at_the_expected_byte_length_does_not_panic() {
         // Regression test: "a" (1 byte) + "€" (3 bytes, U+20AC) + "1234"
         // (4 bytes) totals 8 *bytes* (matching the ARGB length check), but
         // byte index 2 falls inside "€"'s 3-byte encoding — not a char
-        // boundary. Slicing `&s[2..]` before checking `is_ascii()` would
-        // panic on this input ("byte index 2 is not a char boundary").
-        // ColorRef::Rgb never validates its value at parse time, so this
-        // exact shape is reachable from an untrusted, crafted .xlsx file.
+        // boundary. An earlier version sliced `&s[2..]` before checking
+        // `is_ascii()`, which panicked on this input ("byte index 2 is not
+        // a char boundary"); the current implementation never slices `s`
+        // at all. ColorRef::Rgb never validates its value at parse time,
+        // so this exact shape is reachable from an untrusted, crafted
+        // .xlsx file.
         let multibyte = "a€1234";
         assert_eq!(multibyte.len(), 8);
         let color = ColorRef::Rgb(Arc::from(multibyte));
