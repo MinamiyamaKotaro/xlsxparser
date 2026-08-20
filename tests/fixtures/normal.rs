@@ -331,3 +331,61 @@ pub fn inline_strings() -> Vec<u8> {
         ),
     ])
 }
+
+/// Three `t="d"` (ISO 8601, ECMA-376 Part 1's extension) cells covering the
+/// shapes real files use (Issue #58, confirmed against calamine's
+/// `date_iso.xlsx` test-corpus fixture — not committed to this repo, see
+/// `tests/fixtures/other`'s `.gitignore` entry): date-only, date+time, and
+/// time-only.
+pub fn iso8601_dates() -> Vec<u8> {
+    let rows = r#"<row r="1">
+  <c r="A1" t="d"><v>2021-01-01</v></c>
+  <c r="A2" t="d"><v>2021-01-01T10:10:10</v></c>
+  <c r="A3" t="d"><v>10:10:10</v></c>
+</row>"#;
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[("rId1", "worksheet", "worksheets/sheet1.xml")]).as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(rows, "").as_bytes(),
+        ),
+    ])
+}
+
+/// A package whose workbook part lives at the package root (`workbook.xml`)
+/// rather than the conventional `xl/workbook.xml`, discoverable only
+/// through `_rels/.rels`'s `officeDocument` relationship (Issue #55,
+/// confirmed against calamine's `minimal_package.xlsx` test-corpus fixture
+/// — not committed to this repo, see `tests/fixtures/other`'s
+/// `.gitignore` entry). `build_zip` normally injects a default
+/// `_rels/.rels` pointing at `xl/workbook.xml`; supplying our own here
+/// overrides that (see `build_zip`'s doc comment).
+pub fn workbook_at_package_root() -> Vec<u8> {
+    let rows = r#"<row r="1">
+  <c r="A1"><v>42</v></c>
+</row>"#;
+
+    build_zip(&[
+        (
+            "_rels/.rels",
+            rels_xml(&[("rId1", "officeDocument", "workbook.xml")]).as_bytes(),
+        ),
+        (
+            "_rels/workbook.xml.rels",
+            rels_xml(&[("rId1", "worksheet", "sheet1.xml")]).as_bytes(),
+        ),
+        (
+            "workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        ("sheet1.xml", worksheet_xml(rows, "").as_bytes()),
+    ])
+}

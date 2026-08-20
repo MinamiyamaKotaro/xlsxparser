@@ -313,3 +313,61 @@ fn inline_strings_are_extracted_without_a_shared_string_table() {
         Some(CellValue::Text(Arc::from("Inline Two")))
     );
 }
+
+#[test]
+fn t_d_iso8601_cells_resolve_to_datetime() {
+    // Issue #58: t="d" cells were falling back to CellValue::Text instead
+    // of being parsed as dates.
+    let workbook = parse_workbook_reader(Cursor::new(normal::iso8601_dates())).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    assert_eq!(
+        sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
+        Some(CellValue::DateTime(DateTimeValue {
+            year: 2021,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        }))
+    );
+    assert_eq!(
+        sheet.get(CellRef { row: 2, col: 1 }).unwrap().value,
+        Some(CellValue::DateTime(DateTimeValue {
+            year: 2021,
+            month: 1,
+            day: 1,
+            hour: 10,
+            minute: 10,
+            second: 10,
+        }))
+    );
+    // Time-only: no date component in the source, so it lands on Excel's
+    // own "time of day" convention (serial day 0 = 1899-12-30).
+    assert_eq!(
+        sheet.get(CellRef { row: 3, col: 1 }).unwrap().value,
+        Some(CellValue::DateTime(DateTimeValue {
+            year: 1899,
+            month: 12,
+            day: 30,
+            hour: 10,
+            minute: 10,
+            second: 10,
+        }))
+    );
+}
+
+#[test]
+fn workbook_part_at_package_root_resolves_via_root_rels() {
+    // Issue #55: the workbook part path was hardcoded to xl/workbook.xml
+    // rather than resolved via the package root's _rels/.rels, per OPC.
+    let workbook = parse_workbook_reader(Cursor::new(normal::workbook_at_package_root())).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    assert_eq!(sheet.name, "Sheet1");
+    assert_eq!(
+        sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
+        Some(CellValue::Number(42.0))
+    );
+}

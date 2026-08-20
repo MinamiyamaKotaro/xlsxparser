@@ -196,7 +196,7 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
 - Verify that a minimal, valid `.xlsx`-shaped ZIP (one sheet, containing numbers, shared-string references, and a merged cell) passed to `run` returns `Ok` with the expected `Workbook` (an integration test)
 - Verify that a ZIP with no `_rels/.rels` returns `Error::MissingRelationshipPart` (Issue #55)
 - Verify that a ZIP whose `_rels/.rels` carries no `officeDocument`-typed relationship returns `Error::InvalidPackage` (Issue #55)
-- Verify that `run` still resolves correctly when the workbook part lives at the package root (`workbook.xml`) rather than `xl/workbook.xml`, discoverable only via `_rels/.rels` — `tests/fixtures/other/minimal_package.xlsx` (from calamine's test corpus) is a real-world example of exactly this (Issue #55)
+- Verify that `run` still resolves correctly when the workbook part lives at the package root (`workbook.xml`) rather than `xl/workbook.xml`, discoverable only via `_rels/.rels` (a real-world example of exactly this is `tests/fixtures/other/minimal_package.xlsx`, from calamine's test corpus — that directory is `.gitignore`d and not part of this repo, so the integration test itself reproduces the same shape via a hand-authored fixture through `tests/fixtures/builder.rs`. Issue #55)
 - Verify that a ZIP with no `xl/_rels/workbook.xml.rels` returns `Error::MissingRelationshipPart`
 - Verify that a ZIP with no `xl/workbook.xml` returns `Error::InvalidPackage`
 - Verify that returns `Error::DanglingRelationship` when a `workbook.xml` `<sheet r:id="...">`'s r:id is not found in the rels

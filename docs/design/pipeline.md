@@ -192,7 +192,7 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
 - 正当な最小構成の `.xlsx` 相当ZIP（1シート、数値・共有文字列参照・結合セルを含む）を `run` に渡し、`Ok` で期待する `Workbook` が得られることの確認（統合テスト）
 - `_rels/.rels` が存在しないZIPに対し `Error::MissingRelationshipPart` を返すことの確認（Issue #55）
 - `_rels/.rels` は存在するが `officeDocument` タイプの関係が無いZIPに対し `Error::InvalidPackage` を返すことの確認（Issue #55）
-- workbookパーツが `xl/workbook.xml` ではなくパッケージルート直下（`workbook.xml`）にあり、`_rels/.rels` 経由でのみ発見可能なZIPでも `run` が正しく解決できることの確認——`tests/fixtures/other/minimal_package.xlsx`（calamineテストコーパス由来）が実例として存在する（Issue #55）
+- workbookパーツが `xl/workbook.xml` ではなくパッケージルート直下（`workbook.xml`）にあり、`_rels/.rels` 経由でのみ発見可能なZIPでも `run` が正しく解決できることの確認(実例として `tests/fixtures/other/minimal_package.xlsx` ——calamineテストコーパス由来。同ディレクトリは`.gitignore`対象でリポジトリには含まれないため、統合テスト自体は同じ構造を再現した手書きフィクスチャ(`tests/fixtures/builder.rs` 経由)を用いる。Issue #55)
 - `xl/_rels/workbook.xml.rels` が存在しないZIPに対し `Error::MissingRelationshipPart` を返すことの確認
 - `xl/workbook.xml` が存在しないZIPに対し `Error::InvalidPackage` を返すことの確認
 - `workbook.xml` の `<sheet r:id="...">` が指す r:id が rels 内に存在しない場合に `Error::DanglingRelationship` を返すことの確認
