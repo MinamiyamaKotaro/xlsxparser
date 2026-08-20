@@ -101,11 +101,20 @@ fn real_houganshi_merged_xlsx_resolves_the_whole_region_to_the_anchor() {
 
 #[test]
 fn real_cell_hyperlinks_xlsx_resolves_external_and_location_only_hyperlinks() {
-    // scripts/generate_real_fixtures.py's cell_hyperlinks(): openpyxl
-    // declares xmlns:r inline on the <hyperlink> element itself (not on
-    // the <worksheet> root the way every hand-authored fixture does) —
-    // this is what a real fixture is for, catching an XML shape none of
-    // the synthetic tests happen to exercise.
+    // scripts/generate_real_fixtures.py's cell_hyperlinks(): a real,
+    // openpyxl-authored external hyperlink (assigned relationship id,
+    // TargetMode="External", tooltip) plus a location-only internal jump
+    // with no r:id at all, resolved end to end through actual ZIP/XML
+    // bytes rather than the hand-authored snippets pipeline.rs's own unit
+    // tests use — the standard rationale this whole file exists for (see
+    // its module doc). Notably, openpyxl happens to declare xmlns:r
+    // inline on the <hyperlink> element itself, rather than anywhere
+    // hand-authored fixtures in this repo ever place it (they never
+    // declare it at all) — parse/worksheet.rs's plain string-prefix
+    // attribute matching (parse/mod.md Open Question 4's policy) is
+    // indifferent to either shape by design, and this pins that down
+    // against a real writer's actual output instead of leaving it an
+    // untested assumption.
     let workbook = parse_workbook(fixture_path("complex/cell_hyperlinks.xlsx")).unwrap();
     let sheet = &workbook.sheets()[0];
 
