@@ -147,8 +147,12 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
                 r_id: route.worksheet_path.clone(),
             }
         })?;
-        let output =
-            parse::parse_worksheet(BufReader::new(reader), &route.worksheet_path, &mut sheet)?;
+        let output = parse::parse_worksheet(
+            BufReader::new(reader),
+            &route.worksheet_path,
+            &mut sheet,
+            date1904,
+        )?;
 
         // --- Phase 3.5: image anchor resolution (Issue #65), only if this
         // sheet declared a <drawing r:id>. Kept in pipeline.rs rather than
