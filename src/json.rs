@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn single_numeric_cell_round_trips_through_json_string() {
         let sheet = sheet_with_one_cell("Sheet1", Some(CellValue::Number(42.0)));
-        let workbook = Workbook::new(vec![sheet]);
+        let workbook = Workbook::new(vec![sheet], None);
 
         let json = to_json_string(&workbook).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -477,7 +477,7 @@ mod tests {
                 })),
             },
         );
-        let workbook = Workbook::new(vec![sheet]);
+        let workbook = Workbook::new(vec![sheet], None);
 
         let json = to_json_string(&workbook).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -506,7 +506,7 @@ mod tests {
                 })),
             },
         );
-        let workbook = Workbook::new(vec![sheet]);
+        let workbook = Workbook::new(vec![sheet], None);
 
         let json = to_json_string(&workbook).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -525,7 +525,7 @@ mod tests {
                 style: Some(Arc::new(ResolvedStyle::default())),
             },
         );
-        let workbook = Workbook::new(vec![sheet]);
+        let workbook = Workbook::new(vec![sheet], None);
 
         let json = to_json_string(&workbook).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -548,7 +548,7 @@ mod tests {
                 })),
             },
         );
-        let workbook = Workbook::new(vec![sheet]);
+        let workbook = Workbook::new(vec![sheet], None);
 
         let json = to_json_string(&workbook).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -580,7 +580,7 @@ mod tests {
                 })),
             },
         );
-        let workbook = Workbook::new(vec![sheet]);
+        let workbook = Workbook::new(vec![sheet], None);
 
         let json = to_json_string(&workbook).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -608,7 +608,7 @@ mod tests {
                 })),
             },
         );
-        let workbook = Workbook::new(vec![sheet]);
+        let workbook = Workbook::new(vec![sheet], None);
 
         let json = to_json_string(&workbook).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -633,7 +633,7 @@ mod tests {
                 })),
             },
         );
-        let workbook = Workbook::new(vec![sheet]);
+        let workbook = Workbook::new(vec![sheet], None);
 
         let json = to_json_string(&workbook).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -655,7 +655,7 @@ mod tests {
                 style: Some(Arc::new(ResolvedStyle::default())),
             },
         );
-        let workbook = Workbook::new(vec![sheet]);
+        let workbook = Workbook::new(vec![sheet], None);
 
         let json = to_json_string(&workbook).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -683,7 +683,7 @@ mod tests {
     #[test]
     fn unstyled_cell_omits_the_style_field_entirely() {
         let sheet = sheet_with_one_cell("Sheet1", Some(CellValue::Number(1.0)));
-        let workbook = Workbook::new(vec![sheet]);
+        let workbook = Workbook::new(vec![sheet], None);
 
         let json = to_json_string(&workbook).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -710,7 +710,7 @@ mod tests {
             ],
             Some(8.43),
         );
-        let workbook = Workbook::new(vec![sheet]);
+        let workbook = Workbook::new(vec![sheet], None);
 
         let json = to_json_string(&workbook).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -742,7 +742,7 @@ mod tests {
             start: CellRef { row: 1, col: 1 },
             end: CellRef { row: 2, col: 3 },
         });
-        let workbook = Workbook::new(vec![sheet]);
+        let workbook = Workbook::new(vec![sheet], None);
 
         let json = to_json_string(&workbook).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -755,7 +755,7 @@ mod tests {
     #[test]
     fn unmerged_cell_omits_span_fields() {
         let sheet = sheet_with_one_cell("Sheet1", Some(CellValue::Number(1.0)));
-        let workbook = Workbook::new(vec![sheet]);
+        let workbook = Workbook::new(vec![sheet], None);
 
         let json = to_json_string(&workbook).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -798,7 +798,7 @@ mod tests {
                 style: Some(style),
             },
         );
-        let workbook = Workbook::new(vec![sheet]);
+        let workbook = Workbook::new(vec![sheet], None);
 
         let json = to_json_string(&workbook).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -809,7 +809,7 @@ mod tests {
     fn non_finite_numbers_fall_back_to_empty_without_erroring() {
         for n in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let sheet = sheet_with_one_cell("Sheet1", Some(CellValue::Number(n)));
-            let workbook = Workbook::new(vec![sheet]);
+            let workbook = Workbook::new(vec![sheet], None);
 
             let json = to_json_string(&workbook).unwrap();
             let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -873,7 +873,7 @@ mod tests {
                 style: None,
             },
         );
-        let workbook = Workbook::new(vec![sheet]);
+        let workbook = Workbook::new(vec![sheet], None);
 
         let json = to_json_string(&workbook).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -885,11 +885,14 @@ mod tests {
 
     #[test]
     fn hidden_and_very_hidden_sheets_report_visibility() {
-        let workbook = Workbook::new(vec![
-            Sheet::new("Vis".into(), SheetVisibility::Visible),
-            Sheet::new("Hid".into(), SheetVisibility::Hidden),
-            Sheet::new("VHid".into(), SheetVisibility::VeryHidden),
-        ]);
+        let workbook = Workbook::new(
+            vec![
+                Sheet::new("Vis".into(), SheetVisibility::Visible),
+                Sheet::new("Hid".into(), SheetVisibility::Hidden),
+                Sheet::new("VHid".into(), SheetVisibility::VeryHidden),
+            ],
+            None,
+        );
 
         let json = to_json_string(&workbook).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -904,7 +907,7 @@ mod tests {
 
     #[test]
     fn zero_sheet_workbook_serializes_as_empty_array() {
-        let workbook = Workbook::new(vec![]);
+        let workbook = Workbook::new(vec![], None);
         assert_eq!(to_json_string(&workbook).unwrap(), r#"{"sheets":[]}"#);
     }
 
@@ -920,10 +923,10 @@ mod tests {
             }
         }
 
-        let workbook = Workbook::new(vec![sheet_with_one_cell(
-            "Sheet1",
-            Some(CellValue::Number(1.0)),
-        )]);
+        let workbook = Workbook::new(
+            vec![sheet_with_one_cell("Sheet1", Some(CellValue::Number(1.0)))],
+            None,
+        );
         let err = to_json_writer(&workbook, FailingWriter).unwrap_err();
         assert!(matches!(err, Error::JsonSerialize { .. }));
     }

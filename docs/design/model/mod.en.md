@@ -6,7 +6,7 @@ Design doc for `src/model/mod.rs`. This is purely an aggregation file: it declar
 
 ## Responsibility / Scope
 
-- Declaring submodules (`mod cell; mod sheet; mod workbook; mod style;`)
+- Declaring submodules (`mod cell; mod sheet; mod workbook; mod style; mod color;`)
 - Re-exporting public types (`pub use cell::{Cell, CellValue, CellRef};` etc.)
 - **Not responsible for**: type definitions themselves (the responsibility of each submodule), or any logic — per architecture.md's policy that `model/` holds only pure data structures with no logic, `mod.rs` contains no processing either.
 
@@ -17,18 +17,22 @@ mod cell;
 mod sheet;
 mod workbook;
 mod style;
+mod color;
 
 pub use cell::{Cell, CellRef, CellValue};
 pub use sheet::{MergedRegion, Sheet, SheetVisibility};
 pub use workbook::Workbook;
-pub use style::{ResolvedStyle, StyleId, StyleSheet};
+pub use style::{Alignment, ColorRef, Font, ResolvedStyle, StyleId, StyleSheet};
+pub use color::{Rgb, ThemePalette};
 ```
+
+`Rgb`/`ThemePalette` ([`model/color.rs`](color.en.md), Issue #76) are re-exported as part of the public API surface reachable from `Workbook::theme()`/`ResolvedStyle.fill_fg_color` and similar — calling [`resolve::color::resolve_color`](../resolve/color.en.md) directly from outside the crate (the "Option A" call shape, see [resolve/color.md](../resolve/color.en.md)) is not possible without these types being public.
 
 `DateTimeValue` (see open question 4 in [model/cell.md](cell.en.md)) is already defined inside `model/cell.rs`, so it is included in the `cell::{..}` re-export. [`lib.md`](../lib.en.md)'s design settled that re-exporting `DateTimeValue` is mandatory, since `CellValue::DateTime` is part of the crate's public API (the concrete type itself remains a separate matter, handled by [model/cell.md Open Question 4](cell.en.md)). Where `ResolvedStyle` / `StyleSheet` / `StyleId` live has now been settled by adding [`model/style.rs`](style.en.md) (resolves the former Open Question 1 — addresses PR #8 review feedback).
 
 ## Dependencies
 
-- Depends on: [`model/cell.rs`](cell.en.md), [`model/sheet.rs`](sheet.en.md), [`model/workbook.rs`](workbook.en.md), [`model/style.rs`](style.en.md) (all as `mod` declarations)
+- Depends on: [`model/cell.rs`](cell.en.md), [`model/sheet.rs`](sheet.en.md), [`model/workbook.rs`](workbook.en.md), [`model/style.rs`](style.en.md), [`model/color.rs`](color.en.md) (all as `mod` declarations)
 - Depended on by: other layers within the crate such as `resolve/`, `parse/`, `json.rs`, `lib.rs` (which reference types via this file, e.g. `crate::model::Workbook`)
 
 ## Error Handling Policy

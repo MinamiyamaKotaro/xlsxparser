@@ -6,11 +6,13 @@
 //! `docs/design/architecture.en.md`.
 
 mod cell;
+mod color;
 mod sheet;
 mod style;
 mod workbook;
 
 pub use cell::{Cell, CellRef, CellValue, DateTimeValue};
+pub use color::{Rgb, ThemePalette};
 pub use sheet::{
     AnchorMarker, ColWidthRange, Image, ImageAnchor, ImageExtent, MergedRegion, Sheet,
     SheetVisibility,
