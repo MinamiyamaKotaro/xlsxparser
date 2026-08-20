@@ -81,7 +81,7 @@ pub struct Cell {
 ## Dependencies
 
 - Depends on: none (a leaf module with no dependency on any sibling module within `model/`)
-- Depended on by: `model::Sheet` (uses `CellRef`, or an equivalent tuple, as the key of `HashMap<(u32, u32), Cell>`), `resolve/`, `json.rs`
+- Depended on by: `model::Sheet` (uses `CellRef`, or an equivalent tuple, as the key of `BTreeMap<(u32, u32), Cell>` — see [model/sheet.en.md](sheet.en.md) for why `BTreeMap` rather than `HashMap`), `resolve/`, `json.rs`
 
 `resolve/style.rs` clones the `Arc` for the relevant style out of [`model/style.rs`](style.en.md)'s `StyleSheet` (`HashMap<StyleId, Arc<ResolvedStyle>>`) and assigns it to each cell. Because each cell holds (a share of) the actual data's ownership via `Arc`, the `StyleSheet` container itself can be dropped once Phase 4 completes — satisfying both `pipeline.rs`'s policy of immediate disposal and the memory-efficiency requirement of avoiding value copies. The same relationship holds between `resolve/shared_strings.rs` and `Arc<str>`.
 

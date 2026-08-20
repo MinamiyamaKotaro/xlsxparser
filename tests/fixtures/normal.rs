@@ -460,3 +460,40 @@ pub fn unicode_text() -> Vec<u8> {
         ),
     ])
 }
+
+/// `<row>` elements deliberately stream in a scrambled order (3, then 1,
+/// then 2), each with its own out-of-order `<c>` columns, mirroring how a
+/// third-party writer or a hand-edited file might not emit rows
+/// top-to-bottom. Verifies the JSON `cells` array comes out sorted by
+/// `(row, col)` regardless — the actual guarantee Issue #87 is about,
+/// checked end to end through the real parsing pipeline rather than just
+/// `Sheet::iter_cells` directly (`model::sheet`'s own unit test covers
+/// that half).
+pub fn cells_streamed_out_of_order() -> Vec<u8> {
+    let rows = r#"<row r="3">
+  <c r="B3" t="str"><v>B3</v></c>
+  <c r="A3" t="str"><v>A3</v></c>
+</row>
+<row r="1">
+  <c r="C1" t="str"><v>C1</v></c>
+  <c r="A1" t="str"><v>A1</v></c>
+</row>
+<row r="2">
+  <c r="A2" t="str"><v>A2</v></c>
+</row>"#;
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[("rId1", "worksheet", "worksheets/sheet1.xml")]).as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(rows, "").as_bytes(),
+        ),
+    ])
+}

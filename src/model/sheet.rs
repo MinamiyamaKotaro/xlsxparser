@@ -5,7 +5,7 @@
 //! transparent merged-cell access.
 
 use crate::model::cell::{Cell, CellRef};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A merged range. Holds the top-left (origin cell) and bottom-right
 /// coordinates.
@@ -113,7 +113,29 @@ pub enum SheetVisibility {
 pub struct Sheet {
     pub name: String,
     pub visibility: SheetVisibility,
-    cells: HashMap<CellRef, Cell>,
+    /// `BTreeMap` rather than `HashMap` (Issue #87): `iter_cells`'s
+    /// iteration order feeds `json.rs`'s `cells` array directly, and a
+    /// `HashMap`'s order is randomized per-process (a fresh hash seed each
+    /// run, for HashDoS resistance) — harmless for a diff that matches
+    /// cells by `(row, col)`, but a real problem for a *textual* diff
+    /// (`git diff` or similar) of two JSON snapshots of the same
+    /// unchanged file: identical cells reordered by chance looks like a
+    /// wall of spurious changes. `BTreeMap`'s key order is `CellRef`'s
+    /// derived `Ord` — `row` compared before `col` (declaration order),
+    /// giving exactly the row-major, then-column-major order a human
+    /// reading the JSON would expect — for free, with no separate sort
+    /// step. Measured (PoC on Issue #87, `massive_dense_accounting.xlsx`,
+    /// 300,000 cells): ~9-12% faster end to end than `HashMap` despite
+    /// `BTreeMap`'s reputation for being the slower of the two — SipHash's
+    /// cost per `CellRef` (an 8-byte key) turned out to exceed a B-tree
+    /// node's few integer comparisons in practice, and `HashMap::new()`'s
+    /// unsized start means repeated rehash-and-grow while streaming in
+    /// cells, each temporarily holding old and new tables at once (a
+    /// ~54% peak-memory spike over steady state that `BTreeMap`'s
+    /// incremental per-node growth doesn't have). The one real cost:
+    /// ~9% more steady-state memory per cell (node/pointer overhead) —
+    /// accepted as the trade-off for deterministic output.
+    cells: BTreeMap<CellRef, Cell>,
     /// origin cell coordinate -> merged region. Also doubles as the source
     /// of truth for resolving a virtual coordinate to its origin (see
     /// `resolve_origin`) via geometric containment, rather than
@@ -166,7 +188,7 @@ impl Sheet {
         Self {
             name,
             visibility,
-            cells: HashMap::new(),
+            cells: BTreeMap::new(),
             merged_regions: HashMap::new(),
             merge_bounds: None,
             max_row: 0,
@@ -538,6 +560,41 @@ mod tests {
         sheet.insert_merge(region);
         assert_eq!(sheet.merged_region_at(r(1, 1)), Some(&region));
         assert_eq!(sheet.merged_region_at(r(2, 2)), None);
+    }
+
+    #[test]
+    fn iter_cells_yields_row_major_then_column_major_order_regardless_of_insertion_order() {
+        // Issue #87: json.rs's `cells` array feeds `iter_cells` directly,
+        // so its order IS the JSON output order — this must be
+        // deterministic (row ascending, then column ascending within a
+        // row) for a textual diff of two snapshots of the same unchanged
+        // file to stay quiet, independent of the order `<c>` elements
+        // happened to stream in from the worksheet XML.
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let blank = || Cell {
+            value: None,
+            style: None,
+        };
+        // Deliberately scrambled insertion order — neither ascending nor
+        // descending — so a coincidental match with insertion order can't
+        // hide a bug.
+        for (row, col) in [(3, 2), (1, 5), (2, 1), (1, 1), (3, 1), (2, 3), (1, 3)] {
+            sheet.insert_cell(r(row, col), blank());
+        }
+
+        let coords: Vec<CellRef> = sheet.iter_cells().map(|(coord, _)| coord).collect();
+        assert_eq!(
+            coords,
+            vec![
+                r(1, 1),
+                r(1, 3),
+                r(1, 5),
+                r(2, 1),
+                r(2, 3),
+                r(3, 1),
+                r(3, 2),
+            ]
+        );
     }
 
     #[test]

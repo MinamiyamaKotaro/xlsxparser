@@ -6,7 +6,7 @@ Design doc for `src/model/sheet.rs`. Using `Cell` / `CellRef` from [model/cell.m
 
 ## Responsibility / Scope
 
-- Defines `Sheet`, a sparse matrix that holds only cells with data or formatting, backed by `HashMap<CellRef, Cell>`
+- Defines `Sheet`, a sparse matrix that holds only cells with data or formatting, backed by `BTreeMap<CellRef, Cell>` (changed from `HashMap` in Issue #87 — see the note right after the code block for details)
 - Resolves a virtual cell coordinate inside a merged region to its origin cell, enabling transparent access via `get()` (see Key Types for how — a bug found at implementation time ruled out the originally-drafted per-cell alias map; see the note right after the code block)
 - Keeps `cells` / `merged_regions` fully private, and only allows mutation through a narrow `pub(crate)` API (`insert_cell` / `insert_merge` / `get_mut`), so that `Sheet` itself enforces internal invariants such as keeping `max_row`/`max_col` in sync and backfilling a placeholder for a merge's origin cell
 - **Not responsible for**: parsing `<mergeCells>` XML (`parse/worksheet.rs`), or the decision logic that matches merge ranges against cell data and calls `insert_merge` (`resolve/merge.rs` — this file only provides the API that safely builds the mapping once called)
@@ -14,7 +14,7 @@ Design doc for `src/model/sheet.rs`. Using `Cell` / `CellRef` from [model/cell.m
 ## Key Types (draft)
 
 ```rust
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use crate::model::cell::{Cell, CellRef};
 
 /// A merged range. Holds the top-left (origin cell) and bottom-right coordinates.
@@ -46,7 +46,7 @@ pub enum SheetVisibility {
 pub struct Sheet {
     pub name: String,
     pub visibility: SheetVisibility,
-    cells: HashMap<CellRef, Cell>,
+    cells: BTreeMap<CellRef, Cell>,
     /// origin cell coordinate -> merged region. Also the sole source of
     /// truth for resolving a virtual coordinate to its origin (via
     /// `resolve_origin`'s geometric containment check) — see the note
@@ -69,7 +69,7 @@ impl Sheet {
         Self {
             name,
             visibility,
-            cells: HashMap::new(),
+            cells: BTreeMap::new(),
             merged_regions: HashMap::new(),
             max_row: 0,
             max_col: 0,
@@ -233,6 +233,10 @@ impl Sheet {
     /// remaining `cells` key is its own origin, so a plain `cells.iter()`
     /// is correct on its own. See the note after the code block (Issue
     /// #43) for why this changed from the PR #20-era filtered version.
+    /// Because `cells` is a `BTreeMap`, this iteration order also follows
+    /// `CellRef`'s derived `Ord` (row compared before column), giving a
+    /// deterministic row-major, then-column-major order (Issue #87 — see
+    /// the note after the code block).
     pub fn iter_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
         self.cells.iter().map(|(&r, c)| (r, c))
     }
@@ -254,6 +258,16 @@ The fix that held up is `Sheet::finalize_merges`: called once by `resolve::merge
 `column_width(col) -> Option<f64>` binary-searches `col_widths` — `partition_point` for the last range with `min <= col`, then checks whether that range's `max` actually reaches `col` — giving O(log R) regardless of how a file arranges its ranges (R capped at `resolve::column_width::MAX_COLUMN_WIDTH_RANGES`, 2,000). Returns `None` (not a guessed default like Excel's common "Calibri 11 ≈ 8.43 characters") when nothing covers `col` and no `defaultColWidth` was set: that fallback depends on font metrics this library does not compute, so an explicit absence is preferred over a possibly-wrong number. `col_width_ranges()` exposes the raw sorted `Vec` for `json.rs` to serialize as a sheet-level `columns` array — deliberately *not* looked up once per cell and embedded into each cell's JSON object, since a column-level value repeated onto every populated cell in that column would multiply output size for no benefit, working directly against the sparse-output design this library exists for (raised during Issue #36's review discussion, before the column-width work had its own sub-issue).
 
 **Feature: images (Issue #65).** `Sheet` also holds `images: Vec<Image>`, populated once by `pipeline.rs`'s Phase 3.5 via `Sheet::set_images` — the same "resolve elsewhere, register once" split as `set_col_widths`. Unlike `merged_regions`, images are not keyed by any cell coordinate at all: an `ImageAnchor::TwoCell`/`OneCell` marker carries an EMU-unit offset within its cell, so an anchor's position doesn't always align to a cell boundary the way a `MergedRegion`'s does, and there is no single cell an image is naturally "owned by." `images()` exposes the raw `Vec` for `json.rs` to serialize as a sheet-level `images` array, for the same sparse-output reasoning as `col_width_ranges` (see above) — with the added point that there is no cell to attach an image to even if per-cell duplication were otherwise desirable.
+
+**Fix: `cells` changed from `HashMap` to `BTreeMap` (Issue #87).** `iter_cells`'s iteration order feeds `json.rs`'s `cells` array directly, but a `HashMap`'s iteration order depends on a per-process random hash seed (HashDoS resistance), so parsing the same file twice could produce a different cell order in the output JSON each time. This is harmless for use cases that match cells by coordinate `(row, col)`, but a report surfaced a real problem for a *textual* diff (`git diff` or similar) of two JSON snapshots of the same, unchanged file: cells that hadn't actually changed, merely reordered by chance, showed up as a wall of spurious differences. `BTreeMap` iterates in the order of key type `CellRef`'s derived `Ord` (fields compared in declaration order, so `row` before `col`), which gives the row-major, then-column-major order a human reading the JSON would expect, for free, with no separate sort step needed.
+
+Issue #87's PoC (`massive_dense_accounting.xlsx`, 300,000 cells; measured with a custom byte-counting allocator and macOS's `sample` profiler) found:
+
+- **CPU / wall time**: `BTreeMap` is roughly 9-13% faster end to end — counter to `HashMap`'s reputation as the faster structure, but `CellRef` is an 8-byte key, small enough that SipHash's per-key cost turned out to exceed the cost of a B-tree node's handful of integer comparisons.
+- **Peak memory during parsing**: `BTreeMap` is roughly 26% better. `HashMap::new()` starts unsized and repeatedly rehashes-and-grows while cells stream in, each time briefly holding both the old and new tables at once — a roughly 54% spike over steady state that `BTreeMap`'s incremental, per-node growth never exhibits.
+- **Steady-state memory**: `BTreeMap` is roughly 9.2% worse (about 78.3 bytes/cell vs. `HashMap`'s about 71.7 bytes/cell — node/pointer overhead). Accepted as the trade-off for deterministic output. A separate PoC also confirmed insertion order (ascending/descending/shuffled) doesn't meaningfully move steady-state memory — relevant because `Sheet::insert_cell` is called in the XML's own appearance order by `parse/worksheet.rs`, which is not guaranteed to be row/column-ascending for every real file.
+
+`merged_regions` (an internal-only O(1)/O(N) lookup keyed by origin cell, whose iteration order is never reflected in `json.rs`'s output) is intentionally left as `HashMap` — out of scope for this fix.
 
 ## Dependencies
 
@@ -287,11 +301,13 @@ The `cells` / `merged_regions` fields themselves stay fully private — not even
 - **End-to-end regression: a file with `MAX_MERGE_REGIONS` merges arranged to maximize `merge_bounds` (two arranged at opposite corners) plus hundreds of thousands of unrelated cells completes JSON generation without the multi-second stall measured pre-fix** (`tests/security.rs`'s `sparse_merge_bounding_box_does_not_amplify_json_generation_cost`, using the `sparse_merge_bounding_box_amplification` fixture — categorized under Category 5 (security) rather than Category 4 (load), since it's specifically an adversarial-arrangement DoS concern, matching `zip_bomb`/`zip_slip`/`xxe_attack`)
 - **`column_width` returns `None` with no ranges and no `defaultColWidth`**, **binary search correctness across multiple ranges** (including boundary values: inside a range, in a gap between ranges, falling back to `defaultColWidth`), **`col_width_ranges`/`default_col_width` expose the raw values for JSON output** (Issue #39; detailed validation lives in `resolve::column_width`'s own test suite)
 - **`images()` exposes the raw `Vec` set by `set_images`, unmodified** (Issue #65; per-anchor resolution correctness lives in `parse::drawing`'s and `pipeline.rs`'s own test suites)
+- **Verifying `iter_cells`'s iteration order is deterministic — row-major, then column-major, following `CellRef`'s `Ord` — regardless of insertion order** (Issue #87; the guarantee that comes from `cells` being a `BTreeMap`. [`tests/normal.rs`'s `json_cells_array_is_sorted_by_row_then_col_regardless_of_source_order`](../../../tests/normal.rs) uses a fixture whose insertion order is deliberately scrambled, modeling a real file whose XML appearance order is not row/column-ascending)
 
 ## Open Questions
 
 1. ~~Managing sheet dimensions (used range)~~ → **Resolved**: `<dimension>` elements generated by third-party tools can be inaccurate or missing, so they are not trusted. `max_row` / `max_col` are updated incrementally on each cell insertion and exposed as public fields on `Sheet` for O(1) retrieval (finalized following the [PR #5 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948235239)). `insert_merge` updates `max_row`/`max_col` using the region's end coordinate (`region.end`) as well as the origin cell — since the end coordinate is a virtual cell never inserted into `cells`, it is not picked up via `insert_cell` and needs this explicit update (flagged and fixed following [a further review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948277539)).
-2. **Key type for `cells`**: Whether to adopt `HashMap<CellRef, Cell>` or the `HashMap<(u32, u32), Cell>` shown as an example in the requirements spec. `CellRef` already implements `Hash` so the two are type-equivalent, but which to use is still to be decided from a readability / API-consistency standpoint.
+2. **Key type for `cells`**: Whether to adopt `BTreeMap<CellRef, Cell>` or the `HashMap<(u32, u32), Cell>` shown as an example in the requirements spec. `CellRef` already implements both `Hash` and `Ord` so the two are type-equivalent, but which to use is still to be decided from a readability / API-consistency standpoint (the container type itself is resolved separately — see item 6; this item is only about whether the key stays the `CellRef` struct or is flattened to a tuple).
 3. **Handling of duplicate/invalid merge ranges**: How `resolve/merge.rs` should behave if a malicious or corrupted XLSX contains overlapping merge ranges (reject with an error, or overwrite on a last-write-wins basis) is undecided. Note that this file's API design (`insert_merge` called multiple times is assumed to simply overwrite) assumes "last write wins."
 4. **Other `worksheet.xml` metadata such as frozen rows/columns**: Not explicitly covered by the requirements spec, but if things like `freezePane` are handled in the future, whether to hold them on `Sheet` or split them into a separate type is undecided (currently out of scope and not included in the type). Visibility is resolved (see Open Question 1 of workbook.md).
 5. ~~Crate-internal access to private fields~~ → **Resolved**: rather than making fields like `cells` directly `pub(crate)`, `Sheet` implements the narrow API `insert_cell` / `insert_merge` / `get_mut` and disallows direct access from anywhere else (finalized following the [PR #5 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948259819); see the Dependencies section for the comparison against directly exposing the fields).
+6. ~~Container type for `cells` (`HashMap` vs. `BTreeMap`)~~ → **Resolved**: adopted `BTreeMap<CellRef, Cell>` (Issue #87). Because `iter_cells`'s iteration order feeds `json.rs`'s `cells` array directly, `HashMap`'s per-process random hash seed meant re-parsing the same file could shuffle unrelated cells in the output, which showed up as spurious noise in a textual diff of two JSON snapshots. PoC measurements (see the note after the code block) confirmed `BTreeMap` doesn't lose on CPU or peak memory either — it's ahead on both — before finalizing the switch. `merged_regions` is out of scope (stays `HashMap`) since its order never reaches JSON output.

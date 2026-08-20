@@ -35,7 +35,7 @@ src/
   model/                    # Pure domain model (no dependency on XML parsing or resolution logic)
     mod.rs
     cell.rs               # CellValue, Cell, CellRef (A1 notation <-> coordinates)
-    sheet.rs              # Sparse matrix Sheet (HashMap<(u32, u32), Cell>)
+    sheet.rs              # Sparse matrix Sheet (BTreeMap<(u32, u32), Cell>)
     workbook.rs           # Resolved Workbook model
     style.rs              # ResolvedStyle / StyleSheet / StyleId (shared vocabulary between parse/styles.rs and resolve/style.rs; added per PR #8 review feedback)
 
@@ -91,7 +91,7 @@ The layer that aggregates dependencies on XML parsing libraries such as `quick-x
 
 ### `model/`
 
-Defines pure Rust data structures such as `Cell` / `Sheet` / `Workbook`. Has no dependency on XML parsing or resolution logic. Optimizes memory usage via a sparse matrix (`HashMap<(row, col), Cell>`).
+Defines pure Rust data structures such as `Cell` / `Sheet` / `Workbook`. Has no dependency on XML parsing or resolution logic. Optimizes memory usage via a sparse matrix (`BTreeMap<(row, col), Cell>`). See [model/sheet.en.md](model/sheet.en.md) for why `BTreeMap` (changed from `HashMap`).
 
 - Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [mod.md](model/mod.en.md) / [cell.md](model/cell.en.md) / [sheet.md](model/sheet.en.md) / [workbook.md](model/workbook.en.md) / [style.md](model/style.en.md)
 
