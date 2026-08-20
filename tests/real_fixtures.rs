@@ -100,6 +100,31 @@ fn real_houganshi_merged_xlsx_resolves_the_whole_region_to_the_anchor() {
 }
 
 #[test]
+fn real_cell_hyperlinks_xlsx_resolves_external_and_location_only_hyperlinks() {
+    // scripts/generate_real_fixtures.py's cell_hyperlinks(): openpyxl
+    // declares xmlns:r inline on the <hyperlink> element itself (not on
+    // the <worksheet> root the way every hand-authored fixture does) —
+    // this is what a real fixture is for, catching an XML shape none of
+    // the synthetic tests happen to exercise.
+    let workbook = parse_workbook(fixture_path("complex/cell_hyperlinks.xlsx")).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    let external = sheet
+        .hyperlink_at(CellRef { row: 2, col: 1 })
+        .expect("A2 must carry a hyperlink");
+    assert_eq!(external.target.as_deref(), Some("https://example.com/"));
+    assert_eq!(external.location, None);
+    assert_eq!(external.tooltip.as_deref(), Some("Visit example"));
+
+    let internal = sheet
+        .hyperlink_at(CellRef { row: 3, col: 1 })
+        .expect("A3 must carry a hyperlink");
+    assert_eq!(internal.target, None);
+    assert_eq!(internal.location.as_deref(), Some("Sheet1!A1"));
+    assert_eq!(internal.tooltip, None);
+}
+
+#[test]
 fn real_multi_sheet_states_xlsx_enumerates_every_visibility() {
     let workbook = parse_workbook(fixture_path("complex/multi_sheet_states.xlsx")).unwrap();
     let sheets = workbook.sheets();

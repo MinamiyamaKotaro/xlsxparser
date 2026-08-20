@@ -72,9 +72,14 @@ real file is what *found* the bug, but the committed test is what
   transparently across every coordinate it covers, all four sheet
   visibility states (including an empty sheet) enumerated together,
   embedded images (single-cell and two-cell anchors, grouped/rotated,
-  hyperlinks), and the extreme-sparse shape (`A1` + `XFD1048576`, Excel's
-  actual opposite corners) that motivates the sparse `HashMap` storage
-  model in the first place.
+  hyperlinks), cell hyperlinks (Issue #95 — external with a tooltip,
+  `location`-only internal; `real_fixtures.rs`'s `cell_hyperlinks.xlsx`
+  additionally caught a real-world XML shape — `xmlns:r` declared inline
+  on the `<hyperlink>` element rather than on the `<worksheet>` root —
+  none of the hand-authored fixtures happened to exercise), and the
+  extreme-sparse shape (`A1` + `XFD1048576`, Excel's actual opposite
+  corners) that motivates the sparse `HashMap` storage model in the first
+  place.
 - **Load** (`load.rs` / `real_load.rs`): 300,000 cells in a fully-packed
   10,000×30 block, 1,000 sheets in one workbook, and a 50,000-entry shared
   string table — each a scale/resource-exhaustion check, not a
