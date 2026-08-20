@@ -8,8 +8,9 @@ Design doc for `src/container/sanitize.rs`. Covers Phase 2 (sanitization) as def
 
 - **Zip Slip protection**: validates that a ZIP entry name cannot escape the archive's logical root (`validate_entry_path`)
 - **Zip Bomb protection**: provides a `Read` wrapper (`BoundedReader`) that enforces an uncompressed-size cap while streaming
-- Defines `SizeLimits`, the public configuration type callers use to set the Zip Bomb size caps (re-exported by `lib.rs` ([lib.md](../lib.en.md)) and used as the argument to `parse_workbook_with_limits`/`parse_workbook_reader_with_limits` — security review Finding 2)
-- **Not responsible for**: extracting the ZIP archive itself or enumerating its entries (`container/mod.rs`), interpreting XML syntax or XXE protection (`parse/` — per the discussion recorded in architecture.md, the XXE requirement from requirements spec section 2 has already been settled as `parse/mod.rs`'s responsibility)
+- Defines `SizeLimits`, the public configuration type callers use to set the Zip Bomb size caps and the per-sheet cell-count cap (`max_cells_per_sheet`, below) (re-exported by `lib.rs` ([lib.md](../lib.en.md)) and used as the argument to `parse_workbook_with_limits`/`parse_workbook_reader_with_limits` — security review Finding 2)
+- **Defines the cell-count cap's value itself** (Issue [#88](https://github.com/MinamiyamaKotaro/xlsxparser/issues/88)): `parse::worksheet` ([parse/worksheet.md](../parse/worksheet.en.md)) owns the actual logic that counts `<c>` elements while streaming; this module owns only the design decision of *where the cap value lives* (the same public `SizeLimits` type, alongside the Zip Bomb caps)
+- **Not responsible for**: extracting the ZIP archive itself or enumerating its entries (`container/mod.rs`), interpreting XML syntax or XXE protection (`parse/` — per the discussion recorded in architecture.md, the XXE requirement from requirements spec section 2 has already been settled as `parse/mod.rs`'s responsibility), actually counting cells and cutting the parse off (`parse::worksheet` — this module is only where the limit *value* lives)
 
 ## Key Types (draft)
 
@@ -29,11 +30,33 @@ pub const DEFAULT_MAX_UNCOMPRESSED_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB
 /// PR #7 review).
 pub const DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 
-/// Public configuration type callers use to set the Zip Bomb size caps.
-/// `lib.rs` ([lib.md](../lib.en.md)) re-exports it at the crate root and
-/// uses it as the argument to `parse_workbook_with_limits`/
-/// `parse_workbook_reader_with_limits`. `Default` reuses
-/// `DEFAULT_MAX_UNCOMPRESSED_SIZE` / `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE`
+/// The default cap on the number of cells materialized into a single
+/// `Sheet` (Issue #88). Only counts cells that actually reach
+/// `Sheet::insert_cell` — a `<c>` with no value, style, or shared-string
+/// reference is dropped for free by `flush_cell` in `parse/worksheet.rs`
+/// and never counted. Measured directly (`poc/issue88-poc/`, findings
+/// recorded on the Issue) at 78.3 bytes per such cell in the
+/// `BTreeMap<CellRef, Cell>` `Sheet::cells` uses (≈2x the raw
+/// `(CellRef, Cell)` pair's 40 bytes, the rest being `BTreeMap` node
+/// overhead). The byte-size cap above (`DEFAULT_MAX_UNCOMPRESSED_SIZE`,
+/// 512 MiB) alone doesn't bound this: a worksheet XML entry packed with
+/// minimal populated cells (`<c r="..."><v>1</v></c>`, ~26 bytes each) can
+/// fit ~20 million of them within that byte cap, which would then
+/// materialize into ~1.6 GB of `Sheet` memory — a ~3x amplification that
+/// bypasses the byte cap entirely. Capping at 5,000,000 cells bounds
+/// worst-case `Sheet` memory to roughly the same order of magnitude as the
+/// byte-size cap itself (≈391 MB), eliminating most of that amplification,
+/// while leaving ~16x headroom over `tests/fixtures/load.rs`'s
+/// `massive_dense_accounting` fixture (300,000 cells), the largest
+/// legitimate scale this crate's own test suite exercises.
+pub const DEFAULT_MAX_CELLS_PER_SHEET: usize = 5_000_000;
+
+/// Public configuration type callers use to set the Zip Bomb size caps and
+/// the cell-count cap. `lib.rs` ([lib.md](../lib.en.md)) re-exports it at
+/// the crate root and uses it as the argument to
+/// `parse_workbook_with_limits`/`parse_workbook_reader_with_limits`.
+/// `Default` reuses `DEFAULT_MAX_UNCOMPRESSED_SIZE` /
+/// `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE` / `DEFAULT_MAX_CELLS_PER_SHEET`
 /// as-is (a single source of truth for the values — `parse_workbook`/
 /// `parse_workbook_reader` simply pass `SizeLimits::default()` internally).
 #[derive(Debug, Clone, Copy)]
@@ -46,6 +69,18 @@ pub struct SizeLimits {
     /// straight through to `ZipContainer::with_max_total_size`
     /// ([container/mod.md](mod.en.md)).
     pub max_total_size: u64,
+    /// The cap on the number of cells actually inserted into a single
+    /// `Sheet` (Issue #88). Checked per sheet, not cumulatively across the
+    /// workbook — a workbook whose sheets are each individually under this
+    /// cap is accepted regardless of their sum, the same as
+    /// `resolve::merge::MAX_MERGE_REGIONS`/
+    /// `resolve::column_width::MAX_COLUMN_WIDTH_RANGES` (a deliberate
+    /// design decision not to defend against an attack that spreads cells
+    /// across many sheets). Passed straight through to
+    /// `parse::worksheet::parse_worksheet`
+    /// ([parse/worksheet.md](../parse/worksheet.en.md)), which checks it
+    /// incrementally while streaming `<c>` elements.
+    pub max_cells_per_sheet: usize,
 }
 
 impl Default for SizeLimits {
@@ -53,6 +88,7 @@ impl Default for SizeLimits {
         Self {
             max_entry_size: DEFAULT_MAX_UNCOMPRESSED_SIZE,
             max_total_size: DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE,
+            max_cells_per_sheet: DEFAULT_MAX_CELLS_PER_SHEET,
         }
     }
 }
@@ -193,7 +229,8 @@ The reason Zip Slip is validated even though this library never extracts entries
 - `BoundedReader`: verify a read that exceeds the per-entry limit by even one byte returns `Err`, with `LimitExceeded`'s `actual`/`limit` correctly reflecting `per_entry_limit`
 - `BoundedReader`: verify that even when a single entry stays within its own limit, cumulative reads spanning multiple entries that exceed `cumulative_limit` return `Err`, with `LimitExceeded`'s `actual`/`limit` correctly reflecting `cumulative_limit` (including verifying the cumulative counter correctly carries over across calls)
 - `BoundedReader`: verify ordinary reads before either cap is reached correctly count and pass through bytes, and that `cumulative_read` is incremented correctly
-- Verify that `SizeLimits::default()`'s `max_entry_size`/`max_total_size` equal `DEFAULT_MAX_UNCOMPRESSED_SIZE`/`DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE` respectively (a regression test guarding against the two sources of truth drifting apart at implementation time)
+- Verify that `SizeLimits::default()`'s `max_entry_size`/`max_total_size`/`max_cells_per_sheet` equal `DEFAULT_MAX_UNCOMPRESSED_SIZE`/`DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE`/`DEFAULT_MAX_CELLS_PER_SHEET` respectively (a regression test guarding against the sources of truth drifting apart at implementation time)
+- Testing the actual count-and-cutoff logic for `max_cells_per_sheet` belongs to `parse/worksheet.md` — this module is only where the limit value lives
 
 ## Open Questions
 
@@ -202,3 +239,4 @@ The reason Zip Slip is validated even though this library never extracts entries
 3. ~~The conversion layer from `LimitExceeded` to `Error::ZipBombDetected`~~ → **Resolved**: the downcast happens where `parse/` converts a `quick_xml::Error` into `crate::error::Error` — not in `pipeline.rs`. See Error Handling Policy for the rationale and details (reflects feedback from the PR #7 review; the alternative initially considered — giving `ZipContainer` a shared flag via `Cell` that `pipeline.rs` checks — was not adopted, since it would create an ongoing risk of a missed check outside `container/sanitize.rs`'s own visibility, and would require extra interior mutability compared to converting at the `parse/` layer).
 4. **Whether to add compression-ratio-based detection**: the current design judges only by absolute uncompressed size. Whether `container/mod.rs` should additionally perform early screening using the ratio between the ZIP central directory's declared compressed and uncompressed sizes (e.g. flagging a ratio above 100:1) before actually decompressing anything is undecided; if added, whether that logic belongs in this file or in `container/mod.rs` is also undecided.
 5. **Allowlisting entry names**: the current `validate_entry_path` uses a denylist approach (e.g. "must not contain `..`"). Whether to instead adopt a stricter allowlist that only permits entries matching known OPC namespace prefixes (`xl/`, `docProps/`, `_rels/`, `[Content_Types].xml`, etc.) is undecided.
+6. ~~Whether a cell-count cap is needed, where it lives, and its value~~ → **Resolved** (Issue [#88](https://github.com/MinamiyamaKotaro/xlsxparser/issues/88)): the byte-size cap (`max_entry_size`) alone turned out not to be enough — packing minimal populated cells (`<c r="..."><v>1</v></c>`) can amplify parsed `Sheet` memory by roughly 3x, effectively bypassing the existing Zip Bomb defense. Added `max_cells_per_sheet` to `SizeLimits` (default 5,000,000, derived from the 78.3 bytes/cell measured in `poc/issue88-poc/`). Confirmed via a comparison against other parser libraries (calamine/openpyxl, see the Issue #88 comments) that this class of vulnerability is not unique to xlsxparser and is not an uncommon design gap industry-wide. The decision to check per sheet rather than cumulatively across the workbook is part of this resolution too.

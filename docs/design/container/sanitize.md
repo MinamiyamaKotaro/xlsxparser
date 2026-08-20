@@ -8,8 +8,9 @@
 
 - **Zip Slip対策**: ZIPエントリ名がアーカイブのルート外へ脱出しないことを検証する（`validate_entry_path`）
 - **Zip Bomb対策**: 展開後バイト数の上限をストリーミングで強制する `Read` ラッパー（`BoundedReader`）を提供する
-- Zip Bombサイズ上限を呼び出し側が指定するための公開設定型 `SizeLimits` を定義する（`lib.rs`（[lib.md](../lib.md)）が再エクスポートし、`parse_workbook_with_limits`/`parse_workbook_reader_with_limits` の引数として使う。セキュリティレビュー Finding 2）
-- **含まない責務**: ZIPアーカイブそのものの展開・エントリ列挙（`container/mod.rs`）、XMLの構文解釈やXXE対策（`parse/`。要求仕様書2章のXXE要件は architecture.md の議論の経緯により `parse/mod.rs` の責務と確定済み）
+- Zip Bombサイズ上限、および1シートあたりのセル数上限（`max_cells_per_sheet`。後述）を呼び出し側が指定するための公開設定型 `SizeLimits` を定義する（`lib.rs`（[lib.md](../lib.md)）が再エクスポートし、`parse_workbook_with_limits`/`parse_workbook_reader_with_limits` の引数として使う。セキュリティレビュー Finding 2）
+- **セル数上限の値そのものの定義**（Issue [#88](https://github.com/MinamiyamaKotaro/xlsxparser/issues/88)）: `parse::worksheet`（[parse/worksheet.md](../parse/worksheet.md)）が実際に`<c>`をストリーミング中に数えるロジックを持つのに対し、本モジュールは「その上限値をどこに置くか」（`SizeLimits`という同じ公開設定型に、Zip Bomb対策と並べて置く）を決める設計判断のみを担う
+- **含まない責務**: ZIPアーカイブそのものの展開・エントリ列挙（`container/mod.rs`）、XMLの構文解釈やXXE対策（`parse/`。要求仕様書2章のXXE要件は architecture.md の議論の経緯により `parse/mod.rs` の責務と確定済み）、セル数を実際にカウントして打ち切るロジック（`parse::worksheet`。本モジュールは上限「値」の置き場所でしかない）
 
 ## 主要な型（案）
 
@@ -28,13 +29,30 @@ pub const DEFAULT_MAX_UNCOMPRESSED_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB
 /// PR #7 レビュー指摘を反映）。
 pub const DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 
-/// Zip Bomb対策のサイズ上限を呼び出し側が指定するための公開設定型。
-/// `lib.rs`（[lib.md](../lib.md)）がクレートルートへ再エクスポートし、
-/// `parse_workbook_with_limits`/`parse_workbook_reader_with_limits` の引数
-/// として使う。`Default` は `DEFAULT_MAX_UNCOMPRESSED_SIZE` /
-/// `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE` をそのまま用いる（値を二重管理
-/// せず、`parse_workbook`/`parse_workbook_reader` は内部で
-/// `SizeLimits::default()` を渡すだけで済む）。
+/// 1シートあたりのデフォルトのセル数上限（Issue #88）。カウント対象は
+/// `Sheet::insert_cell` に実際に到達したセルのみ（値・スタイル・共有文字列
+/// 参照のいずれも持たない`<c>`は`parse/worksheet.rs`の`flush_cell`が無料で
+/// 捨てるため、カウントされない）。実測（`poc/issue88-poc/`、知見はIssue
+/// コメントに記録）で、`Sheet::cells`が使う`BTreeMap<CellRef, Cell>`は
+/// そうしたセル1件あたり78.3バイト（生の`(CellRef, Cell)`ペア40バイトの
+/// 約2倍。差分は`BTreeMap`のノードオーバーヘッド）。上のバイト数上限
+/// （`DEFAULT_MAX_UNCOMPRESSED_SIZE`、512MiB）だけではこれを抑えられない
+/// ——`<c r="..."><v>1</v></c>`（1セルあたり約26バイト）を敷き詰めた
+/// ワークシートXMLは、このバイト数上限内だけで約2,000万セルに達し得て、
+/// それが約1.6GBの`Sheet`メモリに増幅する（バイト数上限を約3倍上回る）。
+/// 5,000,000という値は、この増幅をバイト数上限とほぼ同じオーダー（約
+/// 391MB）まで抑え込みつつ、本クレート自身のテストスイートが実際に使う
+/// 最大の正当な規模（`tests/fixtures/load.rs`の`massive_dense_accounting`
+/// フィクスチャ、300,000セル）に対して約16倍の余裕を残す。
+pub const DEFAULT_MAX_CELLS_PER_SHEET: usize = 5_000_000;
+
+/// Zip Bomb対策のサイズ上限、およびセル数上限を呼び出し側が指定するための
+/// 公開設定型。`lib.rs`（[lib.md](../lib.md)）がクレートルートへ再エクス
+/// ポートし、`parse_workbook_with_limits`/`parse_workbook_reader_with_limits`
+/// の引数として使う。`Default` は `DEFAULT_MAX_UNCOMPRESSED_SIZE` /
+/// `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE` / `DEFAULT_MAX_CELLS_PER_SHEET` を
+/// そのまま用いる（値を二重管理せず、`parse_workbook`/`parse_workbook_reader`
+/// は内部で `SizeLimits::default()` を渡すだけで済む）。
 #[derive(Debug, Clone, Copy)]
 pub struct SizeLimits {
     /// 個々のZIPエントリ（シートXML等）の展開後サイズ上限（バイト）。
@@ -45,6 +63,16 @@ pub struct SizeLimits {
     /// `ZipContainer::with_max_total_size`（[container/mod.md](mod.md)）へ
     /// そのまま渡る。
     pub max_total_size: u64,
+    /// 1つの`Sheet`に実際に挿入されるセル数の上限（Issue #88）。シート単位
+    /// でチェックし、ワークブック全体での累積は見ない——複数シートに分散
+    /// させて上限を回避する攻撃までは対象外とする設計判断（各シートが個別
+    /// に上限未満なら、合計がどれだけ大きくても受理される。
+    /// `resolve::merge::MAX_MERGE_REGIONS`/
+    /// `resolve::column_width::MAX_COLUMN_WIDTH_RANGES`と同じくシート単位の
+    /// 上限）。`parse::worksheet::parse_worksheet`
+    /// （[parse/worksheet.md](../parse/worksheet.md)）へそのまま渡り、
+    /// `<c>`をストリーミング中に逐次チェックされる。
+    pub max_cells_per_sheet: usize,
 }
 
 impl Default for SizeLimits {
@@ -52,6 +80,7 @@ impl Default for SizeLimits {
         Self {
             max_entry_size: DEFAULT_MAX_UNCOMPRESSED_SIZE,
             max_total_size: DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE,
+            max_cells_per_sheet: DEFAULT_MAX_CELLS_PER_SHEET,
         }
     }
 }
@@ -185,7 +214,8 @@ Zip Slipの検証を「実ディスクへの展開を行わない設計であっ
 - `BoundedReader`: エントリ単体の上限を1バイトでも超える読み込みが `Err` になり、`LimitExceeded` の `actual`/`limit` が `per_entry_limit` 側の値で正しいことの確認
 - `BoundedReader`: エントリ単体は上限内でも、複数エントリにまたがる累積読み込みが `cumulative_limit` を超えた場合に `Err` になり、`LimitExceeded` の `actual`/`limit` が `cumulative_limit` 側の値で正しいことの確認（累積カウンタが呼び出しをまたいで正しく引き継がれることの確認を含む）
 - `BoundedReader`: 上限に達する前の通常の読み込みが正しくバイト数をカウント・透過し、`cumulative_read` の値も正しく加算されることの確認
-- `SizeLimits::default()` の `max_entry_size`/`max_total_size` が、それぞれ `DEFAULT_MAX_UNCOMPRESSED_SIZE`/`DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE` と一致することの確認（値の二重管理が実装時にずれていないことの回帰テスト）
+- `SizeLimits::default()` の `max_entry_size`/`max_total_size`/`max_cells_per_sheet` が、それぞれ `DEFAULT_MAX_UNCOMPRESSED_SIZE`/`DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE`/`DEFAULT_MAX_CELLS_PER_SHEET` と一致することの確認（値の二重管理が実装時にずれていないことの回帰テスト）
+- `max_cells_per_sheet` 超過時の実際のカウント・打ち切りロジックのテストは `parse/worksheet.md` 側の責務（本モジュールは値の置き場所でしかないため）
 
 ## 未決事項 / オープンクエスチョン
 
@@ -194,3 +224,4 @@ Zip Slipの検証を「実ディスクへの展開を行わない設計であっ
 3. ~~`LimitExceeded` から `Error::ZipBombDetected` への変換層~~ → **解決**: `pipeline.rs` ではなく `parse/` が `quick_xml::Error` を `crate::error::Error` へ変換する境界（型消去する直前）でダウンキャストする。理由・詳細はエラー処理方針セクション参照（PR #7 レビュー指摘を反映。当初検討した「`ZipContainer` に共有フラグ（`Cell`）を持たせ `pipeline.rs` 側で確認する」代替案は、`container/sanitize.rs` の関知しない範囲に恒常的なチェック漏れリスクを生む上、`parse/` 層での変換に比べて余分な内部可変性を要するため採用しない）。
 4. **圧縮率ベースの検知の要否**: 現状は展開後の絶対サイズのみで判定するが、ZIP中央ディレクトリから安価に取得できる「宣言された圧縮後サイズ」と「宣言された展開後サイズ」の比率（例: 100倍以上）を用いた早期検知（実際に展開する前段階でのスクリーニング）を `container/mod.rs` 側に追加すべきかは未決定。追加する場合、その判定ロジックを本ファイルに置くか `container/mod.rs` に置くかも未確定。
 5. **エントリ名のアローリスト化**: 現状の `validate_entry_path` は「`..` を含まない」等のデナイリスト方式だが、より厳格に「`xl/` `docProps/` `_rels/` `[Content_Types].xml` など既知のOPC名前空間プレフィックスに一致するエントリのみを許可する」アローリスト方式にすべきかは未決定。
+6. ~~セル数上限の要否・置き場所・値~~ → **解決**（Issue [#88](https://github.com/MinamiyamaKotaro/xlsxparser/issues/88)）: バイト数上限（`max_entry_size`）だけでは、値を持つ最小限のセル（`<c r="..."><v>1</v></c>`）を敷き詰めることでパース後の `Sheet` メモリを約3倍増幅でき、既存のZip Bomb対策を実質的にすり抜けられることが判明。対応として `SizeLimits` に `max_cells_per_sheet`（デフォルト5,000,000、`poc/issue88-poc/` の実測78.3バイト/セルから逆算）を追加。他パーサーライブラリ（calamine/openpyxl、Issue #88コメント参照）との比較で、この種の脆弱性はxlsxparser固有ではなく業界的にも珍しくない設計漏れであることを確認した上での対応。ワークブック累計ではなくシート単位のチェックとする設計判断も含めて確定。

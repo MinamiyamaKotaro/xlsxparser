@@ -7,7 +7,7 @@ Design doc for `src/pipeline.rs`. This is the orchestrator for the 5-phase pipel
 ## Responsibility / Scope
 
 - Owns a [`container::ZipContainer`](container/mod.en.md) and calls `get_entry` sequentially throughout Phases 1–4 (fully consuming one entry before fetching the next — following the sequential-access pattern [container/mod.md](container/mod.en.md) already enforces via `get_entry`'s type signature)
-- Forwards the `SizeLimits` ([lib.md](lib.en.md)) received from the caller (`lib.rs`) into `with_max_entry_size` / `with_max_total_size` ([container/mod.md](container/mod.en.md)) right after `ZipContainer::open_reader`, so callers can override the Zip Bomb size caps (security review Finding 2, Issue [#14](https://github.com/MinamiyamaKotaro/xlsxparser/issues/14))
+- Forwards the `SizeLimits` ([lib.md](lib.en.md)) received from the caller (`lib.rs`) into `with_max_entry_size` / `with_max_total_size` ([container/mod.md](container/mod.en.md)) right after `ZipContainer::open_reader`, so callers can override the Zip Bomb size caps (security review Finding 2, Issue [#14](https://github.com/MinamiyamaKotaro/xlsxparser/issues/14)). The same `SizeLimits`'s `max_cells_per_sheet` is forwarded as-is into each sheet's `parse::parse_worksheet` call (Phase 3) (Issue [#88](https://github.com/MinamiyamaKotaro/xlsxparser/issues/88); see [container/sanitize.md](container/sanitize.en.md))
 - **Phase 1**: first fetches and parses the package root's own relationship part, `_rels/.rels` (the one path OPC itself fixes, unlike `xl/_rels/workbook.xml.rels`), and resolves the actual workbook part path from whatever the `officeDocument` relationship type targets (Issue [#55](https://github.com/MinamiyamaKotaro/xlsxparser/issues/55)). This used to read `xl/workbook.xml` as a hardcoded path; but that fixedness is not an OPC guarantee, and a real file was found (`tests/fixtures/other/minimal_package.xlsx`, from calamine's test corpus) whose workbook part is discoverable only via `_rels/.rels`, so resolution was changed to go through `_rels/.rels` → `officeDocument` relationship → workbook part, as OPC intends. The workbook part's own `_rels` path (the `xl/_rels/workbook.xml.rels`-equivalent) is likewise derived from this resolved workbook part path via `rels_path_for` (see "Key Types / Functions (draft)" below) — it no longer depends on the literal string `xl/workbook.xml`. It then fetches and parses that workbook part's `_rels` and its `workbook.xml` body, building a "routing plan" of sheet names, visibility, and backing file paths. It also identifies the relationships to `sharedStrings.xml` / `styles.xml` within the workbook part's `_rels` by relationship type (`Relationship.rel_type`) — implementing the division of labor [relationships.md Not Responsible For](parse/relationships.en.md) assigned to the caller: "which `r:id` corresponds to which part kind is the caller's job". A workbook may have neither relationship (`sharedStrings.xml` has always been treated as optional; `styles.xml` joined it as of Issue #54 — see Error Handling Policy). This phase also reads `ParsedWorkbookXml::date1904` (Issue #40) and holds it in a local variable — it never becomes a field on `Workbook`, following the same "phase-transient value" treatment `StyleSheet` gets (see below). It used to be passed only to Phase 4's `resolve::resolve_sheet`; with `t="d"` support (Issue #58 / PR #80 review point 2), the same value is now also passed into each sheet's `parse::parse_worksheet` call (Phase 3) — see [parse/worksheet.md](parse/worksheet.en.md)
 - Once the routing plan is built, lets the reader used for the rels read and the [`parse::RelationshipMap`](parse/relationships.en.md) go out of scope and be dropped (implements architecture.md's "dispose of the `_rels` scratch buffer immediately once the routing map is built at the end of Phase 1")
 - Once the routing plan is finalized, builds the [`SharedStringTable`](parse/shared_strings.en.md) and [`StyleSheet`](model/style.en.md) exactly once, before entering the per-sheet loop
@@ -153,7 +153,13 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
         let reader = container.get_entry(&route.worksheet_path)?.ok_or_else(|| {
             Error::DanglingRelationship { r_id: route.worksheet_path.clone() }
         })?;
-        let output = parse::parse_worksheet(reader, &route.worksheet_path, &mut sheet, date1904)?;
+        let output = parse::parse_worksheet(
+            reader,
+            &route.worksheet_path,
+            &mut sheet,
+            date1904,
+            limits.max_cells_per_sheet,
+        )?;
         resolve::resolve_sheet(
             &mut sheet,
             &output.pending_shared_strings,
@@ -208,6 +214,7 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
 - Verify that if a later sheet (e.g. the second) fails to parse, the whole call returns `Err` rather than a `Workbook`, even though the first sheet was processed successfully (a regression test for fail-closed behavior)
 - Verify that a book containing `Hidden`/`VeryHidden` sheets still includes every sheet in `Workbook`, none excluded (wiring to [model/workbook.md Open Question 1](model/workbook.en.md))
 - Verify that passing `run` a `SizeLimits` whose `max_entry_size` is smaller than `DEFAULT_MAX_UNCOMPRESSED_SIZE` turns an input that would otherwise succeed into `Error::ZipBombDetected` (a wiring test confirming `SizeLimits` actually reaches `ZipContainer`; `with_max_entry_size`/`with_max_total_size`'s own logic is verified under [container/mod.md](container/mod.en.md))
+- Verify that passing `run` a `SizeLimits` with a small `max_cells_per_sheet` turns the parse into `Error::TooManyCells` (a wiring test confirming `SizeLimits.max_cells_per_sheet` actually reaches `parse::parse_worksheet`; the actual counting/cutoff logic itself is [parse/worksheet.md](parse/worksheet.en.md)'s responsibility. Issue #88)
 
 ## Open Questions
 

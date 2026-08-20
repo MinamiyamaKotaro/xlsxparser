@@ -91,6 +91,27 @@ pub enum Error {
         limit: usize,
     },
 
+    /// The number of cells materialized into a single `Sheet` (i.e. that
+    /// actually reached `Sheet::insert_cell` — a `<c>` with no value, style,
+    /// or shared-string reference is dropped for free and never counted)
+    /// exceeded `SizeLimits::max_cells_per_sheet`. Checked incrementally as
+    /// `parse/worksheet.rs` streams `<c>` elements, not after collecting a
+    /// batch (unlike `TooManyMergedRanges`/`TooManyColumnWidthRanges`) — for
+    /// cells, the memory cost accrues at the moment of insertion itself
+    /// rather than in a separate post-collection step, so checking only
+    /// after the fact would already be too late. Guards against the same
+    /// class of amplification `TooManyMergedRanges` guards against: the Zip
+    /// Bomb byte-size cap alone bounds the XML's raw byte size, not the
+    /// `Sheet`'s in-memory footprint after each `<c>` materializes into a
+    /// `BTreeMap` entry (Issue #88; see `SizeLimits::max_cells_per_sheet`'s
+    /// doc comment for the measured bytes-per-cell this cap is based on).
+    #[error("too many cells in {path}: {count} exceeds limit {limit}")]
+    TooManyCells {
+        path: String,
+        count: usize,
+        limit: usize,
+    },
+
     // --- Phase 4: analysis and deferred resolution ---
     /// An A1-style cell reference string is invalid (syntax error, numeric
     /// overflow, empty string, etc. — returned by `CellRef::from_a1`).
@@ -333,6 +354,16 @@ mod tests {
             }
             .to_string(),
             "too many nested <xdr:grpSp> groups in xl/drawings/drawing1.xml: depth 65 exceeds limit 64"
+        );
+
+        assert_eq!(
+            Error::TooManyCells {
+                path: "xl/worksheets/sheet1.xml".into(),
+                count: 5_000_001,
+                limit: 5_000_000,
+            }
+            .to_string(),
+            "too many cells in xl/worksheets/sheet1.xml: 5000001 exceeds limit 5000000"
         );
 
         assert_eq!(

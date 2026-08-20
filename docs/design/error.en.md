@@ -82,6 +82,26 @@ pub enum Error {
     #[error("DOCTYPE declaration rejected in {path} (XXE defense)")]
     DoctypeRejected { path: String },
 
+    /// The number of cells actually inserted into a single `Sheet` (only
+    /// cells that reach `Sheet::insert_cell` — a `<c>` with no value,
+    /// style, or shared-string reference is dropped for free by
+    /// `flush_cell` and never counted) exceeded
+    /// `SizeLimits::max_cells_per_sheet` (Issue
+    /// [#88](https://github.com/MinamiyamaKotaro/xlsxparser/issues/88)).
+    /// Unlike `TooManyMergedRanges`/`TooManyColumnWidthRanges` (checked in
+    /// one batch after collection), `parse/worksheet.rs` checks this
+    /// incrementally while streaming `<c>` elements — for cells, the memory
+    /// cost accrues the moment one is inserted, so checking only after
+    /// collection would already be too late. See
+    /// [container/sanitize.md](container/sanitize.en.md)'s
+    /// `SizeLimits::max_cells_per_sheet` for the cap value.
+    #[error("too many cells in {path}: {count} exceeds limit {limit}")]
+    TooManyCells {
+        path: String,
+        count: usize,
+        limit: usize,
+    },
+
     // --- Phase 4: analysis and deferred resolution ---
     /// An A1-style cell reference string is invalid (syntax error, numeric
     /// overflow, empty string, etc. — returned by `CellRef::from_a1` in
