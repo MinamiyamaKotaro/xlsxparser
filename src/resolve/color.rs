@@ -201,21 +201,23 @@ pub(crate) fn lookup_indexed_color(index: u32) -> Option<Rgb> {
     }
 }
 
-/// Parses an 8-digit ARGB (`"FFFF0000"`) or bare 6-digit RGB hex string
-/// into an `Rgb`, discarding any alpha digits. `ColorRef::Rgb` never
-/// validates its value at parse time and keeps it verbatim, so this
-/// returns `None` for anything that isn't valid hex of the expected length
+/// Parses an 8-digit ARGB hex string (`"FFFF0000"`, ECMA-376's
+/// `ST_UnsignedIntHex` — the only form `<fgColor rgb="..">` ever legally
+/// takes) into an `Rgb`, discarding the two alpha digits. `ColorRef::Rgb`
+/// never validates its value at parse time and keeps it verbatim, so this
+/// returns `None` for anything that isn't exactly 8 ASCII hex digits,
 /// rather than panicking.
+///
+/// The `is_ascii()` check must happen *before* slicing `&s[2..]` — `len()`
+/// counts bytes, not chars, so an 8-*byte* string containing multi-byte
+/// UTF-8 (e.g. a crafted `rgb="ééé"`-shaped value from an untrusted file)
+/// can have byte index 2 land mid-codepoint, which would panic were the
+/// slice taken first.
 fn parse_argb_hex(s: &str) -> Option<Rgb> {
-    let hex = match s.len() {
-        8 => &s[2..],
-        6 => s,
-        _ => return None,
-    };
-    if !hex.is_ascii() {
+    if s.len() != 8 || !s.is_ascii() {
         return None;
     }
-    let v = u32::from_str_radix(hex, 16).ok()?;
+    let v = u32::from_str_radix(&s[2..], 16).ok()?;
     Some(Rgb {
         r: ((v >> 16) & 0xFF) as u8,
         g: ((v >> 8) & 0xFF) as u8,
@@ -285,6 +287,72 @@ mod tests {
         assert_eq!(apply_tint(base, -0.25), rgb_val(0x37, 0x60, 0x92));
     }
 
+    // The 5 cases below exercise `rgb_to_hsl`/`hue_to_rgb`'s remaining hue
+    // octants and the achromatic (gray) path that #4F81BD alone never
+    // reaches — each independently cross-checked against Python's
+    // `colorsys` (the same independent-implementation verification method
+    // Issue #76's design PoC used), not just chosen to pad coverage.
+    #[test]
+    fn apply_tint_pure_red_max_channel_is_r() {
+        // tint=-0.33 rather than a round-numbered value like -0.3: the
+        // latter happens to land the intermediate lightness exactly on a
+        // 178.5 rounding boundary, where Rust's f64::round() (round half
+        // away from zero) and Python's round() (round half to even) —
+        // otherwise in full agreement everywhere else this was
+        // cross-checked — legitimately disagree by 1 ULP-of-a-color-value.
+        // Both are "correct" by their own convention; -0.33 just avoids
+        // asserting a value that depends on which convention is used.
+        assert_eq!(
+            apply_tint(rgb_val(0xFF, 0x00, 0x00), -0.33),
+            rgb_val(0xAB, 0x00, 0x00)
+        );
+    }
+
+    #[test]
+    fn apply_tint_pure_green_max_channel_is_g() {
+        assert_eq!(
+            apply_tint(rgb_val(0x00, 0xFF, 0x00), 0.4),
+            rgb_val(0x66, 0xFF, 0x66)
+        );
+    }
+
+    #[test]
+    fn apply_tint_achromatic_gray_stays_gray() {
+        // s == 0: exercises rgb_to_hsl's early achromatic return and
+        // hsl_to_rgb's s.abs() < EPSILON fast path, neither of which
+        // #4F81BD (a chromatic color) ever reaches.
+        let result = apply_tint(rgb_val(0x80, 0x80, 0x80), 0.5);
+        assert_eq!(result, rgb_val(0xC0, 0xC0, 0xC0));
+        assert_eq!(result.r, result.g);
+        assert_eq!(result.g, result.b);
+    }
+
+    #[test]
+    fn apply_tint_orange_max_channel_is_r_with_g_at_least_b() {
+        assert_eq!(
+            apply_tint(rgb_val(0xFF, 0x80, 0x00), -0.2),
+            rgb_val(0xCC, 0x66, 0x00)
+        );
+    }
+
+    #[test]
+    fn apply_tint_pink_max_channel_is_r_with_g_less_than_b() {
+        assert_eq!(
+            apply_tint(rgb_val(0xFF, 0x00, 0x80), 0.2),
+            rgb_val(0xFF, 0x33, 0x99)
+        );
+    }
+
+    #[test]
+    fn rgb_const_fn_decomposes_a_hex_literal() {
+        // INDEXED_PALETTE builds entirely at compile time via `rgb()`, so
+        // no test exercises it at runtime otherwise; this both closes that
+        // coverage gap and is a direct unit test of the helper itself.
+        assert_eq!(rgb(0x4F81BD), rgb_val(0x4F, 0x81, 0xBD));
+        assert_eq!(rgb(0x000000), rgb_val(0x00, 0x00, 0x00));
+        assert_eq!(rgb(0xFFFFFF), rgb_val(0xFF, 0xFF, 0xFF));
+    }
+
     #[test]
     fn lookup_indexed_color_covers_the_table_and_boundaries() {
         assert_eq!(lookup_indexed_color(0), Some(rgb_val(0x00, 0x00, 0x00)));
@@ -304,6 +372,21 @@ mod tests {
     #[test]
     fn resolve_color_rgb_variant_invalid_hex_is_none() {
         let color = ColorRef::Rgb(Arc::from("not-a-color"));
+        assert_eq!(resolve_color(&color, None), None);
+    }
+
+    #[test]
+    fn resolve_color_rgb_variant_multibyte_utf8_at_the_expected_byte_length_does_not_panic() {
+        // Regression test: "a" (1 byte) + "€" (3 bytes, U+20AC) + "1234"
+        // (4 bytes) totals 8 *bytes* (matching the ARGB length check), but
+        // byte index 2 falls inside "€"'s 3-byte encoding — not a char
+        // boundary. Slicing `&s[2..]` before checking `is_ascii()` would
+        // panic on this input ("byte index 2 is not a char boundary").
+        // ColorRef::Rgb never validates its value at parse time, so this
+        // exact shape is reachable from an untrusted, crafted .xlsx file.
+        let multibyte = "a€1234";
+        assert_eq!(multibyte.len(), 8);
+        let color = ColorRef::Rgb(Arc::from(multibyte));
         assert_eq!(resolve_color(&color, None), None);
     }
 

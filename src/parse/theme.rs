@@ -332,6 +332,37 @@ mod tests {
     }
 
     #[test]
+    fn wrong_length_and_non_ascii_last_clr_also_fall_back_by_slot() {
+        // Distinct from invalid_hex_last_clr_falls_back_by_slot_without_panicking
+        // above (6 valid ASCII chars that just aren't hex digits, e.g.
+        // "ZZZZZZ" — fails at the from_str_radix step): this exercises
+        // parse_hex6's own length/ASCII guard, which a too-short value and
+        // a non-ASCII value both fail before from_str_radix is ever
+        // reached.
+        let xml = xml_with_dk1_lt1_replaced(
+            r#"<a:sysClr val="windowText" lastClr="12"/>"#,
+            r#"<a:sysClr val="window" lastClr="日本語カラー"/>"#,
+        );
+        let palette = parse(xml.as_bytes()).unwrap();
+        assert_eq!(
+            palette.0[1],
+            Rgb {
+                r: 0x00,
+                g: 0x00,
+                b: 0x00
+            }
+        );
+        assert_eq!(
+            palette.0[0],
+            Rgb {
+                r: 0xFF,
+                g: 0xFF,
+                b: 0xFF
+            }
+        );
+    }
+
+    #[test]
     fn missing_slot_is_missing_required_element() {
         // <a:accent3> omitted entirely — a structurally broken theme part.
         let xml = br#"<a:clrScheme><a:dk1><a:sysClr lastClr="000000"/></a:dk1><a:lt1><a:sysClr lastClr="FFFFFF"/></a:lt1><a:dk2><a:sysClr lastClr="000000"/></a:dk2><a:lt2><a:sysClr lastClr="FFFFFF"/></a:lt2><a:accent1><a:sysClr lastClr="000000"/></a:accent1><a:accent2><a:sysClr lastClr="000000"/></a:accent2><a:accent4><a:sysClr lastClr="000000"/></a:accent4><a:accent5><a:sysClr lastClr="000000"/></a:accent5><a:accent6><a:sysClr lastClr="000000"/></a:accent6><a:hlink><a:sysClr lastClr="000000"/></a:hlink><a:folHlink><a:sysClr lastClr="000000"/></a:folHlink></a:clrScheme>"#;
@@ -385,5 +416,45 @@ mod tests {
         )
         .replace("</a:clrScheme>", "</a:clrScheme><a:fontScheme><unclosed>");
         assert!(parse(xml.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn non_self_closing_color_element_resolves_the_same_as_self_closing() {
+        // ECMA-376 permits <a:srgbClr val="..">..</a:srgbClr>` as well as
+        // the self-closing form every other test uses — both must resolve
+        // identically, since resolve_slot_color only reads the start tag's
+        // attributes either way.
+        let xml = xml_with_dk1_lt1_replaced(
+            r#"<a:sysClr lastClr="000000"></a:sysClr>"#,
+            r#"<a:sysClr lastClr="FFFFFF"></a:sysClr>"#,
+        );
+        let palette = parse(xml.as_bytes()).unwrap();
+        assert_eq!(
+            palette.0[1],
+            Rgb {
+                r: 0x00,
+                g: 0x00,
+                b: 0x00
+            }
+        );
+        assert_eq!(
+            palette.0[0],
+            Rgb {
+                r: 0xFF,
+                g: 0xFF,
+                b: 0xFF
+            }
+        );
+    }
+
+    #[test]
+    fn xml_syntax_error_inside_clr_scheme_propagates_as_xml_parse() {
+        // Distinct from missing_clr_scheme_entirely/missing_slot (both
+        // well-formed XML that's merely incomplete): here the XML itself
+        // is malformed, exercising read_event's own Err propagation via
+        // the `?` at the top of parse_theme's loop.
+        let xml = br#"<a:clrScheme><a:dk1><unclosed></a:dk1></a:clrScheme>"#;
+        let err = parse(xml).unwrap_err();
+        assert!(matches!(err, Error::XmlParse { .. }));
     }
 }

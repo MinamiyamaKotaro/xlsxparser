@@ -337,11 +337,19 @@ mod tests {
         assert_reachable::<crate::Rgb>();
         assert_reachable::<crate::ThemePalette>();
         fn _assert_result_reachable(_: crate::Result<()>) {}
-        fn _assert_resolve_color_reachable(
-            color: &crate::ColorRef,
-            theme: Option<&crate::ThemePalette>,
-        ) {
-            let _: Option<crate::Rgb> = crate::resolve_color(color, theme);
-        }
+
+        // resolve_color, unlike the above, is a function rather than a
+        // type, so it's exercised directly rather than through
+        // assert_reachable — also a real assertion, not just a
+        // compile-time check.
+        let color = crate::ColorRef::Rgb(std::sync::Arc::from("FFFF0000"));
+        assert_eq!(
+            crate::resolve_color(&color, None),
+            Some(crate::Rgb {
+                r: 0xFF,
+                g: 0x00,
+                b: 0x00
+            })
+        );
     }
 }
