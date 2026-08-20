@@ -56,7 +56,11 @@ let json = xlsxparser::to_json_string(&workbook)?;
 Both return `Result<Workbook, Error>`, a fully resolved in-memory
 representation of every sheet (visible, hidden, and veryHidden alike). Each
 has a `_with_limits` variant taking an explicit `SizeLimits` to override the
-default Zip Bomb caps (512 MiB per ZIP entry, 2 GiB cumulative).
+defaults: a 512 MiB Zip Bomb cap per ZIP entry, 2 GiB cumulative, and a
+5,000,000-cell cap per sheet (`Error::TooManyCells`) — the cell cap bounds
+a sheet's in-memory footprint independently of its raw XML byte size,
+since a pathologically cell-dense file can stay well under the byte-size
+cap while still costing gigabytes once every `<c>` materializes.
 
 **Output**: `to_json_string(&workbook)` / `to_json_writer(&workbook,
 writer)` serialize the resolved `Workbook` into JSON shaped like this
@@ -81,7 +85,8 @@ sheet with a single merged region, `A1:C3`, holding one text cell):
           "rowSpan": 3,
           "colSpan": 3
         }
-      ]
+      ],
+      "images": []
     }
   ]
 }
@@ -143,6 +148,9 @@ sheet with a single merged region, `A1:C3`, holding one text cell):
     the actual displayed color *is* needed, `resolve_color` converts any
     of these three forms to a real RGB value on demand — see
     [Resolving display colors](#resolving-display-colors) below.
+- `images` is the sheet's cell-anchored embedded images (always present,
+  even as an empty array — unlike `style`, which is omitted per-cell when
+  absent). See [Embedded images](#embedded-images) below for its shape.
 
 A second real example — every `CellValue` variant in one row
 (`tests/fixtures/normal/basic_types.xlsx`; cells re-ordered by column here
@@ -175,7 +183,8 @@ for readability, since actual order is unspecified):
         { "row": 1, "col": 5, "value": { "type": "boolean", "value": true } },
         { "row": 1, "col": 6, "value": { "type": "boolean", "value": false } },
         { "row": 1, "col": 7, "value": { "type": "error", "value": "#N/A" } }
-      ]
+      ],
+      "images": []
     }
   ]
 }
@@ -209,6 +218,51 @@ width="12.5"/>`, `<col min="5" max="5" width="30"/>`, and
 Column 4 falls in the gap between the two `columns` ranges, so a cell there
 (none exist in this example) would fall back to `defaultColumnWidth`
 (9.1) rather than either range's `width`.
+
+## Embedded images
+
+`images` is a sheet-level array of cell-anchored embedded images
+(`xl/drawings/drawingN.xml`) — real output, from
+`tests/fixtures/complex/embedded_image.xlsx` (one image anchored `B2:E9`
+with a hyperlink; `cells`/`columns` omitted below for brevity):
+
+```json
+{
+  "images": [
+    {
+      "anchor": {
+        "type": "twoCell",
+        "from": { "row": 2, "col": 2, "colOff": 10000, "rowOff": 20000 },
+        "to": { "row": 9, "col": 5, "colOff": 0, "rowOff": 0 }
+      },
+      "target": "xl/media/image1.png",
+      "hyperlink": "https://example.com/sample-image"
+    }
+  ]
+}
+```
+
+- `anchor` is tagged by `type`: `"twoCell"` (stretches between two cell
+  corners, `from`/`to`) or `"oneCell"` (`from` plus an `ext: {"cx", "cy"}`
+  size in EMU — a `oneCell` anchor has no `to` marker, since its size is
+  independent of any cell boundary). `row`/`col` are 1-based, matching
+  every other cell coordinate this crate emits; `colOff`/`rowOff` are the
+  EMU-unit offset *within* that cell (kept rather than rounded away, so a
+  diff can distinguish an image nudged a few pixels from one that hasn't
+  moved).
+- `target` is the embedded media part's resolved path (e.g.
+  `"xl/media/image1.png"`) — never the image's own bytes, which stay
+  entirely out of scope (a diff-oriented tool has no use for pixel data,
+  and reading it would scale memory use with image count rather than
+  cell count).
+- `hyperlink` is the image's own hyperlink (`a:hlinkClick`), distinct from
+  a cell hyperlink (not parsed by this library). Omitted when the image
+  carries none. An `Internal` (in-package) target resolves to a
+  ZIP-entry-name-equivalent path the same way `target` does; an
+  `External` one (a URL, as above) is kept verbatim.
+- Grouped images (`<xdr:grpSp>`) resolve each contained `<xdr:pic>`'s
+  anchor relative to its enclosing group, flattened into this same
+  per-sheet `images` array — no separate group structure is exposed.
 
 ## Resolving display colors
 
@@ -312,11 +366,20 @@ src/
 - `xl/theme/theme{N}.xml` (`<clrScheme>`'s 12 colors — read only when a
   style actually references a theme color; see
   [Resolving display colors](#resolving-display-colors))
-- `xl/worksheets/sheetX.xml` (`<sheetData>`, `<mergeCells>`)
+- `xl/worksheets/sheetX.xml` (`<sheetData>` — including `t="d"` ISO 8601
+  date cells alongside the numeric-serial dates every other date/time
+  cell uses, both unified into the same `"dateTime"` output — and
+  `<mergeCells>`)
+- `xl/drawings/drawingN.xml` and its own `_rels` (cell-anchored embedded
+  images — anchor geometry, the embedded media's resolved path, and the
+  image's own hyperlink, including images nested in `<xdr:grpSp>` groups;
+  see [Embedded images](#embedded-images) below)
 
-`[Content_Types].xml` is not read; fixed paths such as `xl/workbook.xml`
-are accessed directly instead of being resolved through its Content-Type
-declarations (see
+`[Content_Types].xml` is not read at all — the workbook part's actual path
+is resolved via `_rels/.rels`'s `officeDocument` relationship rather than
+assumed to be the conventional `xl/workbook.xml` (Issue #55), but that
+resolution never cross-checks a part's declared Content-Type against
+`[Content_Types].xml` (see
 [pipeline.en.md Open Question 3](docs/design/pipeline.en.md) for the
 rationale and the strict-OPC-conformance tradeoff this makes).
 
