@@ -197,6 +197,25 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
             output.default_col_width,
             output.merge_regions,
         )?;
+
+        // --- Phase 3.5: hyperlink resolution (Issue #95), only if this
+        // sheet declared any <hyperlink> at all. The ZIP I/O half (r_id ->
+        // raw Target string) is kept in pipeline.rs for the same reason
+        // image resolution is; the resulting Vec<HyperlinkRange> batch is
+        // then handed to the I/O-independent resolve::hyperlink::resolve
+        // (overlap validation + Sheet::finalize_hyperlinks). Runs after
+        // merges are finalized above, since finalize_hyperlinks's
+        // placeholder-cell backfill must not race the merge sweep in
+        // Sheet::finalize_merges. ---
+        if !output.pending_hyperlinks.is_empty() {
+            let ranges = resolve_sheet_hyperlinks(
+                &mut container,
+                &route.worksheet_path,
+                output.pending_hyperlinks,
+            )?;
+            resolve::hyperlink::resolve(&mut sheet, ranges)?;
+        }
+
         sheets.push(sheet);
     }
     // shared_string_table / stylesheet go out of scope and are dropped here
@@ -362,6 +381,69 @@ fn resolve_sheet_images<R: Read + Seek>(
     }
 
     Ok(images)
+}
+
+/// Phase 3.5: resolves a worksheet's collected `PendingHyperlink`s (Issue
+/// #95) into a `Vec<model::HyperlinkRange>` — looking up each `r_id`'s raw
+/// Target string against the worksheet's own `_rels`, the same map
+/// `resolve_sheet_images` loads for `<drawing r:id>`. Unlike that
+/// function, this one deliberately does **not** verify that an `Internal`
+/// target's ZIP entry exists, and never does anything with an `External`
+/// one beyond copying its URL string — Issue #95's explicit scope
+/// decision is that hyperlinks are captured for diffing, never followed
+/// (no existence check, no HTTP fetch). An `r_id` that isn't in `_rels` at
+/// all (a malformed file) degrades to `target: None` rather than failing
+/// the whole sheet, the same "a broken decoration on an otherwise-valid
+/// sheet shouldn't sour every other cell's parse" tradeoff
+/// `resolve_sheet_images` already makes for `Image::hyperlink`.
+///
+/// `_rels` is loaded at all only when at least one pending entry actually
+/// carries an `r_id` — a sheet whose hyperlinks are all `location`-only
+/// internal jumps never touches the ZIP for this step. Only *builds* the
+/// batch; registering it into `sheet` (overlap validation +
+/// `Sheet::finalize_hyperlinks`) is the caller's job, via
+/// `resolve::hyperlink::resolve` — that step is pure domain logic, not
+/// I/O plumbing, so it does not belong in this function.
+fn resolve_sheet_hyperlinks<R: Read + Seek>(
+    container: &mut ZipContainer<R>,
+    worksheet_path: &str,
+    pending: Vec<parse::PendingHyperlink>,
+) -> Result<Vec<crate::model::HyperlinkRange>, Error> {
+    let needs_rels = pending.iter().any(|p| p.r_id.is_some());
+    let worksheet_rels = if needs_rels {
+        let (worksheet_rels_path, worksheet_dir) = rels_path_for(worksheet_path);
+        match container.get_entry(&worksheet_rels_path)? {
+            Some(reader) => Some(parse::parse_relationships(
+                BufReader::new(reader),
+                worksheet_dir,
+                &worksheet_rels_path,
+            )?),
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    Ok(pending
+        .into_iter()
+        .map(|p| {
+            let target = p.r_id.as_ref().and_then(|id| {
+                worksheet_rels
+                    .as_ref()
+                    .and_then(|rels| rels.get(id))
+                    .map(|rel| rel.target.clone())
+            });
+            crate::model::HyperlinkRange {
+                start: p.start,
+                end: p.end,
+                hyperlink: crate::model::Hyperlink {
+                    target,
+                    location: p.location,
+                    tooltip: p.tooltip,
+                },
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -1285,5 +1367,208 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].target, "xl/media/image1.png");
         assert_eq!(images[0].hyperlink, None);
+    }
+
+    // --- Cell hyperlinks (Issue #95) ---
+
+    const WORKSHEET_WITH_EXTERNAL_HYPERLINK_XML: &[u8] = br#"<worksheet><sheetData>
+<row r="1"><c r="A1"><v>42</v></c></row>
+</sheetData>
+<hyperlinks><hyperlink ref="A1" r:id="rIdLink" tooltip="Visit example"/></hyperlinks>
+</worksheet>"#;
+
+    const WORKSHEET_RELS_WITH_HYPERLINK: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdLink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/" TargetMode="External"/>
+</Relationships>"#;
+
+    #[test]
+    fn external_hyperlink_resolves_target_and_tooltip_end_to_end() {
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            (
+                "xl/worksheets/sheet1.xml",
+                WORKSHEET_WITH_EXTERNAL_HYPERLINK_XML,
+            ),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                WORKSHEET_RELS_WITH_HYPERLINK,
+            ),
+        ]);
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+        let sheet = &workbook.sheets()[0];
+        let hyperlink = sheet.hyperlink_at(CellRef { row: 1, col: 1 }).unwrap();
+        assert_eq!(hyperlink.target.as_deref(), Some("https://example.com/"));
+        assert_eq!(hyperlink.location, None);
+        assert_eq!(hyperlink.tooltip.as_deref(), Some("Visit example"));
+    }
+
+    #[test]
+    fn range_ref_hyperlink_attaches_independently_to_every_populated_cell() {
+        // ref="A1:B1" is not a merge — A1 and B1 are two independent,
+        // already-populated cells that must each carry the hyperlink on
+        // their own in JSON-facing output (Sheet::hyperlink_at), not just
+        // the range's origin.
+        let worksheet: &[u8] = br#"<worksheet><sheetData>
+<row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row>
+</sheetData>
+<hyperlinks><hyperlink ref="A1:B1" r:id="rIdLink"/></hyperlinks>
+</worksheet>"#;
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            ("xl/worksheets/sheet1.xml", worksheet),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                WORKSHEET_RELS_WITH_HYPERLINK,
+            ),
+        ]);
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+        let sheet = &workbook.sheets()[0];
+        for col in 1..=2 {
+            assert_eq!(
+                sheet
+                    .hyperlink_at(CellRef { row: 1, col })
+                    .unwrap()
+                    .target
+                    .as_deref(),
+                Some("https://example.com/"),
+                "col {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_hyperlink_ranges_are_invalid_hyperlink_range() {
+        let worksheet: &[u8] = br#"<worksheet><sheetData></sheetData>
+<hyperlinks>
+<hyperlink ref="A1:C3" location="Sheet1!A1"/>
+<hyperlink ref="B2:D4" location="Sheet1!A1"/>
+</hyperlinks>
+</worksheet>"#;
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            ("xl/worksheets/sheet1.xml", worksheet),
+        ]);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::InvalidHyperlinkRange { .. }));
+    }
+
+    #[test]
+    fn location_only_hyperlink_needs_no_worksheet_rels_part() {
+        // No r:id at all — a pure in-workbook jump. No
+        // xl/worksheets/_rels/sheet1.xml.rels part exists in this ZIP,
+        // proving resolve_sheet_hyperlinks never even attempts to load it
+        // when nothing in pending_hyperlinks carries an r_id.
+        let worksheet: &[u8] = br#"<worksheet><sheetData>
+<row r="1"><c r="A1"><v>1</v></c></row>
+</sheetData>
+<hyperlinks><hyperlink ref="A1" location="'Sheet2'!A1"/></hyperlinks>
+</worksheet>"#;
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            ("xl/worksheets/sheet1.xml", worksheet),
+        ]);
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+        let hyperlink = workbook.sheets()[0]
+            .hyperlink_at(CellRef { row: 1, col: 1 })
+            .unwrap();
+        assert_eq!(hyperlink.target, None);
+        assert_eq!(hyperlink.location.as_deref(), Some("'Sheet2'!A1"));
+    }
+
+    #[test]
+    fn unresolved_hyperlink_r_id_degrades_to_no_target_rather_than_failing() {
+        // r:id is present on <hyperlink>, but xl/worksheets/_rels/sheet1.xml.rels
+        // has no matching entry (a malformed file) — Issue #95's scope
+        // explicitly rules out failing the whole sheet over a broken
+        // hyperlink decoration, the same tradeoff resolve_sheet_images
+        // already makes for Image::hyperlink.
+        let rels_without_the_link_id: &[u8] = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>"#;
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            (
+                "xl/worksheets/sheet1.xml",
+                WORKSHEET_WITH_EXTERNAL_HYPERLINK_XML,
+            ),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                rels_without_the_link_id,
+            ),
+        ]);
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+        let hyperlink = workbook.sheets()[0]
+            .hyperlink_at(CellRef { row: 1, col: 1 })
+            .unwrap();
+        assert_eq!(hyperlink.target, None);
+        assert_eq!(hyperlink.tooltip.as_deref(), Some("Visit example"));
+    }
+
+    #[test]
+    fn hyperlink_on_an_otherwise_fully_blank_cell_still_surfaces_in_output() {
+        // B1 carries a hyperlink but no <c> element at all — mirrors
+        // insert_merge's placeholder-cell backfill (Sheet::insert_hyperlink
+        // must do the same, or this cell would silently vanish from
+        // iter_cells/JSON output entirely).
+        let worksheet: &[u8] = br#"<worksheet><sheetData>
+<row r="1"><c r="A1"><v>1</v></c></row>
+</sheetData>
+<hyperlinks><hyperlink ref="B1" location="Sheet1!A1"/></hyperlinks>
+</worksheet>"#;
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            ("xl/worksheets/sheet1.xml", worksheet),
+        ]);
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+        let sheet = &workbook.sheets()[0];
+        let b1 = CellRef { row: 1, col: 2 };
+        assert!(
+            sheet.get(b1).is_some(),
+            "B1 must exist as a placeholder cell"
+        );
+        assert!(sheet.hyperlink_at(b1).is_some());
+        let coords: Vec<CellRef> = sheet.iter_cells().map(|(c, _)| c).collect();
+        assert!(
+            coords.contains(&b1),
+            "B1 must be reachable via iter_cells/JSON output"
+        );
+    }
+
+    #[test]
+    fn hyperlink_count_over_the_limit_is_too_many_hyperlinks() {
+        let mut hyperlinks = String::from("<hyperlinks>");
+        for row in 1..=(resolve::hyperlink::MAX_HYPERLINKS_PER_SHEET as u32 + 1) {
+            hyperlinks.push_str(&format!(
+                r#"<hyperlink ref="A{row}" location="Sheet1!A1"/>"#
+            ));
+        }
+        hyperlinks.push_str("</hyperlinks>");
+        let worksheet =
+            format!("<worksheet><sheetData></sheetData>{hyperlinks}</worksheet>").into_bytes();
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            ("xl/worksheets/sheet1.xml", &worksheet),
+        ]);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::TooManyHyperlinks { .. }));
     }
 }

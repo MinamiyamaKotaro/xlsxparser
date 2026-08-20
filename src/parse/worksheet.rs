@@ -39,6 +39,28 @@ pub(crate) struct PendingStyle {
     pub style_id: StyleId,
 }
 
+/// The pending entry Phase 3 records for a `<hyperlink>` element (Issue
+/// #95). Only syntactic parsing happens here — `r_id` (if present) is
+/// resolved to a raw Target string in `pipeline.rs`, against the same
+/// `worksheet_rels` map Issue #65's image resolution already loads;
+/// `start`/`end` ordering and mutual overlap with other hyperlink ranges
+/// are validated by `resolve/hyperlink.rs`, not here — same division of
+/// labor as `MergedRegion`/`resolve/merge.rs`.
+///
+/// `start`/`end` mirror a single coordinate (`ref="A1"`) as `start ==
+/// end`, or the two ends of a range (`ref="A1:C3"`) otherwise —
+/// `parse_hyperlink_ref` never expands a range into individual cells, for
+/// the same O(row_span * col_span) amplification reason `MergedRegion`
+/// isn't expanded either.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingHyperlink {
+    pub start: CellRef,
+    pub end: CellRef,
+    pub r_id: Option<String>,
+    pub location: Option<String>,
+    pub tooltip: Option<String>,
+}
+
 /// `parse_worksheet`'s output. `sheet` itself is mutated directly through
 /// the `&mut` argument, so this only returns the three remaining pieces of
 /// unresolved data Phase 4 needs.
@@ -54,6 +76,12 @@ pub(crate) struct WorksheetParseOutput {
     /// to locate the `drawingN.xml` part (Issue #65); `None` means this
     /// sheet has no images at all, so no `_rels` lookup is attempted for it.
     pub drawing_r_id: Option<String>,
+    /// Every `<hyperlink>` entry collected from `<hyperlinks>` (Issue #95).
+    /// Empty means this sheet declared no cell hyperlinks at all, in which
+    /// case `pipeline.rs` skips loading `_rels` for hyperlink resolution
+    /// entirely (same "pay for what you use" pattern as the theme color
+    /// gate).
+    pub pending_hyperlinks: Vec<PendingHyperlink>,
 }
 
 /// Phase 3's entry function. `sheet` is received already constructed by
@@ -95,6 +123,7 @@ pub(crate) fn parse_worksheet(
     let mut default_col_width = None;
     let mut merge_regions = Vec::new();
     let mut drawing_r_id = None;
+    let mut pending_hyperlinks = Vec::new();
 
     // State for the `<c>` currently being read (between its start and end
     // tag). `cur_ref` doubles as "are we inside a <c>?".
@@ -225,6 +254,17 @@ pub(crate) fn parse_worksheet(
             Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"drawing" => {
                 drawing_r_id = Some(required_attr(e, path, "r:id")?);
             }
+            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"hyperlink" => {
+                let cell_range = required_attr(e, path, "ref")?;
+                let (start, end) = parse_hyperlink_ref(&cell_range, path)?;
+                pending_hyperlinks.push(PendingHyperlink {
+                    start,
+                    end,
+                    r_id: optional_attr(e, path, "r:id")?,
+                    location: optional_attr(e, path, "location")?,
+                    tooltip: optional_attr(e, path, "tooltip")?,
+                });
+            }
             Event::Eof => break,
             _ => {}
         }
@@ -238,6 +278,7 @@ pub(crate) fn parse_worksheet(
         default_col_width,
         merge_regions,
         drawing_r_id,
+        pending_hyperlinks,
     })
 }
 
@@ -490,6 +531,28 @@ fn parse_merge_ref(cell_range: &str) -> Result<MergedRegion, Error> {
         start: CellRef::from_a1(start_str)?,
         end: CellRef::from_a1(end_str)?,
     })
+}
+
+/// Parses a `<hyperlink ref="...">` attribute (Issue #95) into a
+/// `(start, end)` pair — either a plain coordinate (`"A1"`, the common
+/// case; `start == end`) or a `"A1:C3"` range, kept as two coordinates
+/// rather than expanded (see [`PendingHyperlink`]'s doc comment). Only
+/// syntactic validity is checked here; range soundness (start/end
+/// ordering, overlap with other hyperlink ranges) is
+/// `resolve/hyperlink.rs`'s job — mirrors `parse_merge_ref` exactly.
+fn parse_hyperlink_ref(cell_range: &str, path: &str) -> Result<(CellRef, CellRef), Error> {
+    let invalid = || Error::InvalidCellRef(format!("hyperlink ref {cell_range:?} in {path}"));
+    match cell_range.split_once(':') {
+        Some((start_str, end_str)) => {
+            let start = CellRef::from_a1(start_str).map_err(|_| invalid())?;
+            let end = CellRef::from_a1(end_str).map_err(|_| invalid())?;
+            Ok((start, end))
+        }
+        None => {
+            let coord = CellRef::from_a1(cell_range).map_err(|_| invalid())?;
+            Ok((coord, coord))
+        }
+    }
 }
 
 #[cfg(test)]

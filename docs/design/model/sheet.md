@@ -33,6 +33,31 @@ impl MergedRegion {
     pub fn col_span(&self) -> u32 { debug_assert!(self.start.col <= self.end.col); self.end.col - self.start.col + 1 }
 }
 
+/// セルのハイパーリンク(Issue #95)。生のまま、非解決の状態で保持する
+/// — `ColorRef`と同じ「表示ではなくdiffのため」という思想(Issue #75)。
+/// リンク先の実在確認もHTTPアクセスも一切行わない。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Hyperlink {
+    pub target: Option<String>,
+    pub location: Option<String>,
+    pub tooltip: Option<String>,
+}
+
+/// ハイパーリンクが適用される範囲(Issue #95)——`start`/`end`は
+/// `MergedRegion`と全く同じ形(単一セルの`ref`なら`start == end`)。
+/// 理由も同じ「範囲のまま保持し展開しない」: `<hyperlink
+/// ref="A1:XFD1048576">`はO(row_span × col_span)ではなくO(1)で
+/// 済まなければならない——`insert_merge`が既に塞いだのと同種の増幅
+/// (`insert_merge_on_huge_region_does_not_hang`)。`pub(crate)`——
+/// `MergedRegion`と異なり利用者向けAPIには一切公開されない。`Sheet`が
+/// 公開するのは`hyperlink_at`が返す最終的なセル単位の`Hyperlink`のみ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HyperlinkRange {
+    pub start: CellRef,
+    pub end: CellRef,
+    pub hyperlink: Hyperlink,
+}
+
 /// シートの可視性（`workbook.xml` の `<sheet state="...">`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SheetVisibility {
@@ -62,6 +87,11 @@ pub struct Sheet {
     /// インクリメンタルに更新し、`<dimension>` 要素の値には依存しない。
     pub max_row: u32,
     pub max_col: u32,
+    /// 起点セル座標 -> ハイパーリンク(Issue #95)。`finalize_hyperlinks`が
+    /// 一度だけ設定する。`merged_regions`と同じく`HashMap`——出力順序を
+    /// 直接左右することはなく、`iter_cells`の(既に決定的な)走査中に
+    /// セルごとに引かれるだけである。
+    hyperlinks: HashMap<CellRef, Hyperlink>,
 }
 
 impl Sheet {
@@ -80,6 +110,7 @@ impl Sheet {
             merge_bounds: None,
             max_row: 0,
             max_col: 0,
+            hyperlinks: HashMap::new(),
         }
     }
 
@@ -254,6 +285,93 @@ impl Sheet {
     pub fn iter_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
         self.cells.iter().map(|(&r, c)| (r, c))
     }
+
+    /// `r`にまだ何も無ければ空セルをプレースホルダーとして挿入する
+    /// (Issue #95)——`insert_merge`の起点補完と同じ理由。
+    fn backfill_blank_cell(&mut self, r: CellRef) {
+        if !self.cells.contains_key(&r) {
+            self.insert_cell(r, Cell { value: None, style: None });
+        }
+    }
+
+    /// 検証済みのハイパーリンク範囲をまとめて登録する(重複検証後に
+    /// `resolve::hyperlink::resolve`から呼ばれる。resolve/hyperlink.md
+    /// 参照)。各範囲の起点セルを補完したうえで、`cells`に既に存在する
+    /// 全セルキー(この補完で追加した分を含む)を、それを覆う範囲の
+    /// `Hyperlink`へ1回のスイープラインパスで解決する——
+    /// `finalize_merges`と同じStart/End/Query構成で、C個のセル・H個の
+    /// 範囲に対しO((C + H) log (C + H))、O(C * H)には決してならない。
+    /// カバーされたセルが結合の仮想セルのように起点へ畳み込まれず、
+    /// 自分自身の座標のままキーになる理由はコードブロック直後の
+    /// 注記参照。
+    pub(crate) fn finalize_hyperlinks(&mut self, ranges: Vec<HyperlinkRange>) {
+        if ranges.is_empty() {
+            return;
+        }
+        for range in &ranges {
+            self.backfill_blank_cell(range.start);
+        }
+
+        enum SweepEvent {
+            Start(usize), // rangesへのインデックス
+            End(usize),
+            Query(CellRef),
+        }
+
+        let mut events: Vec<(u32, u8, SweepEvent)> = Vec::new();
+        for (i, range) in ranges.iter().enumerate() {
+            events.push((range.start.row, 0, SweepEvent::Start(i)));
+            events.push((range.end.row + 1, 0, SweepEvent::End(i)));
+        }
+        for &coord in self.cells.keys() {
+            events.push((coord.row, 2, SweepEvent::Query(coord)));
+        }
+        events.sort_by_key(|(row, kind_rank, event)| {
+            let start_end_rank = match event {
+                SweepEvent::End(_) => 0,
+                SweepEvent::Start(_) => 1,
+                SweepEvent::Query(_) => *kind_rank,
+            };
+            (*row, start_end_rank)
+        });
+
+        let mut active: Vec<usize> = Vec::new(); // rangesへのインデックス、start.col順
+        let mut matches: Vec<(CellRef, Hyperlink)> = Vec::new();
+        for (_, _, event) in &events {
+            match event {
+                SweepEvent::Start(i) => {
+                    let col = ranges[*i].start.col;
+                    let pos = active.partition_point(|&j| ranges[j].start.col < col);
+                    active.insert(pos, *i);
+                }
+                SweepEvent::End(i) => {
+                    active.retain(|&j| j != *i);
+                }
+                SweepEvent::Query(coord) => {
+                    let pos = active.partition_point(|&j| ranges[j].start.col <= coord.col);
+                    if pos == 0 {
+                        continue;
+                    }
+                    let candidate = active[pos - 1];
+                    let range = &ranges[candidate];
+                    if coord.col <= range.end.col {
+                        matches.push((*coord, range.hyperlink.clone()));
+                    }
+                }
+            }
+        }
+        for (coord, hyperlink) in matches {
+            self.hyperlinks.insert(coord, hyperlink);
+        }
+    }
+
+    /// セル`origin`に登録されたハイパーリンクをO(1)で取得する。
+    /// `merged_region_at`の慣習をそのまま踏襲する(結合起点への解決は
+    /// ここでは行わない——`json.rs`は常に`iter_cells`が返した座標で
+    /// これを呼ぶ)。
+    pub fn hyperlink_at(&self, origin: CellRef) -> Option<&Hyperlink> {
+        self.hyperlinks.get(&origin)
+    }
 }
 ```
 
@@ -283,10 +401,18 @@ Issue #87のPoC（`massive_dense_accounting.xlsx`、30万セル、カスタム�
 
 `merged_regions`（起点セル座標をキーとする内部専用のO(1)/O(N)ルックアップ用途で、`json.rs`へ直接反映される走査順を持たない）は本対応のスコープ外として`HashMap`のまま据え置いている。
 
+**機能: ハイパーリンク(Issue #95)。** `Sheet` は `hyperlinks: HashMap<CellRef, Hyperlink>` も保持し、`finalize_hyperlinks` が一度だけ設定する——`resolve::hyperlink::resolve`(重複と開始・終了座標の大小関係を検証済みの`HyperlinkRange`バッチを渡す。[resolve/hyperlink.md](../resolve/hyperlink.md)参照)から呼ばれる。`<hyperlink ref="A1:C3">` は(`<mergeCell>`と異なり)必ずしも結合範囲ではない——OOXMLでは、互いに独立した複数セルの矩形選択に対して1つのハイパーリンクを適用できるため、カバーされた各セルは結合の仮想セルのように起点へ畳み込まれるのではなく、それぞれ独立してJSON出力上でハイパーリンクを持たなければならない。
+
+これにより、`resolve_origin`のパターン(仮想座標を1つの共有起点`Cell`へ解決する`get`/`get_mut`方式)をそのまま流用する案は却下された: 最初のドラフトはまさにそれ(幾何学的バウンディングボックスによる事前チェック→クエリごとに範囲リストを線形`.find()`)を行っており、これは`resolve_origin`の**Issue #43修正前**の形そのものであり、`finalize_merges`のスイープライン書き換えが結合セルについて解消したはずのO(セル数 × 範囲数)のコストを再導入してしまうことが設計レビューの段階(実装前)で判明した(この再導入を防ぐ回帰テストについては`resolve/hyperlink.md`のテスト方針参照)。`finalize_hyperlinks`は代わりに同じスイープを一度だけ実行するが、一致した際に**クエリ**座標(カバーされた各セルそれぞれ)をキーとして`hyperlinks`へ挿入する——`finalize_merges`のように非起点キーを削除するのではない。起点セル自身も、スイープが走る前に`backfill_blank_cell`がその存在を既に保証しているため、同じパスの中で自然に自分自身のエントリを得る。
+
+補完(バックフィル)するのは範囲自身の起点セルのみである(`insert_merge`をそのまま踏襲)——範囲内の他のセルで、値・スタイル・ハイパーリンク以外の理由で存在すべき根拠が無いものは実体化されないままとなり、`iter_cells`/JSON出力からは見えない(Excel上ではクリック可能に表示されるにもかかわらず)。範囲内の全セルを補完する案も検討したが却下した——正当に`MAX_HYPERLINKS_PER_SHEET`規模まで許容される範囲がどれだけ大きくなり得るかに上限が無いため、`insert_merge`から`merge_aliases`を廃止した際(上記の注記参照)に結合セルについて塞いだのと同じO(row_span × col_span)の増幅を再び開けてしまう。これは既知の制限として受け入れており(`resolve/hyperlink.md`のオープンクエスチョン参照)、投機的に解決はしていない。
+
+`Sheet::hyperlink_at`は`get`と異なり結合起点への解決を行わない——`merged_region_at`の慣習をそのまま踏襲する(`json.rs`はいずれも`iter_cells`が既に返した座標——構成上常に起点である——でしか呼ばない)。
+
 ## 依存関係
 
 - 依存先: [`model/cell.rs`](cell.md)（`Cell`, `CellRef`）
-- 依存元: `model::Workbook`（複数シートを保持）、[`pipeline.rs`](../pipeline.md)（`Sheet::new` でシートを構築する。フェーズ3.5が `set_images` を呼ぶ——[parse/drawing.md](../parse/drawing.md) 参照）、`resolve/merge.rs`（`insert_merge` を呼び出して結合セルを登録し、全件登録後に `finalize_merges` を呼ぶ）、`resolve/shared_strings.rs` / `resolve/style.rs`（`get_mut` を通じてセルの値・スタイルを解決済みデータへ書き換える）、`resolve/column_width.rs`（検証後に `set_col_widths` を呼ぶ）、[`json.rs`](../json.md)（`iter_cells`・`merged_region_at`・`col_width_ranges`・`default_col_width`・`images` からJSONを組み立てる）、`parse/worksheet.rs`（`insert_cell` でパース結果を挿入する）
+- 依存元: `model::Workbook`（複数シートを保持）、[`pipeline.rs`](../pipeline.md)（`Sheet::new` でシートを構築する。フェーズ3.5が `set_images` を呼ぶ——[parse/drawing.md](../parse/drawing.md) 参照）、`resolve/merge.rs`（`insert_merge` を呼び出して結合セルを登録し、全件登録後に `finalize_merges` を呼ぶ）、`resolve/shared_strings.rs` / `resolve/style.rs`（`get_mut` を通じてセルの値・スタイルを解決済みデータへ書き換える）、`resolve/column_width.rs`（検証後に `set_col_widths` を呼ぶ）、[`resolve/hyperlink.rs`](../resolve/hyperlink.md)（検証後に一度だけ`finalize_hyperlinks`を呼ぶ）、[`json.rs`](../json.md)（`iter_cells`・`merged_region_at`・`col_width_ranges`・`default_col_width`・`images`・`hyperlink_at` からJSONを組み立てる）、`parse/worksheet.rs`（`insert_cell` でパース結果を挿入する）
 
 `cells` / `merged_regions` フィールド自体は `pub(crate)` にも公開せず完全に非公開のままとし、これらの内部データ構造への書き込みは `insert_cell` / `insert_merge` / `get_mut` / `finalize_merges` に限定する。フィールドを直接 `pub(crate)` にする案（初回レビューでの提案）も検討したが、その場合 `max_row`/`max_col` の更新漏れや結合起点セルの補完漏れを各呼び出し元（`resolve/` 配下の複数モジュール）が個別に守る必要があり、不変条件がクレート全体に分散してしまう。メソッド経由に限定することで不変条件を `Sheet` 自身に閉じ込め、呼び出し側は正しさを気にせず利用できる。
 
@@ -316,6 +442,11 @@ Issue #87のPoC（`massive_dense_accounting.xlsx`、30万セル、カスタム�
 - **`column_width` が範囲なし・`defaultColWidth` なしで `None` を返すことの確認**、**複数範囲にまたがる二分探索の正当性の確認**（範囲内・範囲間の隙間・`defaultColWidth`へのフォールバックの境界値を含む）、**`col_width_ranges`/`default_col_width` がJSON出力用に生の値を公開することの確認**（Issue #39。詳細な検証は `resolve::column_width` のテスト群が担う）
 - **`images()` が `set_images` で設定された生の `Vec` をそのまま公開することの確認**（Issue #65。アンカーごとの解決の正当性は `parse::drawing` と `pipeline.rs` それぞれのテスト群が担う）
 - **`iter_cells` の走査順が、挿入順によらず行優先・列優先の決定的な順序（`CellRef`の`Ord`に従う）になることの確認**（Issue #87。`cells`を`BTreeMap`へ変更したことによる保証。XML出現順が昇順とは限らない実ファイルを模した回帰テストとして、[`tests/normal.rs`の`json_cells_array_is_sorted_by_row_then_col_regardless_of_source_order`](../../../tests/normal.rs)が挿入順をわざと入れ替えたフィクスチャで検証する）
+- **範囲リストが空の場合、`finalize_hyperlinks` がno-opであることの確認**（Issue #95。共通ケースを軽量に保つ必要がある。`finalize_merges`と同型）
+- **`finalize_hyperlinks` が範囲の起点セルに空セルをプレースホルダーとして補完し、`hyperlink_at`/`iter_cells` から正しく取得できることの確認**（`insert_merge_backfills_blank_origin_cell`と同型）
+- **既にデータを持つ複数セルにまたがるハイパーリンク範囲(結合ではない)が、起点だけでなくカバーする全セルに独立してハイパーリンクを付与することの確認**——`resolve_origin`方式の解決では(Issue #43修正前のコストを再導入せずには)満たせなかった中核的な正当性要件(上記の「機能: ハイパーリンク」の注記参照)
+- **ハイパーリンク範囲内の、起点以外の完全に空白なセルが `iter_cells`/JSON出力に現れないことの確認**——上述の受け入れた制限を固定するテストであり、将来これを補完する変更が意図的な決定であって偶発的な退行でないことを保証する
+- **結合と同型のエンドツーエンド回帰テスト**: `MAX_HYPERLINKS_PER_SHEET`件の範囲を同時アクティブ行数が最大になるよう配置し、さらに無関係なセルを多数加えたシートが、セル数×範囲数に比例しないコストで完了することの確認(本モジュール単体ではなく`resolve::hyperlink`自身のテストスイートが`pipeline.rs`経由で担う。[resolve/hyperlink.md](../resolve/hyperlink.md)参照)
 
 ## 未決事項 / オープンクエスチョン
 
@@ -325,3 +456,4 @@ Issue #87のPoC（`massive_dense_accounting.xlsx`、30万セル、カスタム�
 4. **凍結行/列など`worksheet.xml`のその他メタデータ**: 要求仕様書では明示されていないが、`freezePane` などを将来的に扱う場合、`Sheet` に持たせるか別型に分離するかは未決定（現時点ではスコープ外として型に含めない）。可視性（`visibility`）については解決済み（workbook.md オープンクエスチョン1参照）。
 5. ~~非公開フィールドへのクレート内アクセス~~ → **解決**: `cells` 等のフィールドを直接 `pub(crate)` にするのではなく、`insert_cell` / `insert_merge` / `get_mut` という限定APIを `Sheet` に実装し、それ以外からの直接アクセスを禁止する（[PR #5 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948259819)を踏まえて確定。フィールド直接公開案との比較は依存関係セクション参照）。
 6. ~~`cells` のコンテナ型（`HashMap` vs `BTreeMap`）~~ → **解決**: `BTreeMap<CellRef, Cell>` を採用（Issue #87）。`iter_cells` の走査順が `json.rs` の `cells` 配列にそのまま反映されるため、`HashMap` のプロセスごとにランダムなハッシュシードに依存する走査順は、同一ファイルの2回のパース結果をテキスト差分で比較する用途で無関係なセル並び替えを大量の差分として見せてしまう問題があった。PoCによる実測（コードブロック直後の注記参照）で `BTreeMap` がCPU/ピークメモリの両面でも `HashMap` に劣らない（むしろ優る）ことを確認したうえで確定。`merged_regions` はJSON出力順に影響しないため対象外（`HashMap` のまま）。
+7. **ハイパーリンク範囲と結合セルの相互作用、`finalize_hyperlinks`と`finalize_merges`の実行順序**: [resolve/hyperlink.md](../resolve/hyperlink.md) 自身のオープンクエスチョン1・2を参照。いずれも本ファイルの挙動に関わるが、実質的には`pipeline.rs`における`resolve::hyperlink::resolve`の呼び出し順序の話であり、`Sheet`のAPI自体の論点ではないためあちらで管理する。
