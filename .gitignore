@@ -23,5 +23,11 @@ tests/fixtures/other
 # merged) — see e.g. Issue #67's grouped-image transform PoC. The folder's
 # own README (rules for this directory) stays tracked; everything else
 # under it does not.
-/PoC/*
-!/PoC/README.md
+#
+# Pattern must match the actual on-disk directory name (`poc/`, lowercase)
+# exactly — git's gitignore matching is case-sensitive regardless of the
+# filesystem, so a case mismatch here (previously `/PoC/*`) silently stops
+# ignoring anything on a case-sensitive filesystem (Linux/CI), even though
+# it appears to work locally on macOS's default case-insensitive one.
+/poc/*
+!/poc/README.md
