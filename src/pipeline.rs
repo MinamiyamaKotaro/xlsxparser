@@ -797,9 +797,9 @@ mod tests {
   <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
 </Relationships>"#;
         let good_sheet: &[u8] = b"<worksheet><sheetData></sheetData></worksheet>";
-        // Missing `r` attribute on <c> makes Phase 3 fail for this sheet.
+        // A malformed A1 cell reference makes Phase 3 fail for this sheet.
         let broken_sheet: &[u8] =
-            br#"<worksheet><sheetData><row r="1"><c t="n"><v>1</v></c></row></sheetData></worksheet>"#;
+            br#"<worksheet><sheetData><row r="1"><c r="1A" t="n"><v>1</v></c></row></sheetData></worksheet>"#;
         let zip = build_zip(&[
             ("xl/_rels/workbook.xml.rels", rels_two_sheets),
             ("xl/workbook.xml", workbook_two_sheets),
@@ -808,7 +808,7 @@ mod tests {
             ("xl/worksheets/sheet2.xml", broken_sheet),
         ]);
         let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
-        assert!(matches!(err, Error::MissingRequiredElement { .. }));
+        assert!(matches!(err, Error::InvalidCellRef(_)));
     }
 
     #[test]

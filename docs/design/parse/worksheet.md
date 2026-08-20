@@ -81,6 +81,18 @@ pub(crate) struct WorksheetParseOutput {
 /// 仮の日付を、同じブック内の数値ベース時刻のみセルが解決する日付と
 /// 一致させるためだけにフェーズ3へも運ぶ(PR #80レビュー指摘2。詳細は
 /// `parse_iso8601_datetime` のdocコメント参照)。
+///
+/// `<row>`/`<c>` の `r` 属性(セル参照)はいずれもECMA-376仕様上省略可能で、
+/// 省略時は「直前の行/セルの次」として暗黙的に位置推論することが許容
+/// されている(Issue #79)。本関数はこの推論に必要な「現在の行番号」
+/// 「行内での現在の列位置」をループのローカル状態として保持し、`<row>`
+/// の開始タグで行番号を確定・列位置をリセットし、各 `<c>` の開始タグで
+/// `r` があればそれを採用しつつ現在列を更新、無ければ現在列を1進めて
+/// 採用する。いずれの経路でも [`model/cell.rs`](../model/cell.md) の
+/// `CellRef::MAX_ROW`/`MAX_COL` と同じ上限チェックを行う——`r` を省略した
+/// `<c>` を大量に並べるだけで `CellRef::from_a1` の上限チェックを経由せず
+/// `Sheet::max_col` を膨張させられてしまうため(セキュリティレビュー
+/// `docs/security/code-review.md` Finding 2 と同じ攻撃面)。
 pub(crate) fn parse_worksheet(
     reader: impl BufRead,
     path: &str,
@@ -201,7 +213,7 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 ## エラー処理方針
 
 - XMLとして構文的に不正な場合は [`convert_xml_error`](mod.md) を通じて `Error::XmlParse` または `Error::ZipBombDetected` に変換する
-- `<c>` の `r` 属性（セル参照。例: `"B12"`）が欠落している場合は `Error::MissingRequiredElement` を返す。行内でのセル省略に基づく列位置の逐次推論（`r` 省略時に直前セルの次列とみなす、仕様上は許容される簡略記法）は行わない（オープンクエスチョン4参照）
+- `<row>`/`<c>` の `r` 属性はいずれも省略可能で、省略時は直前の行/セルから暗黙的に位置を推論する（Issue #79。旧オープンクエスチョン4を解決）。`<row r="0">` や `MAX_ROW` 超過、推論後の列が `MAX_COL` を超える場合は `Error::InvalidCellRef` を返す（`CellRef::from_a1` の上限チェックと同じ方針。行の外(`<row>` を一度も見ていない状態)で `<c>` の `r` が省略された場合も同様）
 - `r` 属性の値が不正なA1形式（`CellRef::from_a1` が `Err` を返す）の場合はそのまま `Error::InvalidCellRef` を伝播する
 - `<v>` の数値テキストが `f64` としてパースできない場合は `Error::InvalidPackage`（暫定。より専用のバリアントを設けるかは [error.md](../error.md) 側の見直しに委ねる）とする
 - `t="d"` セルの `<v>` テキストが日付のみ・日付+時刻・時刻のみのいずれの形にも一致しない、または各数値要素の範囲が不正（月13、時24等）な場合は `Error::InvalidPackage`（上記の数値 `<v>` と同じ暫定方針。Issue #58）。小数秒・末尾のUTC/オフセット指定子・秒の省略はエラーにせず許容する（PR #80レビュー指摘1。`parse_iso8601_datetime` のdocコメント参照）
@@ -220,7 +232,9 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 - 値も書式もない空のセル要素、または `<row>` に `<c>` が1つもない行が、`Sheet` に何も挿入しない（疎行列の空白セル非インスタンス化。要求仕様書3.1）ことの確認
 - `<row>` の処理完了後、次の `<row>` の処理に影響を与えるパーサー内部状態が残らないことの確認（行単位破棄の回帰テスト。ある行で `t="s"` セルを処理した直後、次の行の通常セルが誤って共有文字列として扱われない、といったクロスコンタミネーション検出）
 - `<mergeCells>` 内の複数 `<mergeCell ref="...">` から、`start`/`end` が正しい `MergedRegion` のリストが得られることの確認（妥当性検証自体は行わないため、開始・終了が逆転した不正な範囲もそのまま `Vec` へ含まれることの確認を含む。検証は [resolve/merge.md テスト方針](../resolve/merge.md) 側の責務）
-- `r` 属性を欠く `<c>` に対し `Error::MissingRequiredElement` を返すことの確認
+- `r` 属性を欠く `<c>` が、同じ行内の直前セルの次列として正しく位置推論されることの確認。明示的な `r` を持つセルの直後に省略セルが続く場合、行頭からではなくその明示位置の次列から数え直されることの確認（Issue #79）
+- `r` 属性を欠く `<row>` が、直前行の次番号として正しく位置推論されることの確認（Issue #79）
+- `<row>` を一度も見ていない状態で `r` を欠く `<c>` が現れた場合、`<row r="0">` の場合、`<row>` の `r` が `CellRef::MAX_ROW` を超える場合、および省略推論後の列が `CellRef::MAX_COL` を超える場合(セキュリティレビュー Finding 2 と同じ攻撃面の回帰テスト)に、それぞれ `Error::InvalidCellRef` を返すことの確認（Issue #79）
 - 不正なA1形式の `r` 属性・`mergeCell ref` 属性に対し `Error::InvalidCellRef` を返すことの確認
 - `width` 属性を持つ `<cols>` の各エントリが、正しい `min`/`max`/`width` の `ColWidthRange` として収集されることの確認。`width` を持たない `<col>` はスキップされることの確認。単一の `<col min="1" max="16384" .../>`（実データの最悪ケース）が展開されず1件として収集されることの確認
 - `<sheetFormatPr defaultColWidth="..">` が収集されること、および欠落時に `default_col_width: None` のままであることの確認
@@ -242,6 +256,6 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 1. ~~`PendingSharedString` / `PendingStyle` の配置場所の再検討~~ → **解決**: 両型の定義を本ファイル（`parse/worksheet.rs`）へ移設し、[`resolve/shared_strings.rs`](../resolve/shared_strings.md) / [`resolve/style.rs`](../resolve/style.md) 側がそれぞれを `use` する構造とした（[PR #9 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/9#pullrequestreview-4948641204)を反映）。詳細は依存関係セクション参照。
 2. **数式（`<f>` 要素）の扱い**: 現状は内容を一切パース・保存せず読み飛ばす方針（`<v>` の計算済みキャッシュ値のみを採用）を仮定している。数式文字列そのものをJSON出力に含める要求が将来生じた場合、`Cell` に `formula: Option<String>` を追加するか等は要求仕様書の詳細化と合わせて確定させる。
 3. **未知の `t` 属性値へのフォールバック方針**: 現状は生の `<v>` テキストをそのまま `CellValue::Text` として保持するフォールバックとしているが、[parse/workbook.md](workbook.md) の `state` 属性フォールバックと同様の考え方（データを失わない側へ倒す）である一方、明確な `Error` とすべきという意見もありうる。
-4. **`r` 属性省略セルの列位置逐次推論**: OOXMLの仕様上、`<c>` の `r` 属性は省略可能で、省略時は直前セルからの列位置の逐次推論が許容されている。本設計は現状これに対応せず `Error::MissingRequiredElement` とする簡略化を採用しているが、[model/sheet.md](../model/sheet.md) が既に述べる「サードパーティ製ツールが生成した `.xlsx` は仕様の緩い部分に依存しうる」という懸念を踏まえると、実際に `r` を省略する生成ツールが存在する場合は対応が必要になる。**実例を確認済み**: Issue #55の調査で使用した `tests/fixtures/other/minimal_package.xlsx`（calamineテストコーパス由来）の `sheetData` は `<c s="2" t="inlineStr">` のように `r` 属性を省略した `<c>` 要素を多数含んでおり、この懸念が既に現実のファイルで顕在化していることが確認できた。ただし本ファイルの対応はIssue #55（OPCルートリレーションシップ解決）のスコープ外であり、Issue [#79](https://github.com/MinamiyamaKotaro/xlsxparser/issues/79)として別途切り出した。本オープンクエスチョン自体は#79が解決するまで未解決のまま残る。
+4. ~~`r` 属性省略セルの列位置逐次推論~~ → **解決**（Issue [#79](https://github.com/MinamiyamaKotaro/xlsxparser/issues/79)）: `<row>`/`<c>` いずれも `r` 省略時は直前の行/セルから位置を推論するようになった。ループのローカル状態（現在の行番号・行内の現在列）として `cur_row`/`cur_col` を追加し、`<row>` の開始タグで行番号確定・列位置リセット、各 `<c>` の開始タグで `r` があればそれを採用しつつ現在列を更新（後続の省略セルはその位置から数え直す）、無ければ現在列を1進めて採用する形で実装した。`CellRef::MAX_ROW`/`MAX_COL` の上限チェックは推論経路でも同様に行う（セキュリティレビュー Finding 2 と同じ攻撃面——`r` を省略した `<c>` を大量に並べるだけで `CellRef::from_a1` の上限チェックを経由せず `Sheet::max_col` を膨張させられてしまうため）。実例として確認していた `tests/fixtures/other/minimal_package.xlsx`（calamineテストコーパス由来、非コミット）はこの修正により実際にend-to-endで解決できることを確認済み。
 5. **`Reader` の内部バッファサイズ・パフォーマンスチューニング**: [parse/mod.md オープンクエスチョン5](mod.md) と同一の論点。要求仕様書が想定する「方眼紙Excel」規模のシートに対する実測プロファイリングを踏まえて確定させる。
 6. ~~名前空間の扱い~~ → **解決**: [parse/mod.md オープンクエスチョン4](mod.md) で確定した「`quick_xml::NsReader` は採用せず文字列前方一致で簡略化する」方針に従う。`worksheet.xml` 自体の要素・属性（`row`, `c`, `v`, `is`, `t`, `s`, `r`, `mergeCells`, `mergeCell`, `ref`）に接頭辞は付かないため、本ファイルへの直接的な影響はない。

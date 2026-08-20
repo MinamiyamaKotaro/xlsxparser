@@ -371,3 +371,37 @@ fn workbook_part_at_package_root_resolves_via_root_rels() {
         Some(CellValue::Number(42.0))
     );
 }
+
+#[test]
+fn cells_without_r_attribute_resolve_via_positional_inference() {
+    // Issue #79: `r` is optional per ECMA-376 §18.3.1.4; a <c> omitting it
+    // used to make the whole book fail with Error::MissingRequiredElement.
+    let workbook = parse_workbook_reader(Cursor::new(normal::cells_without_r_attribute())).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    assert_eq!(
+        sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
+        Some(CellValue::Text(Arc::from("A1")))
+    );
+    assert_eq!(
+        sheet.get(CellRef { row: 1, col: 2 }).unwrap().value,
+        Some(CellValue::Text(Arc::from("B1")))
+    );
+    assert_eq!(
+        sheet.get(CellRef { row: 1, col: 3 }).unwrap().value,
+        Some(CellValue::Text(Arc::from("C1")))
+    );
+    assert_eq!(
+        sheet.get(CellRef { row: 2, col: 1 }).unwrap().value,
+        Some(CellValue::Text(Arc::from("A2")))
+    );
+    assert_eq!(
+        sheet.get(CellRef { row: 2, col: 3 }).unwrap().value,
+        Some(CellValue::Text(Arc::from("C2")))
+    );
+    // Resumes from column 3 (the explicit C2), not column 2.
+    assert_eq!(
+        sheet.get(CellRef { row: 2, col: 4 }).unwrap().value,
+        Some(CellValue::Text(Arc::from("D2")))
+    );
+}
