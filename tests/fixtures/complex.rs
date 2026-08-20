@@ -5,6 +5,7 @@
 //! interact.
 
 use super::builder::*;
+use std::fmt::Write as _;
 
 /// A merged region spans `A1:C3` (3 rows x 3 cols) with its value only set
 /// on the anchor cell `A1`. Verifies Phase 4's resolution makes every
@@ -305,6 +306,125 @@ pub fn extreme_sparse() -> Vec<u8> {
         (
             "xl/worksheets/sheet1.xml",
             worksheet_xml(rows, "").as_bytes(),
+        ),
+    ])
+}
+
+/// Number of populated cells [`medium_density`] generates: rows
+/// `1..=MEDIUM_DENSITY_ROWS`, cols `1..=MEDIUM_DENSITY_COLS`, a cell
+/// populated whenever `(row + col) % 10 == 0` (~10% fill).
+pub const MEDIUM_DENSITY_ROWS: u32 = 3_000;
+pub const MEDIUM_DENSITY_COLS: u32 = 50;
+
+/// A tier deliberately missing from `tests/README.md`'s original audit:
+/// neither `extreme_sparse` (2 cells total) nor `massive_dense_accounting`
+/// (100% fill within a fixed rectangle), but the shape most real business
+/// spreadsheets probably have — cells scattered at partial density (~10%
+/// here) across a wide coordinate range, with genuine gaps on every side
+/// of a populated cell rather than either extreme. Exercises the sparse
+/// `HashMap<CellRef, Cell>` model's actual sparse case: unlike
+/// `massive_dense_accounting`'s solid rectangle, most neighbors of any
+/// given populated cell here are themselves unpopulated.
+pub fn medium_density() -> Vec<u8> {
+    let mut rows_xml = String::new();
+    for row in 1..=MEDIUM_DENSITY_ROWS {
+        let mut row_cells = String::new();
+        for col in 1..=MEDIUM_DENSITY_COLS {
+            if (row + col).is_multiple_of(10) {
+                let col_letters = column_letters(col);
+                let value = row as f64 * 1000.0 + col as f64;
+                let _ = write!(row_cells, "<c r=\"{col_letters}{row}\"><v>{value}</v></c>");
+            }
+        }
+        if !row_cells.is_empty() {
+            let _ = writeln!(rows_xml, "<row r=\"{row}\">{row_cells}</row>");
+        }
+    }
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[("rId1", "worksheet", "worksheets/sheet1.xml")]).as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(&rows_xml, "").as_bytes(),
+        ),
+    ])
+}
+
+/// Converts a 1-based column number to A1-style letters (mirrors
+/// `model::cell`'s private `column_number_to_letters`, duplicated here
+/// since that helper isn't part of the public API fixtures can depend on —
+/// same duplication `tests/fixtures/load.rs`/`security.rs` already have).
+fn column_letters(mut n: u32) -> String {
+    let mut buf = Vec::new();
+    while n > 0 {
+        let rem = ((n - 1) % 26) as u8;
+        buf.push(b'A' + rem);
+        n = (n - 1) / 26;
+    }
+    buf.reverse();
+    String::from_utf8(buf).unwrap()
+}
+
+/// A `SIDE`x`SIDE` grid of `BLOCK`x`BLOCK` merged blocks tiling the sheet
+/// with no gaps — `(SIDE * BLOCK)^2` addressable cells, but only
+/// `SIDE^2` populated (anchor) cells, each carrying `rowSpan`/`colSpan` =
+/// `BLOCK`. The "houganshi" scenario Issue #28 originally specified
+/// ("至る所にcol_span/row_spanが発生している" — merges *everywhere*) but
+/// `houganshi_merged` above never actually exercises: that fixture has
+/// exactly one merged region. Mirrors realistic dense grid-paper Excel,
+/// where merges tile most or all of the sheet rather than appearing once
+/// in isolation.
+pub const DENSE_MERGE_GRID_SIDE: u32 = 20;
+pub const DENSE_MERGE_GRID_BLOCK: u32 = 3;
+
+pub fn dense_merged_grid() -> Vec<u8> {
+    let mut rows_xml = String::new();
+    let mut merge_cells_xml = String::from("<mergeCells count=\"");
+    let _ = write!(
+        merge_cells_xml,
+        "{}\">",
+        DENSE_MERGE_GRID_SIDE * DENSE_MERGE_GRID_SIDE
+    );
+
+    for block_row in 0..DENSE_MERGE_GRID_SIDE {
+        let anchor_row = block_row * DENSE_MERGE_GRID_BLOCK + 1;
+        let end_row = anchor_row + DENSE_MERGE_GRID_BLOCK - 1;
+        let mut row_cells = String::new();
+        for block_col in 0..DENSE_MERGE_GRID_SIDE {
+            let anchor_col = block_col * DENSE_MERGE_GRID_BLOCK + 1;
+            let end_col = anchor_col + DENSE_MERGE_GRID_BLOCK - 1;
+            let anchor_ref = format!("{}{anchor_row}", column_letters(anchor_col));
+            let end_ref = format!("{}{end_row}", column_letters(end_col));
+            let value = block_row * DENSE_MERGE_GRID_SIDE + block_col;
+            let _ = write!(row_cells, "<c r=\"{anchor_ref}\"><v>{value}</v></c>");
+            let _ = write!(
+                merge_cells_xml,
+                "<mergeCell ref=\"{anchor_ref}:{end_ref}\"/>"
+            );
+        }
+        let _ = writeln!(rows_xml, "<row r=\"{anchor_row}\">{row_cells}</row>");
+    }
+    merge_cells_xml.push_str("</mergeCells>");
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[("rId1", "worksheet", "worksheets/sheet1.xml")]).as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(&rows_xml, &merge_cells_xml).as_bytes(),
         ),
     ])
 }

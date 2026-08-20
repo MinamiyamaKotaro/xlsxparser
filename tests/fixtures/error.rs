@@ -153,6 +153,101 @@ pub fn reversed_col_width_range() -> Vec<u8> {
     ])
 }
 
+/// `xl/workbook.xml` itself (as opposed to `xl/worksheets/sheet1.xml`,
+/// which `corrupted_xml` above already covers) is truncated mid-document.
+/// `tests/README.md`'s edge-case audit flagged that only the worksheet
+/// part had dedicated malformed-XML coverage, even though `workbook.xml`/
+/// `styles.xml`/`sharedStrings.xml` go through the same
+/// `convert_xml_error` path. Verifies it surfaces as `Error::XmlParse`.
+pub fn corrupted_workbook_xml() -> Vec<u8> {
+    let broken: &[u8] = br#"<?xml version="1.0"?>
+<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="Sheet1" sheetId="1" r:id="rId1"#;
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "styles", "styles.xml"),
+            ])
+            .as_bytes(),
+        ),
+        ("xl/workbook.xml", broken),
+        ("xl/styles.xml", DEFAULT_STYLES_XML),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(r#"<row r="1"><c r="A1"><v>1</v></c></row>"#, "").as_bytes(),
+        ),
+    ])
+}
+
+/// `xl/styles.xml` is truncated mid-document. See `corrupted_workbook_xml`
+/// above for why this is a distinct case from `corrupted_xml`. Verifies it
+/// surfaces as `Error::XmlParse`.
+pub fn corrupted_styles_xml() -> Vec<u8> {
+    let broken: &[u8] = br#"<styleSheet><cellXfs><xf numFmtId="0"#;
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "styles", "styles.xml"),
+            ])
+            .as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        ("xl/styles.xml", broken),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(r#"<row r="1"><c r="A1"><v>1</v></c></row>"#, "").as_bytes(),
+        ),
+    ])
+}
+
+/// `xl/sharedStrings.xml` is truncated mid-document — specifically, EOF
+/// reached inside an `<si>` with no closing tag. See
+/// `corrupted_workbook_xml` above for why this is a distinct case from
+/// `corrupted_xml`; reading this part is triggered purely by the
+/// relationship declaring it (Phase 1), independent of whether any cell
+/// actually references it via `t="s"`. Unlike a raw unterminated-tag
+/// syntax error (`Error::XmlParse`), this specific shape — a
+/// *well-formed* `<t>` open tag whose content simply never finds a
+/// matching close before EOF — is caught by `concat_rich_text`'s own
+/// explicit `Event::Eof` check (`parse/mod.rs`) and reported as the more
+/// specific `Error::MissingRequiredElement { name: "si/is closing tag" }`.
+pub fn corrupted_shared_strings_xml() -> Vec<u8> {
+    let broken: &[u8] = br#"<?xml version="1.0"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>unterminated"#;
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "styles", "styles.xml"),
+                ("rId3", "sharedStrings", "sharedStrings.xml"),
+            ])
+            .as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        ("xl/styles.xml", DEFAULT_STYLES_XML),
+        ("xl/sharedStrings.xml", broken),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(r#"<row r="1"><c r="A1"><v>1</v></c></row>"#, "").as_bytes(),
+        ),
+    ])
+}
+
 /// A `<mergeCell ref="C3:A1"/>` has its start/end coordinates reversed
 /// (end is above-and-left of start). Verifies the bounding-box computation
 /// rejects it as `Error::InvalidMergedRange` rather than panicking or

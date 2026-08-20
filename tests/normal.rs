@@ -405,3 +405,45 @@ fn cells_without_r_attribute_resolve_via_positional_inference() {
         Some(CellValue::Text(Arc::from("D2")))
     );
 }
+
+#[test]
+fn unicode_text_round_trips_through_json() {
+    // tests/README.md edge-case audit: RTL scripts, ZWJ emoji sequences,
+    // combining diacritics, and mixed-bidi text had no committed test
+    // prior to this one.
+    let workbook = parse_workbook_reader(Cursor::new(normal::unicode_text())).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    assert_eq!(
+        sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
+        Some(CellValue::Text(Arc::from("مرحبا بالعالم")))
+    );
+    assert_eq!(
+        sheet.get(CellRef { row: 1, col: 2 }).unwrap().value,
+        Some(CellValue::Text(Arc::from("שלום עולם")))
+    );
+    assert_eq!(
+        sheet.get(CellRef { row: 1, col: 3 }).unwrap().value,
+        Some(CellValue::Text(Arc::from("👨‍👩‍👧‍👦🎉😀")))
+    );
+    assert_eq!(
+        sheet.get(CellRef { row: 1, col: 4 }).unwrap().value,
+        Some(CellValue::Text(Arc::from("é́ combining")))
+    );
+    assert_eq!(
+        sheet.get(CellRef { row: 1, col: 5 }).unwrap().value,
+        Some(CellValue::Text(Arc::from("Order #123 مرحبا")))
+    );
+
+    // The JSON layer must not mangle any of this either — serde_json
+    // escapes non-ASCII by default unless configured otherwise, so this
+    // also confirms xlsxparser doesn't opt into that escaping.
+    let json = to_json_string(&workbook).unwrap();
+    assert!(json.contains("مرحبا بالعالم"));
+    assert!(json.contains("שלום עולם"));
+    assert!(json.contains("👨‍👩‍👧‍👦🎉😀"));
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let cells = parsed["sheets"][0]["cells"].as_array().unwrap();
+    let a1 = cells.iter().find(|c| c["col"] == 1).unwrap();
+    assert_eq!(a1["value"]["value"], "مرحبا بالعالم");
+}
