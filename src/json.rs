@@ -693,6 +693,46 @@ mod tests {
     }
 
     #[test]
+    fn cell_with_hyperlink_reports_it_nested_and_omits_absent_fields() {
+        let mut sheet = sheet_with_one_cell("Sheet1", Some(CellValue::Number(1.0)));
+        sheet.finalize_hyperlinks(vec![crate::model::HyperlinkRange {
+            start: CellRef { row: 1, col: 1 },
+            end: CellRef { row: 1, col: 1 },
+            hyperlink: crate::model::Hyperlink {
+                target: Some("https://example.com/".to_string()),
+                location: None,
+                tooltip: Some("Visit example".to_string()),
+            },
+        }]);
+        let workbook = Workbook::new(vec![sheet], None);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cell_json = &parsed["sheets"][0]["cells"][0];
+
+        assert_eq!(
+            cell_json["hyperlink"],
+            serde_json::json!({
+                "target": "https://example.com/",
+                "tooltip": "Visit example"
+            })
+        );
+        assert!(cell_json["hyperlink"].get("location").is_none());
+    }
+
+    #[test]
+    fn cell_without_hyperlink_omits_the_field_entirely() {
+        let sheet = sheet_with_one_cell("Sheet1", Some(CellValue::Number(1.0)));
+        let workbook = Workbook::new(vec![sheet], None);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cell_json = &parsed["sheets"][0]["cells"][0];
+
+        assert!(cell_json.get("hyperlink").is_none());
+    }
+
+    #[test]
     fn alignment_tag_covers_every_variant() {
         assert_eq!(alignment_tag(Alignment::General), "general");
         assert_eq!(alignment_tag(Alignment::Left), "left");

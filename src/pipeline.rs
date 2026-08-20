@@ -1443,6 +1443,57 @@ mod tests {
     }
 
     #[test]
+    fn hyperlink_r_id_with_no_worksheet_rels_part_degrades_to_no_target() {
+        // <hyperlink r:id="..."> is present, but no
+        // xl/worksheets/_rels/sheet1.xml.rels part exists in the ZIP at
+        // all (distinct from unresolved_hyperlink_r_id_degrades_to_no_target_rather_than_failing,
+        // where the rels part exists but lacks the specific id) — Issue
+        // #95's "never fail the sheet over a broken hyperlink" policy
+        // still applies to this case too.
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            (
+                "xl/worksheets/sheet1.xml",
+                WORKSHEET_WITH_EXTERNAL_HYPERLINK_XML,
+            ),
+        ]);
+        let workbook = run(Cursor::new(zip), SizeLimits::default()).unwrap();
+        let hyperlink = workbook.sheets()[0]
+            .hyperlink_at(CellRef { row: 1, col: 1 })
+            .unwrap();
+        assert_eq!(hyperlink.target, None);
+        assert_eq!(hyperlink.tooltip.as_deref(), Some("Visit example"));
+    }
+
+    #[test]
+    fn malformed_worksheet_rels_xml_with_hyperlink_propagates_parse_error() {
+        // Distinct from the degrades-gracefully cases above: here the
+        // xl/worksheets/_rels/sheet1.xml.rels part exists but is
+        // malformed XML, so parse::parse_relationships itself must fail
+        // and that failure must propagate rather than being swallowed —
+        // mirrors malformed_worksheet_rels_xml_propagates_parse_error for
+        // images.
+        let malformed_rels: &[u8] =
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdLink"/></Relationships>"#;
+        let zip = build_zip(&[
+            ("xl/_rels/workbook.xml.rels", RELS_XML),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/sharedStrings.xml", SHARED_STRINGS_XML),
+            ("xl/styles.xml", STYLES_XML),
+            (
+                "xl/worksheets/sheet1.xml",
+                WORKSHEET_WITH_EXTERNAL_HYPERLINK_XML,
+            ),
+            ("xl/worksheets/_rels/sheet1.xml.rels", malformed_rels),
+        ]);
+        let err = run(Cursor::new(zip), SizeLimits::default()).unwrap_err();
+        assert!(matches!(err, Error::MissingRequiredElement { .. }));
+    }
+
+    #[test]
     fn overlapping_hyperlink_ranges_are_invalid_hyperlink_range() {
         let worksheet: &[u8] = br#"<worksheet><sheetData></sheetData>
 <hyperlinks>
