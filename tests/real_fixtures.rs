@@ -70,6 +70,18 @@ fn real_basic_types_xlsx_maps_every_cell_type() {
 }
 
 #[test]
+fn real_basic_types_xlsx_carries_an_unused_theme_part_that_is_never_read() {
+    // Issue #76 "pay-for-what-you-use", confirmed against a genuine
+    // third-party writer's output rather than a synthetic canary: openpyxl
+    // always emits xl/theme/theme1.xml (its default Office theme) even for
+    // a workbook whose cells never reference a theme color, as this one's
+    // do not. Workbook::theme() must come back None — the part existing on
+    // disk is not enough to trigger parsing it.
+    let workbook = parse_workbook(fixture_path("normal/basic_types.xlsx")).unwrap();
+    assert!(workbook.theme().is_none());
+}
+
+#[test]
 fn real_houganshi_merged_xlsx_resolves_the_whole_region_to_the_anchor() {
     let workbook = parse_workbook(fixture_path("complex/houganshi_merged.xlsx")).unwrap();
     let sheet = &workbook.sheets()[0];
@@ -285,4 +297,73 @@ fn real_styled_fill_color_xlsx_resolves_rgb_and_theme_fills() {
     // for the default style), so it has no fill color to report either.
     let a3_fill_fg = a3.style.as_ref().and_then(|s| s.fill_fg_color.clone());
     assert_eq!(a3_fill_fg, None);
+}
+
+#[test]
+fn real_styled_fill_color_xlsx_resolves_theme_palette_and_display_rgb() {
+    // Issue #76, against the same real openpyxl-written file as the test
+    // above (rather than the hand-authored XML every parse::theme/
+    // resolve::color unit test uses) — this is the one test in the whole
+    // suite that proves the feature works end to end against a genuine
+    // third-party writer's output, not just this crate's own understanding
+    // of the format encoded into synthetic fixtures.
+    use xlsxparser::{resolve_color, Rgb};
+
+    let workbook = parse_workbook(fixture_path("complex/styled_fill_color.xlsx")).unwrap();
+
+    // openpyxl's default Office theme: accent1 (theme index 4) is
+    // #4F81BD, at ThemePalette's slot-0/1-swapped index contract (Issue
+    // #76 PoC, confirmed against this exact fixture's xl/theme/theme1.xml).
+    let theme = workbook
+        .theme()
+        .expect("styled_fill_color.xlsx carries a theme relationship (rId3 -> theme/theme1.xml)");
+    assert_eq!(
+        theme.0[4],
+        Rgb {
+            r: 0x4F,
+            g: 0x81,
+            b: 0xBD
+        }
+    );
+
+    // A2's theme=4/tint=-0.25 fgColor resolves to the real displayed color
+    // through the public resolve_color API, matching the PoC-verified
+    // value from Issue #76's design comments.
+    let sheet = &workbook.sheets()[0];
+    let a2_color = sheet
+        .get(CellRef { row: 2, col: 1 })
+        .unwrap()
+        .style
+        .as_ref()
+        .unwrap()
+        .fill_fg_color
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        resolve_color(a2_color, workbook.theme()),
+        Some(Rgb {
+            r: 0x37,
+            g: 0x60,
+            b: 0x92
+        })
+    );
+
+    // A1's plain RGB fill resolves too, independent of the theme palette.
+    let a1_color = sheet
+        .get(CellRef { row: 1, col: 1 })
+        .unwrap()
+        .style
+        .as_ref()
+        .unwrap()
+        .fill_fg_color
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        resolve_color(a1_color, workbook.theme()),
+        Some(Rgb {
+            r: 0xFF,
+            g: 0x00,
+            b: 0x00
+        })
+    );
 }
