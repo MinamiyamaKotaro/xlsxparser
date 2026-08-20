@@ -104,8 +104,10 @@ sheet with a single merged region, `A1:C3`, holding one text cell):
   `<cols>`, so both show the empty/absent case.
 - `cells` only contains populated coordinates: a blank cell in between is
   simply absent, never emitted as a `null`/`"empty"` entry (see
-  [Motivation](#motivation)). Cell order is unspecified — the sheet is
-  backed by a `HashMap`, not sorted by row/col.
+  [Motivation](#motivation)). Cells are ordered row-major, then
+  column-major (matching reading order), regardless of the order they
+  appear in the source XML — the sheet is backed by a `BTreeMap`, keyed
+  on `(row, col)`.
 - Each cell's `value` is tagged by `type`:
   `"number"` | `"text"` | `"boolean"` | `"error"` | `"dateTime"` |
   `"empty"` (a cell with formatting only, or a value JSON can't
@@ -304,7 +306,7 @@ two populated corners span the full sheet, so that bounding box *is*
 is what gets the process killed.
 
 `xlsxparser` doesn't hit this because cells are kept in a coordinate-keyed
-`HashMap<CellRef, Cell>` (see [Architecture](#architecture) above) sized to
+`BTreeMap<CellRef, Cell>` (see [Architecture](#architecture) above) sized to
 the number of populated cells, never to the sheet's addressable bounding
 box — so `extreme_sparse.xlsx` costs `xlsxparser` exactly 2 map entries.
 

@@ -447,3 +447,28 @@ fn unicode_text_round_trips_through_json() {
     let a1 = cells.iter().find(|c| c["col"] == 1).unwrap();
     assert_eq!(a1["value"]["value"], "مرحبا بالعالم");
 }
+
+#[test]
+fn json_cells_array_is_sorted_by_row_then_col_regardless_of_source_order() {
+    // Issue #87: the whole point of switching Sheet::cells to a BTreeMap
+    // was making this deterministic — a textual diff of two JSON
+    // snapshots of the same unchanged file must not show spurious
+    // reordering. The fixture streams rows 3, 1, 2 (and out-of-order
+    // columns within each), so a naive "insertion order" or "hash order"
+    // implementation would fail this.
+    let workbook =
+        parse_workbook_reader(Cursor::new(normal::cells_streamed_out_of_order())).unwrap();
+    let json = to_json_string(&workbook).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let cells = parsed["sheets"][0]["cells"].as_array().unwrap();
+
+    let coords: Vec<(u64, u64)> = cells
+        .iter()
+        .map(|c| (c["row"].as_u64().unwrap(), c["col"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(
+        coords,
+        vec![(1, 1), (1, 3), (2, 1), (3, 1), (3, 2)],
+        "cells array must be sorted (row, col) ascending, got: {coords:?}"
+    );
+}

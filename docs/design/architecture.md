@@ -35,7 +35,7 @@ src/
   model/                    # 純粋なドメインモデル（XMLパースや解決ロジックに依存しない）
     mod.rs
     cell.rs               # CellValue, Cell, CellRef (A1形式 <-> 座標)
-    sheet.rs              # 疎行列 Sheet (HashMap<(u32, u32), Cell>)
+    sheet.rs              # 疎行列 Sheet (BTreeMap<(u32, u32), Cell>)
     workbook.rs           # 解決済みの Workbook モデル
     style.rs              # ResolvedStyle / StyleSheet / StyleId（parse/styles.rs と resolve/style.rs の共有語彙。PR #8 レビュー指摘を反映し新設）
 
@@ -91,7 +91,7 @@ ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブ�
 
 ### `model/`
 
-`Cell` / `Sheet` / `Workbook` などの純粋なRustデータ構造を定義する。XMLパースや解決ロジックへの依存を持たない。疎行列（`HashMap<(row, col), Cell>`）によりメモリを最適化する。
+`Cell` / `Sheet` / `Workbook` などの純粋なRustデータ構造を定義する。XMLパースや解決ロジックへの依存を持たない。疎行列（`BTreeMap<(row, col), Cell>`）によりメモリを最適化する。`BTreeMap`を採用している理由（`HashMap`からの変更）は[model/sheet.md](model/sheet.md)参照。
 
 - 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [mod.md](model/mod.md) / [cell.md](model/cell.md) / [sheet.md](model/sheet.md) / [workbook.md](model/workbook.md) / [style.md](model/style.md)
 

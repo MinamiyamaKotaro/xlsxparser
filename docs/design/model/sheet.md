@@ -6,7 +6,7 @@
 
 ## 責務・スコープ
 
-- データまたは書式を持つセルのみを `HashMap<CellRef, Cell>` で保持する疎行列 `Sheet` を定義する
+- データまたは書式を持つセルのみを `BTreeMap<CellRef, Cell>`(Issue #87で`HashMap`から変更。詳細はコードブロック直後の注記参照)で保持する疎行列 `Sheet` を定義する
 - 結合範囲内の仮想セル座標を起点セルへ解決し、`get()` 経由で透過的にアクセスできるようにする（具体的な解決方法は主要な型セクション参照。実装時に発覚したバグにより、当初ドラフトのセル単位エイリアスマップは不採用となった。コードブロック直後の注記参照）
 - `cells` / `merged_regions` はクレート内非公開のまま保持し、`insert_cell` / `insert_merge` / `get_mut` という限定されたAPI（`pub(crate)`）経由でのみ変更を許可することで、`max_row`/`max_col` の同期や結合起点セルの補完といった内部不変条件を`Sheet`自身に強制させる
 - **含まない責務**: `<mergeCells>` XMLのパース（`parse/worksheet.rs`）、結合範囲とセルデータを突き合わせて `insert_merge` を呼び出す判断ロジックそのもの（`resolve/merge.rs`。本ファイルは呼び出しを受けて安全にマッピングを構築するAPIのみを提供する）
@@ -14,7 +14,7 @@
 ## 主要な型（案）
 
 ```rust
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use crate::model::cell::{Cell, CellRef};
 
 /// 結合範囲。左上（起点セル）と右下の座標を持つ。
@@ -46,7 +46,7 @@ pub enum SheetVisibility {
 pub struct Sheet {
     pub name: String,
     pub visibility: SheetVisibility,
-    cells: HashMap<CellRef, Cell>,
+    cells: BTreeMap<CellRef, Cell>,
     /// 起点セル座標 -> 結合範囲。仮想座標を起点へ解決する唯一の
     /// 情報源でもある（`resolve_origin` による幾何学的な包含判定。
     /// コードブロック直後の注記でセル単位エイリアスマップから
@@ -75,7 +75,7 @@ impl Sheet {
         Self {
             name,
             visibility,
-            cells: HashMap::new(),
+            cells: BTreeMap::new(),
             merged_regions: HashMap::new(),
             merge_bounds: None,
             max_row: 0,
@@ -247,7 +247,10 @@ impl Sheet {
     /// 登録された直後に一度だけ呼ばれる）により、残っている `cells`
     /// のキーは全て自分自身の起点であることが既に保証されているため、
     /// 単純な `cells.iter()` だけで正しい（PR #20時代のフィルタ付き版から
-    /// 変更した理由はコードブロック直後の注記(Issue #43)参照）。
+    /// 変更した理由はコードブロック直後の注記(Issue #43)参照）。`cells`が
+    /// `BTreeMap`であることにより、この走査順は`CellRef`の導出`Ord`
+    /// （行→列の順で比較）に従う行優先・列優先の決定的な順序となる
+    /// （Issue #87。詳細はコードブロック直後の注記参照）。
     pub fn iter_cells(&self) -> impl Iterator<Item = (CellRef, &Cell)> {
         self.cells.iter().map(|(&r, c)| (r, c))
     }
@@ -269,6 +272,16 @@ impl Sheet {
 `column_width(col) -> Option<f64>` は `col_widths` を二分探索する——`partition_point` で `min <= col` を満たす最後の範囲を求め、その範囲の `max` が実際に `col` まで届くか確認する——ファイルが範囲をどう配置してもO(log R)になる(RはRの上限 `resolve::column_width::MAX_COLUMN_WIDTH_RANGES` = 2,000でキャップ)。`col` を覆う範囲も `defaultColWidth` も無い場合はExcelの一般的な既定値(「Calibri 11 ≈ 8.43文字」など)を推測で埋めるのではなく `None` を返す: そのフォールバックはこのライブラリが計算していないフォントメトリクスに依存するため、誤った数値より明示的な不在の方が望ましい。`col_width_ranges()` は生のソート済み `Vec` を公開し、`json.rs` がシート単位の `columns` 配列としてシリアライズする——意図的に**セルごとに引いてセルのJSONオブジェクトへ埋め込まない**: 列単位の値をその列の全ての実在セルに繰り返すと、このライブラリの存在意義である疎な出力設計に何の利益も無く反する(列幅専用のサブIssueができる前、Issue #36のレビュー議論で提起された)。
 
 **機能: 画像(Issue #65)。** `Sheet` は `images: Vec<Image>` も保持し、`pipeline.rs` のフェーズ3.5が `Sheet::set_images` を通じて一度だけ登録する——`set_col_widths` と同じ「他所で解決し、一度だけ登録する」という分担。`merged_regions` と異なり、画像はいかなるセル座標にも紐付けられない: `ImageAnchor::TwoCell`/`OneCell` のマーカーはセル内のEMU単位オフセットを持つため、アンカーの位置は `MergedRegion` のように常にセル境界に一致するとは限らず、画像が自然に「所属する」単一のセルというものが存在しない。`images()` は生の `Vec` を公開し、`json.rs` がシート単位の `images` 配列としてシリアライズする——`col_width_ranges`(上記)と同じ疎な出力設計の理由に加え、セルごとの複製が望ましい場合であってもそもそも画像を紐付けるセルが存在しないという点が加わる。
+
+**修正: `cells` を `HashMap` から `BTreeMap` へ変更（Issue #87）。** `iter_cells` の走査順は `json.rs` の `cells` 配列にそのまま反映されるが、`HashMap` の走査順はプロセスごとにランダムなハッシュシード（HashDoS対策）に依存するため、同一ファイルを2回パースしても出力されるJSONのセル順が毎回変わりうる。座標で突き合わせる用途（`(row, col)`をキーにした差分）には無害だが、2回のパース結果をテキスト差分（`git diff`等）で比較する用途では、実際には変更が無いセルが並び替わっただけで大量の差分として現れてしまう問題が報告された。`BTreeMap` はキー型`CellRef`の導出`Ord`（フィールド宣言順、つまり`row`を`col`より先に比較）に従って走査されるため、追加のソート処理を挟むことなく、人が読んで自然な行優先・列優先の順序を無条件に保証できる。
+
+Issue #87のPoC（`massive_dense_accounting.xlsx`、30万セル、カスタムのバイトカウント方式アロケータおよびmacOSの`sample`プロファイラで実測）による検証結果:
+
+- **CPU/実時間**: `BTreeMap`の方が約9〜13%高速（`HashMap`が定評として持つ「ハッシュテーブルの方が速い」という直感に反する結果だが、`CellRef`が8バイトの小さいキーであるため、SipHashの計算コストがB-treeノード内の数回の整数比較のコストを上回ることが実測で判明した）。
+- **パース中のピークメモリ**: `BTreeMap`の方が約26%良好。`HashMap::new()`は無容量から開始し、ストリームでセルを挿入する過程で再ハッシュ・再配置を繰り返すたびに新旧2つのテーブルを一時的に同時保持するため、定常状態に対して約54%のピークスパイクが生じる。`BTreeMap`はノード単位でインクリメンタルに成長するため、このスパイクが発生しない。
+- **定常メモリ**: `BTreeMap`の方が約9.2%悪化（1セルあたり約78.3バイト vs `HashMap`の約71.7バイト、ノード/ポインタのオーバーヘッド）。決定的な出力順を得るためのトレードオフとして許容した。挿入順（昇順/降順/シャッフル）による定常メモリへの実測上の有意差は無いことも別途のPoCで確認済み（`Sheet::insert_cell`は`parse/worksheet.rs`がXML出現順に呼ぶため、行・列が昇順とは限らない実ファイルでも定常メモリの見積もりは変わらない）。
+
+`merged_regions`（起点セル座標をキーとする内部専用のO(1)/O(N)ルックアップ用途で、`json.rs`へ直接反映される走査順を持たない）は本対応のスコープ外として`HashMap`のまま据え置いている。
 
 ## 依存関係
 
@@ -302,11 +315,13 @@ impl Sheet {
 - **エンドツーエンド回帰テスト: `MAX_MERGE_REGIONS` 件の結合セルを`merge_bounds`が最大化するよう配置(対角に2個配置)し、さらに無関係なセルを数十万件加えたファイルが、修正前に実測した数秒単位の停止なしにJSON生成を完了できることの確認**（`tests/security.rs` の `sparse_merge_bounding_box_does_not_amplify_json_generation_cost`、`sparse_merge_bounding_box_amplification` フィクスチャを使用。意図的な配置によるDoS懸念であるため、`zip_bomb`/`zip_slip`/`xxe_attack` と同じくCategory 4（負荷）ではなくCategory 5（セキュリティ）に分類）
 - **`column_width` が範囲なし・`defaultColWidth` なしで `None` を返すことの確認**、**複数範囲にまたがる二分探索の正当性の確認**（範囲内・範囲間の隙間・`defaultColWidth`へのフォールバックの境界値を含む）、**`col_width_ranges`/`default_col_width` がJSON出力用に生の値を公開することの確認**（Issue #39。詳細な検証は `resolve::column_width` のテスト群が担う）
 - **`images()` が `set_images` で設定された生の `Vec` をそのまま公開することの確認**（Issue #65。アンカーごとの解決の正当性は `parse::drawing` と `pipeline.rs` それぞれのテスト群が担う）
+- **`iter_cells` の走査順が、挿入順によらず行優先・列優先の決定的な順序（`CellRef`の`Ord`に従う）になることの確認**（Issue #87。`cells`を`BTreeMap`へ変更したことによる保証。XML出現順が昇順とは限らない実ファイルを模した回帰テストとして、[`tests/normal.rs`の`json_cells_array_is_sorted_by_row_then_col_regardless_of_source_order`](../../../tests/normal.rs)が挿入順をわざと入れ替えたフィクスチャで検証する）
 
 ## 未決事項 / オープンクエスチョン
 
 1. ~~シート次元（使用範囲）の管理~~ → **解決**: サードパーティ製ツールが生成した `<dimension>` 要素は不正確・欠落することがあるため信頼しない。セル挿入のたびに `max_row` / `max_col` をインクリメンタルに更新し、`Sheet` の公開フィールドとして O(1) で取得できるようにする（[PR #5 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948235239)を踏まえて確定）。`insert_merge` は起点セルだけでなく結合範囲の終点座標（`region.end`）でも `max_row`/`max_col` を更新する（仮想セルである終点は `cells` に挿入されないため `insert_cell` 経由では反映されず、別途明示的な更新が必要。[再レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948277539)で指摘・修正）。
-2. **`cells` のキー型**: `HashMap<CellRef, Cell>` と要求仕様書の例示 `HashMap<(u32, u32), Cell>` のどちらを採用するか。`CellRef` は `Hash` を実装済みのため型としては等価だが、可読性・API一貫性の観点でどちらにするか要確認。
+2. **`cells` のキー型**: `BTreeMap<CellRef, Cell>` と要求仕様書の例示 `HashMap<(u32, u32), Cell>` のどちらを採用するか。`CellRef` は `Hash`/`Ord` いずれも実装済みのため型としては等価だが、可読性・API一貫性の観点でどちらにするか要確認（コンテナ型自体の選定は項目6で解決済み。本項目はキーを`CellRef`構造体のままにするかタプルに崩すかという別軸の論点）。
 3. **重複／不正な結合範囲の扱い**: 悪意または破損したXLSXが重複する結合範囲を含む場合、`resolve/merge.rs` がどう振る舞うか（エラーで拒否するか、後勝ちで上書きするか）は未決定。本ファイルのAPI（`insert_merge` を複数回呼んだ場合は単純に上書きする実装を想定）は「後勝ち上書き」を前提にしている点に留意。
 4. **凍結行/列など`worksheet.xml`のその他メタデータ**: 要求仕様書では明示されていないが、`freezePane` などを将来的に扱う場合、`Sheet` に持たせるか別型に分離するかは未決定（現時点ではスコープ外として型に含めない）。可視性（`visibility`）については解決済み（workbook.md オープンクエスチョン1参照）。
 5. ~~非公開フィールドへのクレート内アクセス~~ → **解決**: `cells` 等のフィールドを直接 `pub(crate)` にするのではなく、`insert_cell` / `insert_merge` / `get_mut` という限定APIを `Sheet` に実装し、それ以外からの直接アクセスを禁止する（[PR #5 レビュー](https://github.com/MinamiyamaKotaro/xlsxparser/pull/5#pullrequestreview-4948259819)を踏まえて確定。フィールド直接公開案との比較は依存関係セクション参照）。
+6. ~~`cells` のコンテナ型（`HashMap` vs `BTreeMap`）~~ → **解決**: `BTreeMap<CellRef, Cell>` を採用（Issue #87）。`iter_cells` の走査順が `json.rs` の `cells` 配列にそのまま反映されるため、`HashMap` のプロセスごとにランダムなハッシュシードに依存する走査順は、同一ファイルの2回のパース結果をテキスト差分で比較する用途で無関係なセル並び替えを大量の差分として見せてしまう問題があった。PoCによる実測（コードブロック直後の注記参照）で `BTreeMap` がCPU/ピークメモリの両面でも `HashMap` に劣らない（むしろ優る）ことを確認したうえで確定。`merged_regions` はJSON出力順に影響しないため対象外（`HashMap` のまま）。

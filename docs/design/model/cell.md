@@ -79,7 +79,7 @@ pub struct Cell {
 ## 依存関係
 
 - 依存先: なし（`model/` 内の兄弟モジュールにも依存しない、リーフモジュール）
-- 依存元: `model::Sheet`（`HashMap<(u32, u32), Cell>` のキーに `CellRef`相当のタプル、または `CellRef` 自体を使う）、`resolve/`、`json.rs`
+- 依存元: `model::Sheet`（`BTreeMap<(u32, u32), Cell>` のキーに `CellRef`相当のタプル、または `CellRef` 自体を使う。`HashMap`から`BTreeMap`への変更の経緯は[model/sheet.md](sheet.md)参照）、`resolve/`、`json.rs`
 
 `resolve/style.rs` は [`model/style.rs`](style.md) が定義する `StyleSheet`（`HashMap<StyleId, Arc<ResolvedStyle>>`）から該当スタイルの `Arc` を各セルへ `clone()` して割り当てる。各セルが `Arc` を通じて実データの所有権（の一部）を持つため、`StyleSheet` コンテナ自体はフェーズ4完了時に破棄でき、`pipeline.rs` が定める即時破棄の方針と、値のコピーを避けたいというメモリ効率要件を両立できる。`resolve/shared_strings.rs` と `Arc<str>` の関係も同様。
 
