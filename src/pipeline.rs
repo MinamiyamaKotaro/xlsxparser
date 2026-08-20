@@ -152,6 +152,7 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
             &route.worksheet_path,
             &mut sheet,
             date1904,
+            limits.max_cells_per_sheet,
         )?;
 
         // --- Phase 3.5: image anchor resolution (Issue #65), only if this
@@ -570,7 +571,7 @@ mod tests {
         // silently ignored in favor of the DEFAULT_MAX_* constants.
         let tiny_limits = SizeLimits {
             max_entry_size: 1,
-            max_total_size: SizeLimits::default().max_total_size,
+            ..SizeLimits::default()
         };
         let err = run(Cursor::new(minimal_xlsx()), tiny_limits).unwrap_err();
         assert!(matches!(err, Error::ZipBombDetected { .. }));

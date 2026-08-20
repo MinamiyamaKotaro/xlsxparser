@@ -105,6 +105,7 @@ pub(crate) fn parse_worksheet(
     path: &str,
     sheet: &mut Sheet,
     date1904: bool,
+    max_cells: usize,
 ) -> Result<WorksheetParseOutput, Error> {
     let mut xml_reader = create_secure_reader(reader);
     let mut pending_shared_strings = Vec::new();
@@ -228,6 +229,7 @@ The structure now fully matches the spirit of architecture.md design policy 2: n
 - If a `<mergeCell ref="...">`'s `ref` value is not in the `"A1:C3"` shape (two `:`-separated coordinates), or either coordinate is not well-formed A1 notation, `Error::InvalidCellRef` propagates. This file does not validate the range's soundness itself (start/end ordering, overlap with other ranges) — it simply appends to `merge_regions` and leaves validation to [`resolve/merge.rs`](../resolve/merge.en.md)
 - If a `<col>`'s `width`/`defaultColWidth` cannot be parsed as `f64`, or its `min`/`max` cannot be parsed as `u32`, returns `Error::InvalidPackage` (same provisional convention as the numeric `<v>` case above). This file does not validate range soundness (overlap, count) — that is [`resolve/column_width.rs`](../resolve/column_width.en.md)'s responsibility, same division of labor as `<mergeCells>`
 - `<f>` (formula) element content is neither parsed nor retained — it is skipped (outside the requirements' scope; see Open Question 2)
+- Once the number of cells actually inserted via `Sheet::insert_cell` (the `max_cells` argument, `SizeLimits::max_cells_per_sheet` — see [container/sanitize.md](../container/sanitize.en.md)) exceeds `max_cells`, returns `Error::TooManyCells` (Issue [#88](https://github.com/MinamiyamaKotaro/xlsxparser/issues/88)). A cell dropped for carrying no value/style/shared-string reference is never counted. Unlike `resolve::merge`/`resolve::column_width`, which check in one batch after collection, this counts and checks incrementally while streaming `<c>` elements — for cells, the memory cost accrues the moment one is inserted, so checking only after collecting everything would already be too late
 - **Never panics**: since this file handles untrusted external input, any unexpected structure must always propagate as some `Error` variant
 
 ## Testing Strategy
@@ -251,6 +253,7 @@ The structure now fully matches the spirit of architecture.md design policy 2: n
 - Verify that `<cols>` entries with a `width` attribute are collected into `ColWidthRange`s with correct `min`/`max`/`width`, that a `<col>` without `width` is skipped, and that a single `<col min="1" max="16384" .../>` (the realistic worst case) is collected as exactly one range rather than expanded
 - Verify that `<sheetFormatPr defaultColWidth="..">` is collected, and that its absence leaves `default_col_width: None`
 - Verify that a malformed `<col>`/`<sheetFormatPr>` numeric attribute returns `Error::InvalidPackage`
+- Verify that `Error::TooManyCells` is returned as soon as the number of actually-inserted cells exceeds `max_cells`, and that no further parsing continues (Issue #88) — including that a `<c>` carrying no value, style, or shared-string reference is never inserted and so never counts toward `max_cells`, no matter how many appear (`tests/security.rs` verifies this cheaply with a small `max_cells_per_sheet`; fixture is `tests/fixtures/security.rs`'s `too_many_cells`)
 
 ## Implementation Notes
 
@@ -258,6 +261,7 @@ The structure now fully matches the spirit of architecture.md design policy 2: n
 - **`build_cell` signature**: dropped the draft's unused `cell_ref`/`style_id` parameters (the draft itself discarded them via `let _ = (cell_ref, style_id);`) — the value/style split is fully handled by the caller (`flush_cell`), not `build_cell` itself.
 - **`<v>`/`<f>` text reading**: added a `read_leaf_text` helper (not in the draft) that reads a leaf element's text content — including `Event::GeneralRef` entities via [`parse/mod.rs`](mod.en.md)'s `push_general_ref`, the same helper `concat_rich_text` uses — since quick-xml 0.41 tokenizes entities separately from `Event::Text` (see [parse/mod.md Open Question 1](mod.en.md)).
 - **`flush_cell`'s insert decision**: a `<c>` is inserted only if it carries a style (`s` attribute), a value (`<v>`/`<is>` text), or is a `t="s"` reference (which will gain a value once resolved) — matching the sparse-matrix requirement that a fully blank `<c r="A1"/>` never gets instantiated.
+- **`flush_cell`'s return value** (Issue #88): changed to return whether it actually inserted a cell, as a `bool` (was `Result<(), Error>`, now `Result<bool, Error>`). The caller (`parse_worksheet`) only increments and bounds-checks the cell counter when it did — an empty cell costs zero memory, so counting it too would wrongly restrict a legitimately sparse file. The counting/bounds-check logic itself is factored into a small separate function, `check_cell_count`, called from both of `flush_cell`'s two call sites (the self-closing `<c/>` case and the `Event::End` case).
 
 ## Open Questions
 
@@ -267,3 +271,4 @@ The structure now fully matches the spirit of architecture.md design policy 2: n
 4. ~~Sequential column-position inference for cells omitting `r`~~ → **Resolved** (Issue [#79](https://github.com/MinamiyamaKotaro/xlsxparser/issues/79)): both `<row>` and `<c>` now infer an omitted `r` from the previous row/cell. Added `cur_row`/`cur_col` as loop-local state: a `<row>` start tag settles the row number and resets the column counter; each `<c>` start tag either adopts its own `r` (updating the current column from it, so a later omitted cell resumes from there) or advances the current column by one when `r` is absent. Either path applies the same `CellRef::MAX_ROW`/`MAX_COL` bound as an explicit `r` (security review Finding 2 — a run of `r`-omitting `<c>` elements would otherwise never pass through `CellRef::from_a1`'s own check, letting it inflate `Sheet::max_col` unbounded). The real file this open question already cited, `tests/fixtures/other/minimal_package.xlsx` (calamine's test corpus, not committed), was confirmed to now resolve end to end with this fix.
 5. **`Reader` internal buffer size / performance tuning**: same topic as [parse/mod.md Open Question 5](mod.en.md). To be settled based on measured profiling against the "grid-paper Excel" sheet sizes the requirements target.
 6. ~~Namespace handling~~ → **Resolved**: follows the policy [parse/mod.md Open Question 4](mod.en.md) settled on — plain string-prefix matching, no `quick_xml::NsReader`. `worksheet.xml`'s own elements and attributes (`row`, `c`, `v`, `is`, `t`, `s`, `r`, `mergeCells`, `mergeCell`, `ref`) carry no prefix, so this file sees no direct impact.
+7. ~~Where and how to check the cell-count cap~~ → **Resolved** (Issue [#88](https://github.com/MinamiyamaKotaro/xlsxparser/issues/88)): adopted incremental counting and checking while this function streams `<c>` elements, rather than the "check in one batch after collection" pattern `resolve::merge`/`resolve::column_width` use. Rationale: for cells, the memory cost accrues the moment one reaches `Sheet::insert_cell`, so checking only after collecting the whole sheet would already be too late. The cap value itself is caller-configurable via `SizeLimits::max_cells_per_sheet` ([container/sanitize.md](../container/sanitize.en.md)), bridged in through `parse_worksheet`'s new `max_cells` argument, which `pipeline.rs` forwards.

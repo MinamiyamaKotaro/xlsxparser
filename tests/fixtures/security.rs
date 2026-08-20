@@ -191,3 +191,75 @@ pub fn xxe_attack() -> Vec<u8> {
         ),
     ])
 }
+
+/// `n_cells` populated cells (`<c r="..."><v>1</v></c>`, each carrying a
+/// value so it actually reaches `Sheet::insert_cell` rather than being
+/// dropped by `flush_cell` for carrying no value/style/shared-string
+/// reference — see `SizeLimits::max_cells_per_sheet`'s doc comment). Used
+/// with a caller-supplied tiny `max_cells_per_sheet` (same technique as
+/// [`zip_bomb`]'s caller-supplied tiny `max_entry_size`) so the accompanying
+/// test in `tests/security.rs` runs in milliseconds instead of needing a
+/// fixture anywhere near the real 5,000,000-cell default cap.
+pub fn too_many_cells(n_cells: u32) -> Vec<u8> {
+    let mut rows = String::new();
+    for col in 1..=n_cells {
+        rows.push_str(&format!(
+            "<row r=\"{col}\"><c r=\"A{col}\"><v>1</v></c></row>\n"
+        ));
+    }
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "styles", "styles.xml"),
+            ])
+            .as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        ("xl/styles.xml", DEFAULT_STYLES_XML),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(&rows, "").as_bytes(),
+        ),
+    ])
+}
+
+/// Same as [`too_many_cells`], but each cell is a self-closing `<c r="..."
+/// s="0"/>` (a style attribute, no `<v>` — the shape `<row>`/`<c>` take when
+/// self-closing, which only reaches `Sheet::insert_cell` if it carries a
+/// style, unlike a bare `<c r="A1"/>`). Exercises the `is_empty` branch of
+/// `parse/worksheet.rs`'s `<c>` handling — as opposed to [`too_many_cells`],
+/// which only ever produces non-self-closing `<c>...</c>` cells.
+pub fn too_many_cells_self_closing_with_style(n_cells: u32) -> Vec<u8> {
+    let mut rows = String::new();
+    for col in 1..=n_cells {
+        rows.push_str(&format!(
+            "<row r=\"{col}\"><c r=\"A{col}\" s=\"0\"/></row>\n"
+        ));
+    }
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[
+                ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                ("rId2", "styles", "styles.xml"),
+            ])
+            .as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        ("xl/styles.xml", DEFAULT_STYLES_XML),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(&rows, "").as_bytes(),
+        ),
+    ])
+}

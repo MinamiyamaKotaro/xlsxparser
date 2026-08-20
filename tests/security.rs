@@ -43,7 +43,7 @@ fn sparse_merge_bounding_box_does_not_amplify_json_generation_cost() {
 fn zip_bomb_is_capped_before_full_decompression() {
     let tiny_cap = SizeLimits {
         max_entry_size: 1_000_000,
-        max_total_size: SizeLimits::default().max_total_size,
+        ..SizeLimits::default()
     };
     let err =
         parse_workbook_reader_with_limits(Cursor::new(security::zip_bomb()), tiny_cap).unwrap_err();
@@ -51,6 +51,64 @@ fn zip_bomb_is_capped_before_full_decompression() {
         matches!(err, Error::ZipBombDetected { .. }),
         "expected Error::ZipBombDetected, got {err:?}"
     );
+}
+
+#[test]
+fn too_many_cells_is_rejected_before_exceeding_the_cap() {
+    let tiny_cap = SizeLimits {
+        max_cells_per_sheet: 3,
+        ..SizeLimits::default()
+    };
+    let err = parse_workbook_reader_with_limits(Cursor::new(security::too_many_cells(4)), tiny_cap)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::TooManyCells {
+                count: 4,
+                limit: 3,
+                ..
+            }
+        ),
+        "expected Error::TooManyCells {{ count: 4, limit: 3, .. }}, got {err:?}"
+    );
+
+    // One cell under the cap still parses successfully.
+    parse_workbook_reader_with_limits(Cursor::new(security::too_many_cells(3)), tiny_cap).unwrap();
+}
+
+#[test]
+fn too_many_self_closing_styled_cells_is_also_rejected() {
+    // Same cap as above, but every `<c>` is self-closing (`<c r="..."
+    // s="0"/>`) rather than `<c r="...">...</c>` — a styled cell still
+    // reaches `Sheet::insert_cell` even with no `<v>`, so it must count
+    // against the cap the same way a valued cell does.
+    let tiny_cap = SizeLimits {
+        max_cells_per_sheet: 3,
+        ..SizeLimits::default()
+    };
+    let err = parse_workbook_reader_with_limits(
+        Cursor::new(security::too_many_cells_self_closing_with_style(4)),
+        tiny_cap,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::TooManyCells {
+                count: 4,
+                limit: 3,
+                ..
+            }
+        ),
+        "expected Error::TooManyCells {{ count: 4, limit: 3, .. }}, got {err:?}"
+    );
+
+    parse_workbook_reader_with_limits(
+        Cursor::new(security::too_many_cells_self_closing_with_style(3)),
+        tiny_cap,
+    )
+    .unwrap();
 }
 
 #[test]

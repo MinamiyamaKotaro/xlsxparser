@@ -17,12 +17,35 @@ pub const DEFAULT_MAX_UNCOMPRESSED_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB
 /// enormous.
 pub const DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 
-/// Public configuration type callers use to set the Zip Bomb size caps.
-/// `lib.rs` re-exports this at the crate root and uses it as the argument
-/// to `parse_workbook_with_limits`/`parse_workbook_reader_with_limits`.
+/// The default cap on the number of cells materialized into a single
+/// `Sheet` (Issue #88). A cell only reaches `Sheet::insert_cell` once it
+/// carries a value, a style, or a shared-string reference (`flush_cell` in
+/// `parse/worksheet.rs` drops anything emptier than that for free) — measured
+/// directly (`poc/issue88-poc/`, PoC findings recorded on the Issue) at
+/// 78.3 bytes per such cell in the `BTreeMap<CellRef, Cell>` `Sheet::cells`
+/// uses (≈2x the raw `(CellRef, Cell)` pair's 40 bytes, the rest being
+/// `BTreeMap` node overhead). The per-entry byte-size cap above
+/// (`DEFAULT_MAX_UNCOMPRESSED_SIZE`, 512 MiB) alone doesn't bound this: a
+/// worksheet XML entry packed with minimal populated cells
+/// (`<c r="..."><v>1</v></c>`, ~26 bytes each) can fit ~20 million of them
+/// within that byte cap, which would then materialize into ~1.6 GB of
+/// `Sheet` memory — a ~3x amplification that bypasses the byte cap
+/// entirely. Capping at 5,000,000 cells bounds worst-case `Sheet` memory to
+/// roughly the same order of magnitude as the byte-size cap itself (≈391
+/// MB), eliminating most of that amplification, while leaving ~16x
+/// headroom over `tests/fixtures/load.rs`'s `massive_dense_accounting`
+/// fixture (300,000 cells), the largest legitimate scale this crate's own
+/// test suite exercises.
+pub const DEFAULT_MAX_CELLS_PER_SHEET: usize = 5_000_000;
+
+/// Public configuration type callers use to set the Zip Bomb size caps (and
+/// the cell-count cap below). `lib.rs` re-exports this at the crate root
+/// and uses it as the argument to
+/// `parse_workbook_with_limits`/`parse_workbook_reader_with_limits`.
 /// `Default` reuses `DEFAULT_MAX_UNCOMPRESSED_SIZE` /
-/// `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE` as-is, so the default-cap public
-/// functions (`parse_workbook`/`parse_workbook_reader`) need only pass
+/// `DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE` / `DEFAULT_MAX_CELLS_PER_SHEET`
+/// as-is, so the default-cap public functions
+/// (`parse_workbook`/`parse_workbook_reader`) need only pass
 /// `SizeLimits::default()` rather than duplicating the values.
 #[derive(Debug, Clone, Copy)]
 pub struct SizeLimits {
@@ -32,6 +55,13 @@ pub struct SizeLimits {
     /// The archive-wide cumulative uncompressed-size cap, in bytes. Passed
     /// straight through to `ZipContainer::with_max_total_size`.
     pub max_total_size: u64,
+    /// The cap on the number of cells materialized into a single `Sheet`
+    /// (Issue #88). Checked per sheet, not cumulatively across the
+    /// workbook — a workbook with many sheets, each individually under this
+    /// cap, is accepted regardless of their sum, the same way
+    /// `resolve::merge::MAX_MERGE_REGIONS`/
+    /// `resolve::column_width::MAX_COLUMN_WIDTH_RANGES` are per-sheet caps.
+    pub max_cells_per_sheet: usize,
 }
 
 impl Default for SizeLimits {
@@ -39,6 +69,7 @@ impl Default for SizeLimits {
         Self {
             max_entry_size: DEFAULT_MAX_UNCOMPRESSED_SIZE,
             max_total_size: DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE,
+            max_cells_per_sheet: DEFAULT_MAX_CELLS_PER_SHEET,
         }
     }
 }

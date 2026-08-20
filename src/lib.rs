@@ -289,7 +289,7 @@ mod tests {
         // `limits` through to the pipeline rather than ignoring it.
         let tiny_limits = SizeLimits {
             max_entry_size: 1,
-            max_total_size: SizeLimits::default().max_total_size,
+            ..SizeLimits::default()
         };
         let err = parse_workbook_reader_with_limits(Cursor::new(minimal_xlsx()), tiny_limits)
             .unwrap_err();

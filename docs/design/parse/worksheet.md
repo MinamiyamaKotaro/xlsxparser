@@ -98,6 +98,7 @@ pub(crate) fn parse_worksheet(
     path: &str,
     sheet: &mut Sheet,
     date1904: bool,
+    max_cells: usize,
 ) -> Result<WorksheetParseOutput, Error> {
     let mut xml_reader = create_secure_reader(reader);
     let mut pending_shared_strings = Vec::new();
@@ -220,6 +221,7 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 - `<mergeCell ref="...">` の `ref` 属性値が `"A1:C3"` の形式（`:` 区切りの2座標）でない場合、または各座標が不正なA1形式の場合は `Error::InvalidCellRef` を伝播する。結合範囲としての妥当性（開始・終了の大小関係、他範囲との重複）そのものの検証は行わず、そのまま `merge_regions` へ積んで [`resolve/merge.rs`](../resolve/merge.md) の検証に委ねる
 - `<col>` の `width`/`defaultColWidth` が `f64` として、または `min`/`max` が `u32` としてパースできない場合は `Error::InvalidPackage`（上記の数値 `<v>` と同じ暫定方針）を返す。範囲としての妥当性（重複・件数）そのものの検証は行わず、[`resolve/column_width.rs`](../resolve/column_width.md) に委ねる(`<mergeCells>` と同じ分担)
 - `<f>`（数式）要素の内容はパース・保存せず読み飛ばす（要求仕様書のスコープ外。オープンクエスチョン2参照）
+- 実際に `Sheet::insert_cell` されたセル数（`max_cells`引数、`SizeLimits::max_cells_per_sheet`。[container/sanitize.md](../container/sanitize.md)参照）が `max_cells` を超えた場合、`Error::TooManyCells` を返す（Issue [#88](https://github.com/MinamiyamaKotaro/xlsxparser/issues/88)）。値・スタイル・共有文字列参照のいずれも持たず握りつぶされたセルはカウントしない。バッチ収集後にまとめてチェックする `resolve::merge`/`resolve::column_width` とは異なり、`<c>` をストリーミングする最中に逐次カウント・チェックする——セルの場合、メモリコストは挿入された瞬間に発生するため、収集し終えてからのチェックでは手遅れになる
 - **`panic` しない**: 本ファイルが扱う入力は信頼できない外部ファイルであるため、想定外の構造は必ず `Error` のいずれかのバリアントとして伝播させる
 
 ## テスト方針
@@ -243,6 +245,7 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 - `t="d"` セルについて、日付のみ・日付+時刻・時刻のみの3パターンそれぞれが正しい `CellValue::DateTime` として解決されることの確認（時刻のみの場合、日付部分がExcelの規約どおり1899-12-30になることを含む）。不正な形式（範囲外の数値、セグメント数不一致）に対し `Error::InvalidPackage` を返すことの確認(Issue #58。実例として `tests/fixtures/other/date_iso.xlsx` ——calamineテストコーパス由来——で3パターンとも確認済みだが、同ディレクトリは`.gitignore`対象のため、統合テスト自体は同じ3パターンを再現した手書きフィクスチャを用いる)
 - 末尾の `Z`/`+09:00` 等のUTC・オフセット指定子が読み捨てられること、小数秒(`10:10:10.500`)が整数秒へ切り捨てられること、秒省略(`10:10`)が0扱いになることの確認（PR #80レビュー指摘1）
 - `date1904 = true` のブックで時刻のみの `t="d"` セルを解決した場合、仮の日付が1899-12-30ではなく1904-01-01になることの確認（PR #80レビュー指摘2。`resolve/style.rs` の数値ベース時刻のみセルとの整合性の回帰テスト）
+- 実際に挿入されたセル数が `max_cells` を超えた時点で `Error::TooManyCells` が返り、それ以上パースを継続しないことの確認(Issue #88)。値・スタイル・共有文字列参照のいずれも持たない `<c>` は挿入されないため、いくら並べても `max_cells` にはカウントされないことの確認を含む(`tests/security.rs` 側で小さい `max_cells_per_sheet` を使い高速に検証。`tests/fixtures/security.rs` の `too_many_cells` フィクスチャ)
 
 ## 実装メモ
 
@@ -250,6 +253,7 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 - **`build_cell` のシグネチャ**: ドラフトが未使用のまま `let _ = (cell_ref, style_id);` としていた `cell_ref`/`style_id` 引数は削除した。値/スタイルの振り分けは呼び出し元（`flush_cell`）が担い、`build_cell` 自体は不要。
 - **`<v>`/`<f>` のテキスト読み取り**: ドラフトには無かった `read_leaf_text` ヘルパーを追加した。quick-xml 0.41 では実体参照が `Event::Text` とは別の `Event::GeneralRef` としてトークン化されるため（[parse/mod.md オープンクエスチョン1](mod.md)参照）、`concat_rich_text` と同じ共通ヘルパー `push_general_ref`（[parse/mod.rs](mod.md)）経由で解決する。
 - **`flush_cell` の挿入判定**: `<c>` は、スタイル（`s`属性）・値（`<v>`/`<is>` のテキスト）・`t="s"`参照（解決後に値を持つ）のいずれかを持つ場合にのみ挿入する。疎行列の要件通り、完全に空の `<c r="A1"/>` はインスタンス化しない。
+- **`flush_cell` の戻り値**（Issue #88）: 実際に挿入したかどうかを `bool` として返すよう変更した（元は `Result<(), Error>`、現在は `Result<bool, Error>`）。呼び出し元（`parse_worksheet`）はこれを見て、実際に挿入された場合だけセル数カウンタをインクリメント・上限チェックする——空セルはメモリコストがゼロなのでカウントに含めると正当なスパースファイルを不当に制限してしまうため。カウント・上限チェック自体は `check_cell_count` という小さな別関数に切り出し、`flush_cell` の2つの呼び出し箇所（自己終了 `<c/>` の場合と `Event::End` の場合)から共通で呼ぶ。
 
 ## 未決事項 / オープンクエスチョン
 
@@ -259,3 +263,4 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 4. ~~`r` 属性省略セルの列位置逐次推論~~ → **解決**（Issue [#79](https://github.com/MinamiyamaKotaro/xlsxparser/issues/79)）: `<row>`/`<c>` いずれも `r` 省略時は直前の行/セルから位置を推論するようになった。ループのローカル状態（現在の行番号・行内の現在列）として `cur_row`/`cur_col` を追加し、`<row>` の開始タグで行番号確定・列位置リセット、各 `<c>` の開始タグで `r` があればそれを採用しつつ現在列を更新（後続の省略セルはその位置から数え直す）、無ければ現在列を1進めて採用する形で実装した。`CellRef::MAX_ROW`/`MAX_COL` の上限チェックは推論経路でも同様に行う（セキュリティレビュー Finding 2 と同じ攻撃面——`r` を省略した `<c>` を大量に並べるだけで `CellRef::from_a1` の上限チェックを経由せず `Sheet::max_col` を膨張させられてしまうため）。実例として確認していた `tests/fixtures/other/minimal_package.xlsx`（calamineテストコーパス由来、非コミット）はこの修正により実際にend-to-endで解決できることを確認済み。
 5. **`Reader` の内部バッファサイズ・パフォーマンスチューニング**: [parse/mod.md オープンクエスチョン5](mod.md) と同一の論点。要求仕様書が想定する「方眼紙Excel」規模のシートに対する実測プロファイリングを踏まえて確定させる。
 6. ~~名前空間の扱い~~ → **解決**: [parse/mod.md オープンクエスチョン4](mod.md) で確定した「`quick_xml::NsReader` は採用せず文字列前方一致で簡略化する」方針に従う。`worksheet.xml` 自体の要素・属性（`row`, `c`, `v`, `is`, `t`, `s`, `r`, `mergeCells`, `mergeCell`, `ref`）に接頭辞は付かないため、本ファイルへの直接的な影響はない。
+7. ~~セル数の上限チェックをどこで・どう行うか~~ → **解決**（Issue [#88](https://github.com/MinamiyamaKotaro/xlsxparser/issues/88)）: `resolve::merge`/`resolve::column_width` のような「バッチ収集後に一括チェック」ではなく、本関数が `<c>` をストリーミングする最中に逐次カウント・チェックする方式を採用した。理由: セルの場合、メモリコストは `Sheet::insert_cell` された瞬間に発生するため、全セルを収集し終えてからチェックしたのでは既に手遅れになる。上限値自体は `SizeLimits::max_cells_per_sheet`（[container/sanitize.md](../container/sanitize.md)）として呼び出し側が設定可能にし、`pipeline.rs` が `parse_worksheet` の新規引数 `max_cells` として橋渡しする。

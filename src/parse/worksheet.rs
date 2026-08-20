@@ -84,9 +84,11 @@ pub(crate) fn parse_worksheet(
     path: &str,
     sheet: &mut Sheet,
     date1904: bool,
+    max_cells: usize,
 ) -> Result<WorksheetParseOutput, Error> {
     let mut xml_reader = create_secure_reader(reader);
     let mut buf = Vec::new();
+    let mut cell_count: usize = 0;
     let mut pending_shared_strings = Vec::new();
     let mut pending_styles = Vec::new();
     let mut col_width_ranges = Vec::new();
@@ -150,7 +152,7 @@ pub(crate) fn parse_worksheet(
                 let style_id = optional_attr(e, path, "s")?.and_then(|s| s.parse::<u32>().ok());
 
                 if is_empty {
-                    flush_cell(
+                    let inserted = flush_cell(
                         sheet,
                         &mut pending_shared_strings,
                         &mut pending_styles,
@@ -162,6 +164,9 @@ pub(crate) fn parse_worksheet(
                         None,
                         date1904,
                     )?;
+                    if inserted {
+                        check_cell_count(&mut cell_count, max_cells, path)?;
+                    }
                 } else {
                     cur_ref = Some(cell_ref);
                     cur_type = cell_type;
@@ -183,7 +188,7 @@ pub(crate) fn parse_worksheet(
             }
             Event::End(e) if e.local_name().as_ref() == b"c" => {
                 if let Some(cell_ref) = cur_ref.take() {
-                    flush_cell(
+                    let inserted = flush_cell(
                         sheet,
                         &mut pending_shared_strings,
                         &mut pending_styles,
@@ -195,6 +200,9 @@ pub(crate) fn parse_worksheet(
                         cur_inline.take(),
                         date1904,
                     )?;
+                    if inserted {
+                        check_cell_count(&mut cell_count, max_cells, path)?;
+                    }
                 }
             }
             Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"mergeCell" => {
@@ -265,6 +273,9 @@ fn parse_f64_attr(value: &str, attr_name: &str, path: &str) -> Result<f64, Error
 /// worth inserting at all (a sparse matrix never instantiates a fully blank
 /// cell — no value, no style, not even a pending shared-string reference),
 /// and if so, inserts it and records any deferred-resolution entries.
+/// Returns whether a cell was actually inserted, so the caller can count it
+/// against [`SizeLimits::max_cells_per_sheet`](crate::SizeLimits::max_cells_per_sheet)
+/// — a dropped, information-free `<c>` costs nothing and must not count.
 #[allow(clippy::too_many_arguments)]
 fn flush_cell(
     sheet: &mut Sheet,
@@ -277,12 +288,12 @@ fn flush_cell(
     value_text: Option<String>,
     inline_string: Option<String>,
     date1904: bool,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let is_shared_string = cell_type.as_deref() == Some("s");
     let has_value = value_text.is_some() || inline_string.is_some();
 
     if style_id.is_none() && !has_value && !is_shared_string {
-        return Ok(());
+        return Ok(false);
     }
 
     let cell = build_cell(
@@ -306,6 +317,27 @@ fn flush_cell(
         pending_styles.push(PendingStyle { cell_ref, style_id });
     }
 
+    Ok(true)
+}
+
+/// Increments `cell_count` for one just-inserted cell and rejects the whole
+/// parse with `Error::TooManyCells` the moment it exceeds `max_cells`
+/// (Issue #88) — called from both `flush_cell` call sites in
+/// `parse_worksheet`'s main loop (`Event::Empty`/self-closing `<c>`, and
+/// `Event::End` for a `<c>` with children), immediately after `flush_cell`
+/// reports it actually inserted a cell. Checking incrementally here, rather
+/// than after the whole sheet is collected, matters because the memory cost
+/// this guards against accrues at the moment of insertion itself — by the
+/// time a post-hoc count would run, the damage is already done.
+fn check_cell_count(cell_count: &mut usize, max_cells: usize, path: &str) -> Result<(), Error> {
+    *cell_count += 1;
+    if *cell_count > max_cells {
+        return Err(Error::TooManyCells {
+            path: path.to_string(),
+            count: *cell_count,
+            limit: max_cells,
+        });
+    }
     Ok(())
 }
 
@@ -467,7 +499,14 @@ mod tests {
 
     fn parse(xml: &[u8]) -> (Sheet, WorksheetParseOutput) {
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        let output = parse_worksheet(xml, "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap();
+        let output = parse_worksheet(
+            xml,
+            "xl/worksheets/sheet1.xml",
+            &mut sheet,
+            false,
+            usize::MAX,
+        )
+        .unwrap();
         (sheet, output)
     }
 
@@ -638,7 +677,14 @@ mod tests {
         // book would resolve to (resolve/style.rs's EPOCH_OFFSET_1904).
         let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>10:10:10</v></c></row></sheetData></worksheet>"#;
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, true).unwrap();
+        parse_worksheet(
+            &xml[..],
+            "xl/worksheets/sheet1.xml",
+            &mut sheet,
+            true,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(
             sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
             Some(CellValue::DateTime(DateTimeValue {
@@ -656,8 +702,14 @@ mod tests {
     fn t_d_cell_with_wrong_date_segment_count_is_an_error() {
         let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>2021-01</v></c></row></sheetData></worksheet>"#;
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        let err =
-            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
+        let err = parse_worksheet(
+            &xml[..],
+            "xl/worksheets/sheet1.xml",
+            &mut sheet,
+            false,
+            usize::MAX,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::InvalidPackage(_)));
     }
 
@@ -665,8 +717,14 @@ mod tests {
     fn t_d_cell_with_wrong_time_segment_count_is_an_error() {
         let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>10:10:10:10</v></c></row></sheetData></worksheet>"#;
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        let err =
-            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
+        let err = parse_worksheet(
+            &xml[..],
+            "xl/worksheets/sheet1.xml",
+            &mut sheet,
+            false,
+            usize::MAX,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::InvalidPackage(_)));
     }
 
@@ -674,8 +732,14 @@ mod tests {
     fn t_d_cell_with_out_of_range_component_is_an_error() {
         let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>2021-13-01</v></c></row></sheetData></worksheet>"#;
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        let err =
-            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
+        let err = parse_worksheet(
+            &xml[..],
+            "xl/worksheets/sheet1.xml",
+            &mut sheet,
+            false,
+            usize::MAX,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::InvalidPackage(_)));
     }
 
@@ -683,8 +747,14 @@ mod tests {
     fn t_d_cell_with_malformed_time_is_an_error() {
         let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>25:00:00</v></c></row></sheetData></worksheet>"#;
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        let err =
-            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
+        let err = parse_worksheet(
+            &xml[..],
+            "xl/worksheets/sheet1.xml",
+            &mut sheet,
+            false,
+            usize::MAX,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::InvalidPackage(_)));
     }
 
@@ -857,8 +927,14 @@ mod tests {
     fn malformed_col_width_is_invalid_package() {
         let xml = br#"<worksheet><cols><col min="1" max="1" width="not-a-number"/></cols><sheetData></sheetData></worksheet>"#;
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        let err =
-            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
+        let err = parse_worksheet(
+            &xml[..],
+            "xl/worksheets/sheet1.xml",
+            &mut sheet,
+            false,
+            usize::MAX,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::InvalidPackage(_)));
     }
 
@@ -938,8 +1014,14 @@ mod tests {
         // context to infer a position from.
         let xml = br#"<worksheet><sheetData><c t="n"><v>1</v></c></sheetData></worksheet>"#;
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        let err =
-            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
+        let err = parse_worksheet(
+            &xml[..],
+            "xl/worksheets/sheet1.xml",
+            &mut sheet,
+            false,
+            usize::MAX,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::InvalidCellRef(_)));
     }
 
@@ -964,6 +1046,7 @@ mod tests {
             "xl/worksheets/sheet1.xml",
             &mut sheet,
             false,
+            usize::MAX,
         )
         .unwrap_err();
         assert!(matches!(err, Error::InvalidCellRef(_)));
@@ -977,8 +1060,14 @@ mod tests {
         // CellRef::from_a1's Error::InvalidCellRef.
         let xml = br#"<worksheet><sheetData><row r="abc"><c t="n"><v>1</v></c></row></sheetData></worksheet>"#;
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        let err =
-            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
+        let err = parse_worksheet(
+            &xml[..],
+            "xl/worksheets/sheet1.xml",
+            &mut sheet,
+            false,
+            usize::MAX,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::InvalidCellRef(_)));
     }
 
@@ -989,8 +1078,14 @@ mod tests {
         // the same way rather than silently becoming a valid row.
         let xml = br#"<worksheet><sheetData><row r="0"><c t="n"><v>1</v></c></row></sheetData></worksheet>"#;
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        let err =
-            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
+        let err = parse_worksheet(
+            &xml[..],
+            "xl/worksheets/sheet1.xml",
+            &mut sheet,
+            false,
+            usize::MAX,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::InvalidCellRef(_)));
     }
 
@@ -1006,6 +1101,7 @@ mod tests {
             "xl/worksheets/sheet1.xml",
             &mut sheet,
             false,
+            usize::MAX,
         )
         .unwrap_err();
         assert!(matches!(err, Error::InvalidCellRef(_)));
@@ -1015,8 +1111,14 @@ mod tests {
     fn malformed_cell_ref_is_invalid_cell_ref() {
         let xml = br#"<worksheet><sheetData><row r="1"><c r="1A"><v>1</v></c></row></sheetData></worksheet>"#;
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        let err =
-            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
+        let err = parse_worksheet(
+            &xml[..],
+            "xl/worksheets/sheet1.xml",
+            &mut sheet,
+            false,
+            usize::MAX,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::InvalidCellRef(_)));
     }
 
@@ -1026,8 +1128,14 @@ mod tests {
 <mergeCells><mergeCell ref="notarange"/></mergeCells>
 </worksheet>"#;
         let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
-        let err =
-            parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet, false).unwrap_err();
+        let err = parse_worksheet(
+            &xml[..],
+            "xl/worksheets/sheet1.xml",
+            &mut sheet,
+            false,
+            usize::MAX,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::InvalidCellRef(_)));
     }
 

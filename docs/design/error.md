@@ -73,6 +73,24 @@ pub enum Error {
     #[error("DOCTYPE declaration rejected in {path} (XXE defense)")]
     DoctypeRejected { path: String },
 
+    /// 1シートに実際に挿入されたセル数(`Sheet::insert_cell` に到達した
+    /// セルのみ。値・スタイル・共有文字列参照のいずれも持たない `<c>` は
+    /// `flush_cell` が無料で捨てるためカウントされない)が
+    /// `SizeLimits::max_cells_per_sheet` を超えた(Issue
+    /// [#88](https://github.com/MinamiyamaKotaro/xlsxparser/issues/88))。
+    /// `TooManyMergedRanges`/`TooManyColumnWidthRanges` (バッチ収集後に
+    /// 一括チェック)とは異なり、`parse/worksheet.rs` が `<c>` を
+    /// ストリーミングする最中に逐次チェックする——セルの場合、メモリコスト
+    /// は挿入された瞬間に発生するため、収集し終えてからのチェックでは
+    /// 手遅れになる。上限値は[container/sanitize.md](container/sanitize.md)
+    /// の `SizeLimits::max_cells_per_sheet` 参照。
+    #[error("too many cells in {path}: {count} exceeds limit {limit}")]
+    TooManyCells {
+        path: String,
+        count: usize,
+        limit: usize,
+    },
+
     // --- フェーズ4: 分析と遅延解決 ---
     /// A1形式のセル参照文字列が不正（構文エラー・桁溢れ・空文字列など、
     /// model/cell.md の `CellRef::from_a1` が返す）。
