@@ -426,6 +426,95 @@ mod tests {
     }
 
     #[test]
+    fn t_d_cell_resolves_all_three_iso8601_shapes() {
+        let xml = br#"<worksheet><sheetData><row r="1">
+<c r="A1" t="d"><v>2021-01-01</v></c>
+<c r="B1" t="d"><v>2021-01-01T10:10:10</v></c>
+<c r="C1" t="d"><v>10:10:10</v></c>
+</row></sheetData></worksheet>"#;
+        let (sheet, _output) = parse(xml);
+
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 1 }).unwrap().value,
+            Some(CellValue::DateTime(DateTimeValue {
+                year: 2021,
+                month: 1,
+                day: 1,
+                hour: 0,
+                minute: 0,
+                second: 0,
+            }))
+        );
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 2 }).unwrap().value,
+            Some(CellValue::DateTime(DateTimeValue {
+                year: 2021,
+                month: 1,
+                day: 1,
+                hour: 10,
+                minute: 10,
+                second: 10,
+            }))
+        );
+        // Time-only: no date component in the source, so it lands on
+        // Excel's "time of day" convention (serial day 0 = 1899-12-30).
+        assert_eq!(
+            sheet.get(CellRef { row: 1, col: 3 }).unwrap().value,
+            Some(CellValue::DateTime(DateTimeValue {
+                year: 1899,
+                month: 12,
+                day: 30,
+                hour: 10,
+                minute: 10,
+                second: 10,
+            }))
+        );
+    }
+
+    #[test]
+    fn t_d_cell_with_unsupported_shape_is_an_error() {
+        // A UTC/offset suffix is not one of the three shapes real files use
+        // (date-only / date+time / time-only) and is rejected rather than
+        // silently truncated.
+        let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>2021-01-01T10:10:10Z</v></c></row></sheetData></worksheet>"#;
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err = parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet).unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
+    }
+
+    #[test]
+    fn t_d_cell_with_wrong_date_segment_count_is_an_error() {
+        let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>2021-01</v></c></row></sheetData></worksheet>"#;
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err = parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet).unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
+    }
+
+    #[test]
+    fn t_d_cell_with_wrong_time_segment_count_is_an_error() {
+        let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>10:10</v></c></row></sheetData></worksheet>"#;
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err = parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet).unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
+    }
+
+    #[test]
+    fn t_d_cell_with_out_of_range_component_is_an_error() {
+        let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>2021-13-01</v></c></row></sheetData></worksheet>"#;
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err = parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet).unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
+    }
+
+    #[test]
+    fn t_d_cell_with_malformed_time_is_an_error() {
+        let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" t="d"><v>25:00:00</v></c></row></sheetData></worksheet>"#;
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err = parse_worksheet(&xml[..], "xl/worksheets/sheet1.xml", &mut sheet).unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
+    }
+
+    #[test]
     fn styled_cell_records_pending_style() {
         let xml = br#"<worksheet><sheetData><row r="1"><c r="A1" s="3"><v>1</v></c></row></sheetData></worksheet>"#;
         let (_sheet, output) = parse(xml);
