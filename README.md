@@ -23,7 +23,7 @@ frontend or another system.
 Core implementation complete — every module in the planned architecture
 below is implemented and tested against the design in `docs/design/`. The
 public API (`parse_workbook`, `parse_workbook_reader`, `to_json_string`,
-`to_json_writer`) is wired up in `src/lib.rs`.
+`to_json_writer`, `resolve_color`) is wired up in `src/lib.rs`.
 
 ```rust
 let workbook = xlsxparser::parse_workbook("book.xlsx")?;
@@ -139,7 +139,10 @@ sheet with a single merged region, `A1:C3`, holding one text cell):
     raw, unresolved form rather than converted to a final displayed RGB
     value: xlsxparser's output is for diffing, so knowing *that* a fill
     color changed doesn't require knowing what it actually renders as.
-    Omitted when the fill has no foreground/background color at all.
+    Omitted when the fill has no foreground/background color at all. When
+    the actual displayed color *is* needed, `resolve_color` converts any
+    of these three forms to a real RGB value on demand — see
+    [Resolving display colors](#resolving-display-colors) below.
 
 A second real example — every `CellValue` variant in one row
 (`tests/fixtures/normal/basic_types.xlsx`; cells re-ordered by column here
@@ -207,6 +210,45 @@ Column 4 falls in the gap between the two `columns` ranges, so a cell there
 (none exist in this example) would fall back to `defaultColumnWidth`
 (9.1) rather than either range's `width`.
 
+## Resolving display colors
+
+`fillFgColor`/`fillBgColor` above are kept raw because xlsxparser's
+primary purpose is diffing, not rendering — but when a caller does need
+to know the actual color a cell displays as (not just whether it
+changed), `resolve_color` converts any of the three `ColorRef` forms
+(`rgb` / `theme`+`tint` / `indexed`) into a real `Rgb { r, g, b }` value
+on demand:
+
+```rust
+use xlsxparser::{parse_workbook, resolve_color, CellRef};
+
+let workbook = parse_workbook("book.xlsx")?;
+let sheet = &workbook.sheets()[0];
+let cell = sheet.get(CellRef { row: 1, col: 1 }).unwrap();
+
+if let Some(color_ref) = cell.style.as_ref().and_then(|s| s.fill_fg_color.as_ref()) {
+    let rgb = resolve_color(color_ref, workbook.theme());
+    // e.g. Some(Rgb { r: 0x4F, g: 0x81, b: 0xBD })
+}
+```
+
+- `theme`+`tint` references resolve against the workbook's
+  `xl/theme/theme{N}.xml` `<clrScheme>` (`Workbook::theme()`), applying
+  ECMA-376's tint luminance correction, and return `None` if the
+  workbook has no theme part at all or the referenced slot index is out
+  of range.
+- `indexed` references resolve against the legacy ECMA-376 64-color
+  palette; `indexed=64`/`65` (the "system foreground"/"system
+  background" special values) resolve to fixed `#000000`/`#FFFFFF`,
+  independent of any OS system palette (this crate runs headless).
+- `resolve_color` never panics on malformed input (an out-of-range theme
+  index, a non-finite `tint`, malformed hex) — it returns `None` instead.
+- `xl/theme/theme{N}.xml` is read and parsed only if the workbook's
+  stylesheet actually references a theme color at all
+  ("pay-for-what-you-use") — a workbook that never uses one pays zero
+  added I/O or CPU cost for this feature, even when the part is present
+  in the file.
+
 ## Architecture
 
 1. **Relationship resolution** — parse `_rels` parts to build a routing map
@@ -248,7 +290,7 @@ src/
   container/    # ZIP (OPC) extraction, zip-bomb/zip-slip guarding
   parse/        # XML parsing (quick-xml usage is confined here), XXE mitigation
   model/        # pure data structures (Workbook, Sheet, Cell, CellValue, ...)
-  resolve/      # shared-string/style/merge-cell resolution, I/O-independent
+  resolve/      # shared-string/style/merge-cell resolution + on-demand color resolution, I/O-independent
 
   json.rs       # serializes a resolved Workbook to JSON
 ```
@@ -264,7 +306,12 @@ src/
 - `xl/styles.xml` (font size/bold, horizontal alignment, wrap text,
   number format — both the built-in numFmtId table (ECMA-376 §18.8.30) and
   custom `<numFmt>` codes — and fill color, kept in its raw `rgb`/
-  `theme`+`tint`/`indexed` form rather than resolved to a final RGB value)
+  `theme`+`tint`/`indexed` form; see
+  [Resolving display colors](#resolving-display-colors) for converting it
+  to a real RGB value)
+- `xl/theme/theme{N}.xml` (`<clrScheme>`'s 12 colors — read only when a
+  style actually references a theme color; see
+  [Resolving display colors](#resolving-display-colors))
 - `xl/worksheets/sheetX.xml` (`<sheetData>`, `<mergeCells>`)
 
 `[Content_Types].xml` is not read; fixed paths such as `xl/workbook.xml`
