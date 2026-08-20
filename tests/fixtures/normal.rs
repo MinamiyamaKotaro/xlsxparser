@@ -424,3 +424,39 @@ pub fn cells_without_r_attribute() -> Vec<u8> {
         ),
     ])
 }
+
+/// Non-ASCII text beyond the single CJK string (`"日本語Text"`,
+/// `basic_types` above) every other committed fixture relies on:
+/// right-to-left scripts (Arabic, Hebrew), an emoji built from a
+/// zero-width-joiner sequence plus a plain surrogate-pair emoji, a
+/// combining diacritical mark, and a string mixing an RTL script with
+/// plain ASCII (the bidi case). Verifies these round-trip byte-for-byte
+/// through the streaming XML parser and JSON serialization — nothing here
+/// is expected to behave differently from ASCII, since the whole pipeline
+/// carries text as Rust's UTF-8-validated `String`/`&str` throughout with
+/// no manual byte slicing, but that expectation had no regression test
+/// prior to this fixture.
+pub fn unicode_text() -> Vec<u8> {
+    let rows = r#"<row r="1">
+  <c r="A1" t="str"><v>مرحبا بالعالم</v></c>
+  <c r="B1" t="str"><v>שלום עולם</v></c>
+  <c r="C1" t="str"><v>👨‍👩‍👧‍👦🎉😀</v></c>
+  <c r="D1" t="str"><v>é́ combining</v></c>
+  <c r="E1" t="str"><v>Order #123 مرحبا</v></c>
+</row>"#;
+
+    build_zip(&[
+        (
+            "xl/_rels/workbook.xml.rels",
+            rels_xml(&[("rId1", "worksheet", "worksheets/sheet1.xml")]).as_bytes(),
+        ),
+        (
+            "xl/workbook.xml",
+            workbook_xml(&[("Sheet1", "rId1", None)]).as_bytes(),
+        ),
+        (
+            "xl/worksheets/sheet1.xml",
+            worksheet_xml(rows, "").as_bytes(),
+        ),
+    ])
+}

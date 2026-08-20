@@ -225,3 +225,109 @@ fn extreme_sparse_coordinates_register_only_the_populated_cells() {
     // between were never touched.
     assert_eq!(sheet.iter_cells().count(), 2);
 }
+
+#[test]
+fn medium_density_registers_only_the_scattered_populated_cells() {
+    // tests/README.md edge-case audit: a tier between extreme_sparse (2
+    // cells) and massive_dense_accounting (100% fill in a fixed
+    // rectangle) — cells scattered at partial density across a wide
+    // range, with genuine gaps around any given populated cell.
+    let workbook = parse_workbook_reader(Cursor::new(complex::medium_density())).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    let expected_count = (1..=complex::MEDIUM_DENSITY_ROWS)
+        .flat_map(|row| (1..=complex::MEDIUM_DENSITY_COLS).map(move |col| (row, col)))
+        .filter(|(row, col)| (row + col).is_multiple_of(10))
+        .count();
+    assert_eq!(sheet.iter_cells().count(), expected_count);
+
+    // Spot-check a populated cell and confirm its immediate neighbor
+    // (unpopulated under the (row + col) % 10 == 0 rule) is genuinely
+    // absent, not merely zero-valued.
+    assert_eq!(
+        sheet.get(CellRef { row: 1, col: 9 }).unwrap().value,
+        Some(CellValue::Number(1009.0))
+    );
+    assert!(sheet.get(CellRef { row: 1, col: 8 }).is_none());
+    assert!(sheet.get(CellRef { row: 1, col: 10 }).is_none());
+
+    let last_row = complex::MEDIUM_DENSITY_ROWS;
+    let last_col = (1..=complex::MEDIUM_DENSITY_COLS)
+        .rev()
+        .find(|col| (last_row + col).is_multiple_of(10))
+        .unwrap();
+    assert_eq!(
+        sheet
+            .get(CellRef {
+                row: last_row,
+                col: last_col
+            })
+            .unwrap()
+            .value,
+        Some(CellValue::Number(
+            last_row as f64 * 1000.0 + last_col as f64
+        ))
+    );
+}
+
+#[test]
+fn dense_merged_grid_resolves_every_block_to_its_own_anchor() {
+    // tests/README.md edge-case audit: houganshi_merged only ever tests
+    // one merged region, despite Issue #28's original spec calling for
+    // merges "至る所に" (everywhere). This tiles BLOCK x BLOCK merges
+    // across a SIDE x SIDE grid with no gaps, and verifies every one
+    // resolves independently — a cell in one block never leaks into an
+    // adjacent block's anchor.
+    let workbook = parse_workbook_reader(Cursor::new(complex::dense_merged_grid())).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    let side = complex::DENSE_MERGE_GRID_SIDE;
+    let block = complex::DENSE_MERGE_GRID_BLOCK;
+
+    for block_row in 0..side {
+        for block_col in 0..side {
+            let anchor_row = block_row * block + 1;
+            let anchor_col = block_col * block + 1;
+            let anchor = sheet
+                .get(CellRef {
+                    row: anchor_row,
+                    col: anchor_col,
+                })
+                .unwrap();
+            let expected_value = (block_row * side + block_col) as f64;
+            assert_eq!(
+                anchor.value,
+                Some(CellValue::Number(expected_value)),
+                "block ({block_row}, {block_col}) anchor has the wrong value"
+            );
+
+            // Every coordinate in this block resolves to the same anchor,
+            // never to a neighboring block's.
+            for dr in 0..block {
+                for dc in 0..block {
+                    let cell_ref = CellRef {
+                        row: anchor_row + dr,
+                        col: anchor_col + dc,
+                    };
+                    assert_eq!(
+                        sheet.get(cell_ref),
+                        Some(anchor),
+                        "({block_row},{block_col}) offset ({dr},{dc}) did not resolve to its own block's anchor"
+                    );
+                }
+            }
+        }
+    }
+
+    // rowSpan/colSpan == BLOCK on every anchor, and only SIDE^2 cells (the
+    // anchors) are ever emitted — none of the (SIDE*BLOCK)^2 - SIDE^2
+    // virtual coordinates show up as separate JSON cells.
+    let json = xlsxparser::to_json_string(&workbook).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let cells = parsed["sheets"][0]["cells"].as_array().unwrap();
+    assert_eq!(cells.len(), (side * side) as usize);
+    for cell in cells {
+        assert_eq!(cell["rowSpan"], block);
+        assert_eq!(cell["colSpan"], block);
+    }
+}

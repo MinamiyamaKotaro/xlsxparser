@@ -20,6 +20,46 @@ fn corrupted_xml_is_reported_as_xml_parse_error() {
 }
 
 #[test]
+fn corrupted_workbook_xml_is_reported_as_xml_parse_error() {
+    // tests/README.md edge-case audit: only worksheet.xml had a dedicated
+    // malformed-XML fixture prior to this one.
+    let err = parse_workbook_reader(Cursor::new(error::corrupted_workbook_xml())).unwrap_err();
+    assert!(
+        matches!(err, Error::XmlParse { .. }),
+        "expected Error::XmlParse, got {err:?}"
+    );
+}
+
+#[test]
+fn corrupted_styles_xml_is_reported_as_xml_parse_error() {
+    let err = parse_workbook_reader(Cursor::new(error::corrupted_styles_xml())).unwrap_err();
+    assert!(
+        matches!(err, Error::XmlParse { .. }),
+        "expected Error::XmlParse, got {err:?}"
+    );
+}
+
+#[test]
+fn corrupted_shared_strings_xml_is_reported_as_missing_closing_tag() {
+    // Not Error::XmlParse: this fixture's truncation point (EOF inside a
+    // well-formed <t> open tag, no closing </si>) is caught by
+    // concat_rich_text's own explicit EOF check rather than a raw XML
+    // syntax error — see the fixture's doc comment.
+    let err =
+        parse_workbook_reader(Cursor::new(error::corrupted_shared_strings_xml())).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::MissingRequiredElement {
+                name: "si/is closing tag",
+                ..
+            }
+        ),
+        "expected Error::MissingRequiredElement{{name: \"si/is closing tag\"}}, got {err:?}"
+    );
+}
+
+#[test]
 fn missing_relations_is_reported_as_dangling_relationship() {
     let err = parse_workbook_reader(Cursor::new(error::missing_relations())).unwrap_err();
     assert!(
