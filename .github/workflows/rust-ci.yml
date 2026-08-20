@@ -8,6 +8,8 @@ on:
     branches: [master]
     paths:
       - "src/**"
+      - "tests/**"
+      - "!tests/README.md"
       - "Cargo.toml"
       - "Cargo.lock"
       - "deny.toml"
@@ -15,6 +17,8 @@ on:
   pull_request:
     paths:
       - "src/**"
+      - "tests/**"
+      - "!tests/README.md"
       - "Cargo.toml"
       - "Cargo.lock"
       - "deny.toml"
