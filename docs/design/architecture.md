@@ -29,21 +29,26 @@ src/
     workbook.rs           # workbook.xml のパース
     shared_strings.rs     # sharedStrings.xml のパース（SSTの構造化データ抽出）
     styles.rs             # styles.xml のパース（fonts/fills/borders/numFmts/cellXfs）
-    worksheet.rs          # フェーズ3: sheetX.xml の SAXストリームパース（行単位の破棄はここで完結）
+    theme.rs              # theme{N}.xml の <clrScheme> のパース（Issue #76。スタイルがテーマ色を参照する場合のみ読む）
+    worksheet.rs          # フェーズ3: sheetX.xml の SAXストリームパース（行単位の破棄はここで完結）。<mergeCells>/<cols>/<hyperlinks>(Issue #95)もここでフェーズ4向けに収集する
     drawing.rs             # フェーズ3.5: drawingN.xml の画像アンカー解析（Issue #65）
 
   model/                    # 純粋なドメインモデル（XMLパースや解決ロジックに依存しない）
     mod.rs
     cell.rs               # CellValue, Cell, CellRef (A1形式 <-> 座標)
-    sheet.rs              # 疎行列 Sheet (BTreeMap<(u32, u32), Cell>)
+    sheet.rs              # 疎行列 Sheet (BTreeMap<CellRef, Cell>)、結合範囲・列幅・画像・ハイパーリンクを保持
     workbook.rs           # 解決済みの Workbook モデル
-    style.rs              # ResolvedStyle / StyleSheet / StyleId（parse/styles.rs と resolve/style.rs の共有語彙。PR #8 レビュー指摘を反映し新設）
+    style.rs              # ResolvedStyle / StyleSheet / StyleId / Borders（parse/styles.rs と resolve/style.rs の共有語彙。PR #8 レビュー指摘を反映し新設）
+    color.rs              # Rgb / ThemePalette——Issue #76の resolve_color が返す解決済み色の型
 
   resolve/                  # フェーズ4: 分析と遅延解決（I/O非依存、model::Sheet のみで動作）
     mod.rs                # フェーズ4の解決処理のエントリポイント
     shared_strings.rs     # 共有文字列(SST)のインデックス解決
     merge.rs              # 結合セルの遅延解決・エイリアス参照マッピング
     style.rs              # セルスタイルの適用
+    column_width.rs       # <cols>列幅範囲の遅延解決（Issue #39）
+    hyperlink.rs          # <hyperlink>範囲の重複検証+スイープラインによる解決（Issue #95）
+    color.rs              # ColorRef -> Rgb のオンデマンド解決（Issue #76。セル単位パイプラインには含まれない）
 
   json.rs                   # フェーズ5: row_span/col_span を含むJSONシリアライズ
 ```
@@ -85,9 +90,9 @@ ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブ�
 
 - 各パーサー（`workbook.rs` / `worksheet.rs` 等）が個別に `Reader` を初期化すると設定漏れのリスクがあるため、`parse/mod.rs` にセキュアな `Reader` 生成専用のファクトリ関数（例: `create_secure_reader`）を設け、XXE対策の一元適用を強制する。`parse/` 配下の各モジュールはこのファクトリ経由でのみ `Reader` を取得する。
 
-`parse/worksheet.rs` は行/セルデータと `<mergeCells>` 情報をストリームで順次送出する。
+`parse/worksheet.rs` は行/セルデータと `<mergeCells>`/`<cols>`/`<hyperlinks>` 情報をストリームで順次送出する。`parse/theme.rs` は「使う時だけ読む」方針で、`parse/styles.rs` が実際にテーマ色を参照するスタイルを解決した場合のみ読み込む（Issue #76）。
 
-- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [mod.md](parse/mod.md) / [relationships.md](parse/relationships.md) / [workbook.md](parse/workbook.md) / [shared_strings.md](parse/shared_strings.md) / [styles.md](parse/styles.md) / [worksheet.md](parse/worksheet.md)
+- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [mod.md](parse/mod.md) / [relationships.md](parse/relationships.md) / [workbook.md](parse/workbook.md) / [shared_strings.md](parse/shared_strings.md) / [styles.md](parse/styles.md) / [theme.md](parse/theme.md) / [worksheet.md](parse/worksheet.md) / [drawing.md](parse/drawing.md)
 
 ### `model/`
 
@@ -95,7 +100,7 @@ ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブ�
 
 この疎行列という選択は、[README.mdのBenchmarks節](../../README.md#benchmarks)で密な`Vec`を使う読み取りライブラリ(`calamine`)と直接比較・計測されている——対象は`tests/fixtures/complex/extreme_sparse.xlsx`(Excelの実際の対角にある2セルのみ populated。境界矩形サイズの確保を試みると171億8千万要素になる)。`xlsxparser`は正確に2件のマップエントリで済み数ミリ秒で完了するのに対し、密な配列を使う読み取りライブラリは数GBまでメモリを膨張させた末にOSにkillされる。READMEのリソース使用量の時系列プロット(`docs/benchmarks/extreme_sparse_memory.svg`)がこれを理論上の話ではなく具体的に示している。
 
-- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [mod.md](model/mod.md) / [cell.md](model/cell.md) / [sheet.md](model/sheet.md) / [workbook.md](model/workbook.md) / [style.md](model/style.md)
+- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [mod.md](model/mod.md) / [cell.md](model/cell.md) / [sheet.md](model/sheet.md) / [workbook.md](model/workbook.md) / [style.md](model/style.md) / [color.md](model/color.md)
 
 ### `resolve/`
 
@@ -104,8 +109,11 @@ ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブ�
 - `shared_strings.rs`: `t="s"` のインデックスを `SharedStringTable` の実文字列に解決する。
 - `merge.rs`: ストリーム完了後に `<mergeCells>` の結合範囲リストとセルデータを突き合わせ、仮想セル座標から起点セルへのエイリアス参照をマッピングする。
 - `style.rs`: `styles.xml` から解決済みの書式情報をセルに適用する。
+- `column_width.rs`: `<cols>` の列幅範囲を検証(開始・終了の大小関係、重複、件数上限)し `Sheet` へ登録する(Issue #39)。
+- `hyperlink.rs`: `<hyperlink>` 範囲を`resolve::merge`と同型の重複検証にかけたうえで、既にセル化済みの全カバーセルへ1回のスイープラインパスで解決する(Issue #95)——`Sheet::finalize_merges`が結合セルについて解消したのと同じ理由で、セル単位の走査は行わない。
+- `color.rs`: 上記のセル単位パイプラインには含まれない——`resolve_color`は`ColorRef`から`Rgb`への変換を呼び出し元が実際に必要な時だけ呼ぶ、純粋なオンデマンド関数(Issue #76)。
 
-- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [mod.md](resolve/mod.md) / [shared_strings.md](resolve/shared_strings.md) / [merge.md](resolve/merge.md) / [style.md](resolve/style.md)
+- 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [mod.md](resolve/mod.md) / [shared_strings.md](resolve/shared_strings.md) / [merge.md](resolve/merge.md) / [style.md](resolve/style.md) / [column_width.md](resolve/column_width.md) / [hyperlink.md](resolve/hyperlink.md) / [color.md](resolve/color.md)
 
 ### `json.rs`
 

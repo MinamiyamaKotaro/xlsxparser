@@ -29,21 +29,26 @@ src/
     workbook.rs           # Parsing of workbook.xml
     shared_strings.rs     # Parsing of sharedStrings.xml (extracting structured SST data)
     styles.rs             # Parsing of styles.xml (fonts/fills/borders/numFmts/cellXfs)
-    worksheet.rs          # Phase 3: SAX-style stream parse of sheetX.xml (per-row disposal completes here)
+    theme.rs              # Parsing of theme{N}.xml's <clrScheme> (Issue #76; read only when a style references a theme color)
+    worksheet.rs          # Phase 3: SAX-style stream parse of sheetX.xml (per-row disposal completes here); also collects <mergeCells>/<cols>/<hyperlinks> (Issue #95) for Phase 4
     drawing.rs             # Phase 3.5: parses drawingN.xml's image anchors (Issue #65)
 
   model/                    # Pure domain model (no dependency on XML parsing or resolution logic)
     mod.rs
     cell.rs               # CellValue, Cell, CellRef (A1 notation <-> coordinates)
-    sheet.rs              # Sparse matrix Sheet (BTreeMap<(u32, u32), Cell>)
+    sheet.rs              # Sparse matrix Sheet (BTreeMap<CellRef, Cell>), merged regions, column widths, images, hyperlinks
     workbook.rs           # Resolved Workbook model
-    style.rs              # ResolvedStyle / StyleSheet / StyleId (shared vocabulary between parse/styles.rs and resolve/style.rs; added per PR #8 review feedback)
+    style.rs              # ResolvedStyle / StyleSheet / StyleId / Borders (shared vocabulary between parse/styles.rs and resolve/style.rs; added per PR #8 review feedback)
+    color.rs              # Rgb / ThemePalette — the resolved-color types Issue #76's resolve_color returns
 
   resolve/                  # Phase 4: analysis and deferred resolution (I/O-independent, operates only on model::Sheet)
     mod.rs                # Entry point for Phase 4 resolution processing
     shared_strings.rs     # Index resolution of shared strings (SST)
     merge.rs              # Deferred resolution of merged cells / alias reference mapping
     style.rs              # Applying cell styles
+    column_width.rs       # Deferred resolution of <cols> column-width ranges (Issue #39)
+    hyperlink.rs          # Overlap validation + sweep-line resolution of <hyperlink> ranges (Issue #95)
+    color.rs              # On-demand ColorRef -> Rgb resolution (Issue #76; not part of the per-cell pipeline — a display-oriented API called only when a caller needs it)
 
   json.rs                   # Phase 5: JSON serialization including row_span/col_span
 ```
@@ -85,9 +90,9 @@ The layer that aggregates dependencies on XML parsing libraries such as `quick-x
 
 - Since each parser (`workbook.rs` / `worksheet.rs`, etc.) initializing its own `Reader` individually risks missing the configuration, `parse/mod.rs` provides a dedicated factory function for secure `Reader` creation (e.g. `create_secure_reader`) to enforce XXE countermeasures uniformly. Every module under `parse/` obtains its `Reader` only through this factory.
 
-`parse/worksheet.rs` streams out row/cell data and `<mergeCells>` information sequentially.
+`parse/worksheet.rs` streams out row/cell data and `<mergeCells>`/`<cols>`/`<hyperlinks>` information sequentially. `parse/theme.rs` is read on a "pay for what you use" basis — only when `parse/styles.rs` actually resolved a style referencing a theme color (Issue #76).
 
-- Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [mod.md](parse/mod.en.md) / [relationships.md](parse/relationships.en.md) / [workbook.md](parse/workbook.en.md) / [shared_strings.md](parse/shared_strings.en.md) / [styles.md](parse/styles.en.md) / [worksheet.md](parse/worksheet.en.md)
+- Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [mod.md](parse/mod.en.md) / [relationships.md](parse/relationships.en.md) / [workbook.md](parse/workbook.en.md) / [shared_strings.md](parse/shared_strings.en.md) / [styles.md](parse/styles.en.md) / [theme.md](parse/theme.en.md) / [worksheet.md](parse/worksheet.en.md) / [drawing.md](parse/drawing.en.md)
 
 ### `model/`
 
@@ -95,7 +100,7 @@ Defines pure Rust data structures such as `Cell` / `Sheet` / `Workbook`. Has no 
 
 This sparse-matrix choice is what [README.md's Benchmarks section](../../README.md#benchmarks) measures directly against a dense-`Vec`-backed reader (`calamine`) on `tests/fixtures/complex/extreme_sparse.xlsx` — two cells at Excel's actual opposite corners, so a bounding-box-sized allocation is 17.18 billion elements. `xlsxparser` costs exactly 2 map entries and finishes in single-digit milliseconds; the dense-array reader gets killed by the OS after climbing to multiple GB of resident memory. The README's resource-over-time plot (`docs/benchmarks/extreme_sparse_memory.svg`) makes this concrete rather than theoretical.
 
-- Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [mod.md](model/mod.en.md) / [cell.md](model/cell.en.md) / [sheet.md](model/sheet.en.md) / [workbook.md](model/workbook.en.md) / [style.md](model/style.en.md)
+- Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [mod.md](model/mod.en.md) / [cell.md](model/cell.en.md) / [sheet.md](model/sheet.en.md) / [workbook.md](model/workbook.en.md) / [style.md](model/style.en.md) / [color.md](model/color.en.md)
 
 ### `resolve/`
 
@@ -104,8 +109,11 @@ Responsible for Phase 4's analysis and deferred resolution. Since it has no depe
 - `shared_strings.rs`: resolves `t="s"` indices to the actual strings in the `SharedStringTable`.
 - `merge.rs`: after the stream completes, matches the merged-range list from `<mergeCells>` against the collected cell data, mapping alias references from virtual cell coordinates to their origin cell.
 - `style.rs`: applies resolved formatting information from `styles.xml` to cells.
+- `column_width.rs`: validates `<cols>` column-width ranges (start/end ordering, overlap, a count cap — Issue #39) and registers them onto `Sheet`.
+- `hyperlink.rs`: validates `<hyperlink>` ranges the same way (`resolve::merge`'s overlap-validation shape) and resolves each already-populated covered cell to its hyperlink in a single sweep-line pass (Issue #95) — never a per-cell scan, the same complexity concern `Sheet::finalize_merges` addresses for merges.
+- `color.rs`: not part of the per-cell pipeline above — `resolve_color` is a pure, on-demand function (`ColorRef` → `Rgb`) a caller invokes only when it actually needs a displayed color (Issue #76).
 
-- Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [mod.md](resolve/mod.en.md) / [shared_strings.md](resolve/shared_strings.en.md) / [merge.md](resolve/merge.en.md) / [style.md](resolve/style.en.md)
+- Detailed design (per-module design docs in progress under Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3)): [mod.md](resolve/mod.en.md) / [shared_strings.md](resolve/shared_strings.en.md) / [merge.md](resolve/merge.en.md) / [style.md](resolve/style.en.md) / [column_width.md](resolve/column_width.en.md) / [hyperlink.md](resolve/hyperlink.en.md) / [color.md](resolve/color.en.md)
 
 ### `json.rs`
 
