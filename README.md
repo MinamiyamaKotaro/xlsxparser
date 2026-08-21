@@ -487,6 +487,15 @@ after (this fix, v0.10.1)
 
 ### Real-world merge-heavy worksheet vs. calamine
 
+> **Note: Different Goals, Different Results**
+>
+> `calamine` specializes in raw data extraction, so it ignores blank cells
+> that carry only styling. `xlsxparser`, by contrast, aims for complete
+> reproduction of appearance and diffs, so it keeps every blank cell that
+> carries nothing but a background fill or a border. In the real-world-file
+> benchmark below, note that the two libraries are extracting a fundamentally
+> different amount of information (resolution).
+
 The two benchmarks above are synthetic stress tests. This one is a real,
 hand-authored file: `tests/fixtures/other/standard_skill_sheet.xlsx`, a
 skills-matrix spreadsheet with 155 merged cells arranged irregularly (`A1:D11`,
