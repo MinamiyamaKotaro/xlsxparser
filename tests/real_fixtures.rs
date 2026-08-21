@@ -303,6 +303,39 @@ fn real_extreme_sparse_xlsx_registers_only_the_two_populated_cells() {
 }
 
 #[test]
+fn real_styled_borders_xlsx_resolves_boxed_and_divider_shapes() {
+    use xlsxparser::Borders;
+
+    // scripts/generate_real_fixtures.py's styled_borders(): A1 boxed on
+    // all four sides, A2 a top-only "row divider", A3 (no style at all)
+    // implicitly no border.
+    let workbook = parse_workbook(fixture_path("complex/styled_borders.xlsx")).unwrap();
+    let sheet = &workbook.sheets()[0];
+
+    let a1 = sheet.get(CellRef { row: 1, col: 1 }).unwrap();
+    assert_eq!(
+        a1.style.as_ref().unwrap().borders,
+        Borders {
+            top: true,
+            right: true,
+            bottom: true,
+            left: true,
+        }
+    );
+
+    let a2 = sheet.get(CellRef { row: 2, col: 1 }).unwrap();
+    assert_eq!(
+        a2.style.as_ref().unwrap().borders,
+        Borders {
+            top: true,
+            right: false,
+            bottom: false,
+            left: false,
+        }
+    );
+}
+
+#[test]
 fn real_styled_fill_color_xlsx_resolves_rgb_and_theme_fills() {
     use xlsxparser::ColorRef;
 

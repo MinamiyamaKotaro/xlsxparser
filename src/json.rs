@@ -6,8 +6,8 @@
 
 use crate::error::Error;
 use crate::model::{
-    Alignment, AnchorMarker, Cell, CellRef, CellValue, ColWidthRange, ColorRef, DateTimeValue,
-    Hyperlink, Image, ImageAnchor, Sheet, SheetVisibility, Workbook,
+    Alignment, AnchorMarker, Borders, Cell, CellRef, CellValue, ColWidthRange, ColorRef,
+    DateTimeValue, Hyperlink, Image, ImageAnchor, Sheet, SheetVisibility, Workbook,
 };
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Serialize, Serializer};
@@ -222,6 +222,36 @@ struct JsonStyle {
     fill_fg_color: Option<JsonColorRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fill_bg_color: Option<JsonColorRef>,
+    /// Omitted when no side carries a border at all (`Borders::any()` is
+    /// `false` — most cells) rather than emitted as
+    /// `{"top":false,"right":false,"bottom":false,"left":false}` (Issue
+    /// #97) — same "nothing to report" treatment as `fillFgColor`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    borders: Option<JsonBorders>,
+}
+
+/// `Borders`'s JSON form (Issue #97) — a plain, non-tagged object (unlike
+/// `JsonColorRef`, no variant to distinguish). All four fields are always
+/// present together when the object itself is present at all (mirrors
+/// `rowSpan`/`colSpan`'s single-value "all or nothing" omission, not
+/// `fillFgColor`/`fillBgColor`'s per-field omission — a per-side `false`
+/// is meaningful information here, not "nothing to report").
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct JsonBorders {
+    top: bool,
+    right: bool,
+    bottom: bool,
+    left: bool,
+}
+
+fn borders_to_json(b: &Borders) -> Option<JsonBorders> {
+    b.any().then_some(JsonBorders {
+        top: b.top,
+        right: b.right,
+        bottom: b.bottom,
+        left: b.left,
+    })
 }
 
 /// `ColorRef`'s JSON form (Issue #75), tagged the same way `JsonCellValue`
@@ -296,6 +326,7 @@ fn cell_to_json(sheet: &Sheet, cell_ref: CellRef, cell: &Cell) -> JsonCell {
             number_format: s.number_format.as_deref().map(str::to_string),
             fill_fg_color: s.fill_fg_color.as_ref().map(color_ref_to_json),
             fill_bg_color: s.fill_bg_color.as_ref().map(color_ref_to_json),
+            borders: borders_to_json(&s.borders),
         }),
         hyperlink: sheet.hyperlink_at(cell_ref).map(hyperlink_to_json),
     }
@@ -690,6 +721,55 @@ mod tests {
 
         assert!(cell_json["style"].get("fillFgColor").is_none());
         assert!(cell_json["style"].get("fillBgColor").is_none());
+    }
+
+    #[test]
+    fn styled_cell_with_borders_reports_all_four_sides_together() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.insert_cell(
+            CellRef { row: 1, col: 1 },
+            Cell {
+                value: Some(CellValue::Number(1.0)),
+                style: Some(Arc::new(ResolvedStyle {
+                    borders: crate::model::Borders {
+                        top: true,
+                        right: false,
+                        bottom: false,
+                        left: false,
+                    },
+                    ..Default::default()
+                })),
+            },
+        );
+        let workbook = Workbook::new(vec![sheet], None);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cell_json = &parsed["sheets"][0]["cells"][0];
+
+        assert_eq!(
+            cell_json["style"]["borders"],
+            serde_json::json!({"top": true, "right": false, "bottom": false, "left": false})
+        );
+    }
+
+    #[test]
+    fn styled_cell_without_any_border_omits_the_field_entirely() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.insert_cell(
+            CellRef { row: 1, col: 1 },
+            Cell {
+                value: Some(CellValue::Number(1.0)),
+                style: Some(Arc::new(ResolvedStyle::default())),
+            },
+        );
+        let workbook = Workbook::new(vec![sheet], None);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let cell_json = &parsed["sheets"][0]["cells"][0];
+
+        assert!(cell_json["style"].get("borders").is_none());
     }
 
     #[test]

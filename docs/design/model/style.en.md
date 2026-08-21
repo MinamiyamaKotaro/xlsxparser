@@ -42,6 +42,30 @@ impl Default for Font {
     }
 }
 
+/// Which sides of a cell carry a border (Issue #97) — presence only, not
+/// line style/weight or color, the same "not a full transcription" policy
+/// `Font` already follows: the grid-paper-detection use case that
+/// motivated this only needs to know *whether* a cell is boxed in, not
+/// how. `<diagonal>` is not tracked — grid-paper detection has no stated
+/// need for it, and Excel's own UI rarely exposes it either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Borders {
+    pub top: bool,
+    pub right: bool,
+    pub bottom: bool,
+    pub left: bool,
+}
+
+impl Borders {
+    /// Whether any side carries a border at all — `json.rs` uses this to
+    /// decide whether to emit a `borders` object at all, the same sparse-
+    /// output principle `col_width_ranges`/`fill_fg_color` already follow
+    /// (most cells have no border on any side).
+    pub fn any(&self) -> bool {
+        self.top || self.right || self.bottom || self.left
+    }
+}
+
 /// `<xf><alignment horizontal=".."/></xf>`'s horizontal alignment (ECMA-376
 /// `ST_HorizontalAlignmentValues`), Issue #42. An `enum` rather than a
 /// string so it stays a cheap `Copy` value (Issue #42's stated performance
@@ -94,8 +118,13 @@ pub struct ResolvedStyle {
     pub fill_fg_color: Option<ColorRef>,
     /// Same as `fill_fg_color`, for `<bgColor>`.
     pub fill_bg_color: Option<ColorRef>,
-    // Concrete fields for border etc. will be added as their own
-    // sub-issues land (see Open Question 1).
+    /// `<xf borderId="..">` resolved against `<borders>` (Issue #97),
+    /// presence-only per side. Nested (like `font: Font`) rather than
+    /// flattened into four top-level fields — `Borders`'s four booleans
+    /// naturally group as one concept the way `Font`'s `size_pt`/`bold`
+    /// do, unlike `fill_fg_color`/`fill_bg_color`'s split (which exists so
+    /// each can be diffed as an independent `Option<ColorRef>`).
+    pub borders: Borders,
 }
 
 /// A cell fill's foreground/background color, exactly as `<fgColor>`/
@@ -147,5 +176,5 @@ Not applicable. Since this file contains only type definitions, it has no unit t
 
 ## Open Questions
 
-1. **Concrete style elements such as fill/border/wrap/alignment**: further resolved — `font: Font { size_pt, bold }` (Issue #38), `wrap_text: bool` (Issue #37, the overflow-heuristic gate), `number_format: Option<Arc<str>>` (Issue #41), `horizontal_alignment: Alignment` (Issue #42), and `fill_fg_color`/`fill_bg_color: Option<ColorRef>` (Issue #75) are all implemented. Every sub-issue under [Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36) is now resolved, plus the follow-on fill-color issue. `ColorRef` is kept raw/unresolved (`Rgb`/`Theme{index,tint}`/`Indexed`, not a final RGB value) — resolving it to an actual display color is Issue #76, a separate display-oriented concern this file's diff-oriented scope doesn't need. Font color, border, italic, underline, and any other `CT_Font`/`CT_Border` property, plus every other `CT_CellAlignment` attribute besides `wrapText`/`horizontal` (vertical alignment, indent, text rotation, ...), remain out of scope until a concrete downstream use case names them — the same "not a full transcription" policy `Font` already follows.
+1. **Concrete style elements such as fill/border/wrap/alignment**: further resolved — `font: Font { size_pt, bold }` (Issue #38), `wrap_text: bool` (Issue #37, the overflow-heuristic gate), `number_format: Option<Arc<str>>` (Issue #41), `horizontal_alignment: Alignment` (Issue #42), `fill_fg_color`/`fill_bg_color: Option<ColorRef>` (Issue #75), and `borders: Borders` (Issue #97, presence-only per side) are all implemented. Every sub-issue under [Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36) is now resolved, plus the follow-on fill-color and border issues. `ColorRef` is kept raw/unresolved (`Rgb`/`Theme{index,tint}`/`Indexed`, not a final RGB value) — resolving it to an actual display color is Issue #76, a separate display-oriented concern this file's diff-oriented scope doesn't need. Font color, border *line style/weight/color* (as opposed to presence, which Issue #97 covers), italic, underline, and any other `CT_Font`/`CT_Border` property, plus every other `CT_CellAlignment` attribute besides `wrapText`/`horizontal` (vertical alignment, indent, text rotation, ...) and `<diagonal>` border, remain out of scope until a concrete downstream use case names them — the same "not a full transcription" policy `Font` already follows.
 2. ~~Where the date/time format determination logic lives~~ → **Resolved**: [`parse/styles.rs`](../parse/styles.en.md) owns classifying `ResolvedStyle::is_date_time` from `numFmtId`/`formatCode` (the same point as [resolve/style.md Open Question 2](../resolve/style.en.md)). The heuristic's precision itself remains open — see [parse/styles.md Open Question 2](../parse/styles.en.md).

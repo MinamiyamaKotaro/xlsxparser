@@ -148,6 +148,25 @@ sheet with a single merged region, `A1:C3`, holding one text cell):
     the actual displayed color *is* needed, `resolve_color` converts any
     of these three forms to a real RGB value on demand — see
     [Resolving display colors](#resolving-display-colors) below.
+  - `borders`: `{"top": bool, "right": bool, "bottom": bool, "left": bool}`
+    — whether each side carries a border at all (line style/weight/color
+    are not reported; `<diagonal>` is not tracked). Omitted entirely when
+    no side has one, the same "nothing to report" treatment as
+    `fillFgColor`/`fillBgColor` — never emitted as all-`false`.
+- `hyperlink` is present only when the cell carries one (omitted
+  otherwise, not emitted as `"hyperlink": {}`): `{"target": "...",
+  "location": "...", "tooltip": "..."}`, each field itself omitted when
+  absent. `target` is the resolved external URL or internal part path
+  (from the worksheet's own relationships); `location` is an in-workbook
+  jump (e.g. `"Sheet2!A1"`) present on internal hyperlinks instead of, or
+  alongside, `target`. Kept raw, exactly like `fillFgColor`/`fillBgColor`
+  — the target/location string is never checked for existence and never
+  fetched, so a hyperlink pointing at a since-deleted sheet or a dead URL
+  still round-trips unchanged (diffing, not following, is the point). A
+  `ref` spanning multiple cells (`<hyperlink ref="A1:B1">`) attaches
+  independently to every cell in the range that already carries a value
+  or style of its own; a cell with no value/style/hyperlink of its own is
+  never materialized, even inside such a range.
 - `images` is the sheet's cell-anchored embedded images (always present,
   even as an empty array — unlike `style`, which is omitted per-cell when
   absent). See [Embedded images](#embedded-images) below for its shape.
@@ -256,8 +275,8 @@ with a hyperlink; `cells`/`columns` omitted below for brevity):
   and reading it would scale memory use with image count rather than
   cell count).
 - `hyperlink` is the image's own hyperlink (`a:hlinkClick`), distinct from
-  a cell hyperlink (not parsed by this library). Omitted when the image
-  carries none. An `Internal` (in-package) target resolves to a
+  a cell hyperlink (a `JsonCell`-level field — see above). Omitted when the
+  image carries none. An `Internal` (in-package) target resolves to a
   ZIP-entry-name-equivalent path the same way `target` does; an
   `External` one (a URL, as above) is kept verbatim.
 - Grouped images (`<xdr:grpSp>`) resolve each contained `<xdr:pic>`'s
@@ -359,17 +378,23 @@ src/
   handling, CDATA runs, and the `_x000D_` escape Excel uses for a literal CR)
 - `xl/styles.xml` (font size/bold, horizontal alignment, wrap text,
   number format — both the built-in numFmtId table (ECMA-376 §18.8.30) and
-  custom `<numFmt>` codes — and fill color, kept in its raw `rgb`/
-  `theme`+`tint`/`indexed` form; see
+  custom `<numFmt>` codes — fill color, kept in its raw `rgb`/
+  `theme`+`tint`/`indexed` form (see
   [Resolving display colors](#resolving-display-colors) for converting it
-  to a real RGB value)
+  to a real RGB value), and border presence per side — line style/weight/
+  color and `<diagonal>` are not read)
 - `xl/theme/theme{N}.xml` (`<clrScheme>`'s 12 colors — read only when a
   style actually references a theme color; see
   [Resolving display colors](#resolving-display-colors))
 - `xl/worksheets/sheetX.xml` (`<sheetData>` — including `t="d"` ISO 8601
   date cells alongside the numeric-serial dates every other date/time
-  cell uses, both unified into the same `"dateTime"` output — and
-  `<mergeCells>`)
+  cell uses, both unified into the same `"dateTime"` output —
+  `<mergeCells>`, and `<hyperlinks>`, kept raw/unresolved — see the
+  `hyperlink` field above)
+- `xl/worksheets/_rels/sheetX.xml.rels` (resolves a `<hyperlink r:id="...">`
+  to its raw Target string — read only when the sheet declares at least
+  one hyperlink with an `r:id`; a `location`-only internal hyperlink never
+  triggers this read)
 - `xl/drawings/drawingN.xml` and its own `_rels` (cell-anchored embedded
   images — anchor geometry, the embedded media's resolved path, and the
   image's own hyperlink, including images nested in `<xdr:grpSp>` groups;

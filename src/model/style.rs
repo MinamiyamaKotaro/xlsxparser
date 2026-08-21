@@ -71,6 +71,30 @@ pub enum ColorRef {
     Indexed(u32),
 }
 
+/// Which sides of a cell carry a border (Issue #97) — presence only, not
+/// line style/weight or color, the same "not a full transcription" policy
+/// `Font` already follows: the grid-paper-detection use case that
+/// motivated this only needs to know *whether* a cell is boxed in, not
+/// how. `<diagonal>` is not tracked — grid-paper detection has no stated
+/// need for it, and Excel's own UI rarely exposes it either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Borders {
+    pub top: bool,
+    pub right: bool,
+    pub bottom: bool,
+    pub left: bool,
+}
+
+impl Borders {
+    /// Whether any side carries a border at all — `json.rs` uses this to
+    /// decide whether to emit a `borders` object at all, the same sparse-
+    /// output principle `fill_fg_color`/`col_width_ranges` already follow
+    /// (most cells have no border on any side).
+    pub fn any(&self) -> bool {
+        self.top || self.right || self.bottom || self.left
+    }
+}
+
 /// `<xf><alignment horizontal=".."/></xf>`'s horizontal alignment (ECMA-376
 /// `ST_HorizontalAlignmentValues`), Issue #42. An `enum` rather than a
 /// string so it stays a cheap `Copy` value (Issue #42's stated performance
@@ -131,8 +155,13 @@ pub struct ResolvedStyle {
     /// — but both are kept since either can independently change between
     /// two versions of a file, which is what a diff cares about.
     pub fill_bg_color: Option<ColorRef>,
-    // Concrete fields for border etc. are added as their own sub-issues
-    // land (see docs/design/model/style.en.md Open Question 1).
+    /// `<xf borderId="..">` resolved against `<borders>` (Issue #97),
+    /// presence-only per side. Nested (like `font: Font`) rather than
+    /// flattened into four top-level fields — `Borders`'s four booleans
+    /// naturally group as one concept the way `Font`'s `size_pt`/`bold`
+    /// do, unlike `fill_fg_color`/`fill_bg_color`'s split (which exists so
+    /// each can be diffed as an independent `Option<ColorRef>`).
+    pub borders: Borders,
 }
 
 /// A table looking up `ResolvedStyle` by `cellXfs` index. Built by

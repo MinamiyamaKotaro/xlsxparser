@@ -524,6 +524,26 @@ def cell_hyperlinks():
     return path
 
 
+def styled_borders():
+    """Cell border presence (Issue #97): a fully boxed cell (all four
+    sides, A1) and a "row divider" cell (top only, A2) — openpyxl's
+    `Border`/`Side` API, real writer output rather than hand-authored XML.
+    """
+    from openpyxl.styles import Border, Side
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    thin = Side(style="thin")
+    ws["A1"] = "boxed"
+    ws["A1"].border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    ws["A2"] = "divider"
+    ws["A2"].border = Border(top=thin)
+    path = os.path.join(COMPLEX_DIR, "styled_borders.xlsx")
+    wb.save(path)
+    return path
+
+
 def multi_sheet_states():
     """Visible / hidden / veryHidden / empty sheets in one workbook."""
     wb = openpyxl.Workbook()
@@ -863,6 +883,7 @@ def main():
         basic_types,
         houganshi_merged,
         cell_hyperlinks,
+        styled_borders,
         multi_sheet_states,
         embedded_image,
         embedded_image_one_cell,
