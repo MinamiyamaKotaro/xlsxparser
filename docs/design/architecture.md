@@ -93,6 +93,8 @@ ZIP(OPC)展開のエントリポイント。Zip Bomb・Zip Slip の検知・ブ�
 
 `Cell` / `Sheet` / `Workbook` などの純粋なRustデータ構造を定義する。XMLパースや解決ロジックへの依存を持たない。疎行列（`BTreeMap<(row, col), Cell>`）によりメモリを最適化する。`BTreeMap`を採用している理由（`HashMap`からの変更）は[model/sheet.md](model/sheet.md)参照。
 
+この疎行列という選択は、[README.mdのBenchmarks節](../../README.md#benchmarks)で密な`Vec`を使う読み取りライブラリ(`calamine`)と直接比較・計測されている——対象は`tests/fixtures/complex/extreme_sparse.xlsx`(Excelの実際の対角にある2セルのみ populated。境界矩形サイズの確保を試みると171億8千万要素になる)。`xlsxparser`は正確に2件のマップエントリで済み数ミリ秒で完了するのに対し、密な配列を使う読み取りライブラリは数GBまでメモリを膨張させた末にOSにkillされる。READMEのリソース使用量の時系列プロット(`docs/benchmarks/extreme_sparse_memory.svg`)がこれを理論上の話ではなく具体的に示している。
+
 - 詳細設計（Issue [#3](https://github.com/MinamiyamaKotaro/xlsxparser/issues/3) で進行中のモジュール別設計書）: [mod.md](model/mod.md) / [cell.md](model/cell.md) / [sheet.md](model/sheet.md) / [workbook.md](model/workbook.md) / [style.md](model/style.md)
 
 ### `resolve/`
