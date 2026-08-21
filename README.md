@@ -485,6 +485,53 @@ after (this fix, v0.10.1)
   Time (mean ± σ):     600.6 ms ±   7.9 ms    4 runs
 ```
 
+### Real-world merge-heavy worksheet vs. calamine
+
+The two benchmarks above are synthetic stress tests. This one is a real,
+hand-authored file: `tests/fixtures/other/standard_skill_sheet.xlsx`, a
+skills-matrix spreadsheet with 155 merged cells arranged irregularly (`A1:D11`,
+`H3:Q3`, `J36:J39`, ...) — the kind of layout that shows up in an actual
+business template, not a stress-test generator.
+
+Comparing `xlsxparser` (`parse_workbook` + `iter_cells`) against `calamine`
+`0.36.1` (`worksheet_range` + `merge_cells_by_sheet_name`, walked and
+merge-resolved the same way), 500 parses averaged in release mode
+(`poc/skillsheet-bench-poc/`, a throwaway comparison crate — `calamine` is
+not, and was never added as, a dependency of the published package):
+
+| | `xlsxparser` | `calamine` |
+|---|---|---|
+| wall time / parse | 16.96 ms | 7.38 ms |
+| instructions / parse | 200,474,727 | 84,912,087 |
+| peak memory footprint | 6.73 MB | 2.38 MB |
+| cells walked | 25,517 | 663 |
+| **time / cell walked** | **665 ns** | 11.13 µs |
+| **instructions / cell walked** | **7,858** | 128,073 |
+| block I/O (read + write ops, 500 iterations) | 0 | 0 |
+
+![xlsxparser vs calamine, scope: xlsxparser walked 25,517 cells, calamine's used-range detection saw only 663 — 38.5x the work, because xlsxparser retains style-only blank cells that calamine never sees](docs/benchmarks/merge_cell_benchmark_scope.png)
+
+Read as a straight wall-clock race, this looks like a 2.3x loss for
+`xlsxparser`. It isn't the same amount of work: `xlsxparser` walked 25,517
+cells, `calamine`'s used-range detection saw only 663. The sheet's real data
+is 38 rows, but whoever authored it in Excel applied fill/border styling
+roughly 1,500 rows deep — `xlsxparser` keeps every one of those style-bearing
+blank cells (retaining exactly this kind of cell-level state is the library's
+purpose; see [Motivation](#motivation)), while `calamine`'s `Range<Data>` has
+no concept of style and never sees them.
+
+Normalized per cell actually walked, the result flips: `xlsxparser` costs
+665 ns and 7,858 instructions per cell against `calamine`'s 11.13 µs and
+128,073 instructions per cell — roughly **16.7x cheaper per cell**.
+`calamine`'s larger per-cell figure isn't inefficiency; it's fixed
+zip-decompression and XML-parse overhead amortized over a denominator 38x
+smaller. On the other two axes both held up cleanly: peak RSS stayed flat
+across all 500 iterations for both (no leak), and `/usr/bin/time -l`'s block
+I/O counters read zero for both, confirming neither ever spills to a temp
+file (see [Architecture](#architecture)).
+
+![xlsxparser vs calamine, wall-clock time: xlsxparser 16.96ms/parse (25,517 cells) vs calamine 7.38ms/parse (663 cells) — but normalized per cell walked, xlsxparser is about 16.7x cheaper (665ns vs 11.13µs)](docs/benchmarks/merge_cell_benchmark_time.png)
+
 ## Security notes
 
 - **Zip Bomb / Zip Slip / XXE**: guarded against at parse time (see
