@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Minamiyama Kotaro
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Parses `xl/styles.xml`'s `<numFmts>`/`<fonts>`/`<fills>`/`<cellXfs>` into
-//! a `StyleSheet` (`cellXfs` index -> `ResolvedStyle`), classifying each
-//! format as date/time or not and resolving each `<xf>`'s font/wrap-text/
-//! fill color.
+//! Parses `xl/styles.xml`'s `<numFmts>`/`<fonts>`/`<fills>`/`<borders>`/
+//! `<cellXfs>` into a `StyleSheet` (`cellXfs` index -> `ResolvedStyle`),
+//! classifying each format as date/time or not and resolving each `<xf>`'s
+//! font/wrap-text/fill color/border presence.
 
 use crate::error::Error;
-use crate::model::{Alignment, ColorRef, Font, ResolvedStyle, StyleId, StyleSheet};
+use crate::model::{Alignment, Borders, ColorRef, Font, ResolvedStyle, StyleId, StyleSheet};
 use crate::parse::{create_secure_reader, optional_attr, read_event, required_attr};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
@@ -84,6 +84,12 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
     let mut num_fmts: HashMap<u32, String> = HashMap::new();
     let mut fonts: Vec<Font> = Vec::new();
     let mut fills: Vec<Fill> = Vec::new();
+    // Collected directly as `model::Borders` (Issue #97) — unlike `fills`,
+    // a parsed `<border>` entry needs no further transformation before
+    // becoming a `ResolvedStyle::borders` value, so there is no need for a
+    // separate parse-only type the way `Fill` exists for `fg`/`bgColor`;
+    // this mirrors `fonts: Vec<Font>` using the model type directly.
+    let mut borders: Vec<Borders> = Vec::new();
     let mut stylesheet: StyleSheet = HashMap::new();
     // Caches the resolved Arc<str> per numFmtId (Issue #41), so a format
     // code shared by many <xf> entries is allocated at most once per unique
@@ -91,12 +97,15 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
     let mut resolved_formats: HashMap<u32, Arc<str>> = HashMap::new();
     let mut in_fonts = false;
     let mut in_fills = false;
+    let mut in_borders = false;
     let mut in_cell_xfs = false;
     let mut next_style_id: StyleId = 0;
 
     // State for the <font> currently being read (between its start and end
     // tag, mirroring parse/worksheet.rs's per-<c> state pattern).
     let mut cur_font: Option<Font> = None;
+    // Same pattern for the <border> currently being read.
+    let mut cur_border: Option<Borders> = None;
     // Same pattern for the <xf> currently being read.
     let mut cur_xf: Option<CurXf> = None;
 
@@ -144,6 +153,68 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
             Event::Start(e) if in_fills && e.local_name().as_ref() == b"fill" => {
                 fills.push(parse_fill_body(&mut xml_reader, path)?);
             }
+            Event::Start(e) if e.local_name().as_ref() == b"borders" => {
+                in_borders = true;
+            }
+            Event::End(e) if e.local_name().as_ref() == b"borders" => {
+                in_borders = false;
+            }
+            Event::Start(e) if in_borders && e.local_name().as_ref() == b"border" => {
+                cur_border = Some(Borders::default());
+            }
+            Event::Empty(e) if in_borders && e.local_name().as_ref() == b"border" => {
+                // A <border/> with no side children at all: registers "no
+                // borders" (mirrors <font/>'s empty-form handling).
+                borders.push(Borders::default());
+            }
+            Event::End(e) if in_borders && e.local_name().as_ref() == b"border" => {
+                if let Some(b) = cur_border.take() {
+                    borders.push(b);
+                }
+            }
+            // Each side's presence is read directly off its own start/
+            // empty tag's `style` attribute — present and not "none" means
+            // a border is drawn there (Issue #97). A nested `<color>` (or
+            // any other child) is never matched, so it falls through to
+            // this loop's default no-op arm regardless of whether the
+            // element is Start (has children) or Empty (self-closing).
+            // <diagonal> is deliberately never matched either.
+            Event::Start(e) | Event::Empty(e)
+                if cur_border.is_some() && e.local_name().as_ref() == b"top" =>
+            {
+                let present = border_side_present(e, path)?;
+                cur_border
+                    .as_mut()
+                    .expect("cur_border.is_some() checked above")
+                    .top = present;
+            }
+            Event::Start(e) | Event::Empty(e)
+                if cur_border.is_some() && e.local_name().as_ref() == b"right" =>
+            {
+                let present = border_side_present(e, path)?;
+                cur_border
+                    .as_mut()
+                    .expect("cur_border.is_some() checked above")
+                    .right = present;
+            }
+            Event::Start(e) | Event::Empty(e)
+                if cur_border.is_some() && e.local_name().as_ref() == b"bottom" =>
+            {
+                let present = border_side_present(e, path)?;
+                cur_border
+                    .as_mut()
+                    .expect("cur_border.is_some() checked above")
+                    .bottom = present;
+            }
+            Event::Start(e) | Event::Empty(e)
+                if cur_border.is_some() && e.local_name().as_ref() == b"left" =>
+            {
+                let present = border_side_present(e, path)?;
+                cur_border
+                    .as_mut()
+                    .expect("cur_border.is_some() checked above")
+                    .left = present;
+            }
             Event::Start(e) | Event::Empty(e)
                 if cur_font.is_some() && e.local_name().as_ref() == b"sz" =>
             {
@@ -188,27 +259,30 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
             // ResolvedStyle itself is only built at End (or immediately for
             // the self-closing form, where no child could follow).
             Event::Start(e) if in_cell_xfs && e.local_name().as_ref() == b"xf" => {
-                let (numfmt_id, font_id, fill_id) = read_xf_ids(e, path)?;
+                let (numfmt_id, font_id, fill_id, border_id) = read_xf_ids(e, path)?;
                 cur_xf = Some(CurXf {
                     numfmt_id,
                     font_id,
                     fill_id,
+                    border_id,
                     wrap_text: false,
                     horizontal_alignment: Alignment::General,
                 });
             }
             Event::Empty(e) if in_cell_xfs && e.local_name().as_ref() == b"xf" => {
-                let (numfmt_id, font_id, fill_id) = read_xf_ids(e, path)?;
+                let (numfmt_id, font_id, fill_id, border_id) = read_xf_ids(e, path)?;
                 push_resolved_style(
                     &mut stylesheet,
                     &mut next_style_id,
                     &num_fmts,
                     &fonts,
                     &fills,
+                    &borders,
                     &mut resolved_formats,
                     numfmt_id,
                     font_id,
                     fill_id,
+                    border_id,
                     false,
                     Alignment::General,
                 );
@@ -221,10 +295,12 @@ pub(crate) fn parse_styles(reader: impl BufRead, path: &str) -> Result<StyleShee
                         &num_fmts,
                         &fonts,
                         &fills,
+                        &borders,
                         &mut resolved_formats,
                         xf.numfmt_id,
                         xf.font_id,
                         xf.fill_id,
+                        xf.border_id,
                         xf.wrap_text,
                         xf.horizontal_alignment,
                     );
@@ -344,15 +420,17 @@ struct CurXf {
     numfmt_id: u32,
     font_id: usize,
     fill_id: usize,
+    border_id: usize,
     wrap_text: bool,
     horizontal_alignment: Alignment,
 }
 
-/// Reads `numFmtId`/`fontId`/`fillId` off an `<xf>` start tag. All three are
-/// optional; absent, unparseable, or (for `fontId`/`fillId`) out of range
-/// against the parsed `<fonts>`/`<fills>` list all degrade gracefully
-/// rather than erroring — resolved by `push_resolved_style`.
-fn read_xf_ids(e: &BytesStart<'_>, path: &str) -> Result<(u32, usize, usize), Error> {
+/// Reads `numFmtId`/`fontId`/`fillId`/`borderId` off an `<xf>` start tag.
+/// All four are optional; absent, unparseable, or (for `fontId`/`fillId`/
+/// `borderId`) out of range against the parsed `<fonts>`/`<fills>`/
+/// `<borders>` list all degrade gracefully rather than erroring —
+/// resolved by `push_resolved_style`.
+fn read_xf_ids(e: &BytesStart<'_>, path: &str) -> Result<(u32, usize, usize, usize), Error> {
     let numfmt_id = optional_attr(e, path, "numFmtId")?
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
@@ -362,7 +440,19 @@ fn read_xf_ids(e: &BytesStart<'_>, path: &str) -> Result<(u32, usize, usize), Er
     let fill_id = optional_attr(e, path, "fillId")?
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
-    Ok((numfmt_id, font_id, fill_id))
+    let border_id = optional_attr(e, path, "borderId")?
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    Ok((numfmt_id, font_id, fill_id, border_id))
+}
+
+/// Reads whether a `<left>`/`<right>`/`<top>`/`<bottom>` side element
+/// carries a border (Issue #97) — its `style` attribute present and not
+/// `"none"`. A side element that's entirely absent from its `<border>`
+/// (never seen by the caller at all), self-closing with no `style`
+/// attribute, or explicitly `style="none"` are all `false`.
+fn border_side_present(e: &BytesStart<'_>, path: &str) -> Result<bool, Error> {
+    Ok(matches!(optional_attr(e, path, "style")?.as_deref(), Some(s) if s != "none"))
 }
 
 /// Resolves one `<xf>`'s `ResolvedStyle` and inserts it at `next_style_id`
@@ -375,10 +465,12 @@ fn push_resolved_style(
     num_fmts: &HashMap<u32, String>,
     fonts: &[Font],
     fills: &[Fill],
+    borders: &[Borders],
     resolved_formats: &mut HashMap<u32, Arc<str>>,
     numfmt_id: u32,
     font_id: usize,
     fill_id: usize,
+    border_id: usize,
     wrap_text: bool,
     horizontal_alignment: Alignment,
 ) {
@@ -390,6 +482,11 @@ fn push_resolved_style(
     // ColorRef::Rgb's Arc<str> already makes this clone a refcount bump
     // rather than a fresh allocation (Issue #75 review discussion).
     let fill = fills.get(fill_id).cloned().unwrap_or_default();
+    // borders is indexed directly by borderId, the same O(1) shape as
+    // fonts/fills (Issue #97) — Borders is Copy, so this is never more
+    // than a stack copy of four bools regardless of how many StyleIds
+    // share the same borderId.
+    let borders = borders.get(border_id).copied().unwrap_or_default();
     stylesheet.insert(
         *next_style_id,
         Arc::new(ResolvedStyle {
@@ -400,6 +497,7 @@ fn push_resolved_style(
             number_format,
             fill_fg_color: fill.fg_color,
             fill_bg_color: fill.bg_color,
+            borders,
         }),
     );
     *next_style_id += 1;
@@ -1065,5 +1163,155 @@ mod tests {
         // Arc pointers must be equal — the refcount-bump behavior the
         // Issue #75 review verified in PoC/issue75-poc-v2.
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn border_with_style_on_every_side_resolves_all_true() {
+        let xml = br#"<styleSheet>
+<borders count="1">
+<border><left style="thin"/><right style="thin"/><top style="thin"/><bottom style="thin"/><diagonal/></border>
+</borders>
+<cellXfs><xf numFmtId="0" borderId="0"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(
+            sheet[&0].borders,
+            Borders {
+                top: true,
+                right: true,
+                bottom: true,
+                left: true,
+            }
+        );
+    }
+
+    #[test]
+    fn border_side_absent_no_style_or_style_none_all_resolve_false() {
+        let xml = br#"<styleSheet>
+<borders count="1">
+<border><left/><right style="none"/><top></top><bottom style="thin"/></border>
+</borders>
+<cellXfs><xf numFmtId="0" borderId="0"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(
+            sheet[&0].borders,
+            Borders {
+                top: false,
+                right: false,
+                bottom: true,
+                left: false,
+            }
+        );
+    }
+
+    #[test]
+    fn fully_empty_border_resolves_default() {
+        let xml = br#"<styleSheet>
+<borders count="2">
+<border/>
+<border></border>
+</borders>
+<cellXfs><xf numFmtId="0" borderId="0"/><xf numFmtId="0" borderId="1"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].borders, Borders::default());
+        assert_eq!(sheet[&1].borders, Borders::default());
+    }
+
+    #[test]
+    fn mixed_sides_resolve_a_row_divider_shape() {
+        let xml = br#"<styleSheet>
+<borders count="1">
+<border><left/><right/><top style="thin"/><bottom style="thin"/></border>
+</borders>
+<cellXfs><xf numFmtId="0" borderId="0"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(
+            sheet[&0].borders,
+            Borders {
+                top: true,
+                right: false,
+                bottom: true,
+                left: false,
+            }
+        );
+    }
+
+    #[test]
+    fn diagonal_and_nested_color_do_not_affect_side_resolution() {
+        let xml = br#"<styleSheet>
+<borders count="1">
+<border><left style="thin"><color indexed="64"/></left><right/><top/><bottom/><diagonal style="thin"><color indexed="64"/></diagonal></border>
+</borders>
+<cellXfs><xf numFmtId="0" borderId="0"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(
+            sheet[&0].borders,
+            Borders {
+                top: false,
+                right: false,
+                bottom: false,
+                left: true,
+            }
+        );
+    }
+
+    #[test]
+    fn xf_without_border_id_defaults_to_first_border() {
+        let xml = br#"<styleSheet>
+<borders count="1">
+<border><left style="thin"/><right/><top/><bottom/></border>
+</borders>
+<cellXfs><xf numFmtId="0"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert!(sheet[&0].borders.left);
+    }
+
+    #[test]
+    fn border_id_out_of_range_falls_back_to_default_borders() {
+        let xml = br#"<styleSheet>
+<borders count="1">
+<border><left style="thin"/></border>
+</borders>
+<cellXfs><xf numFmtId="0" borderId="5"/></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].borders, Borders::default());
+    }
+
+    #[test]
+    fn no_borders_element_at_all_falls_back_to_default_borders() {
+        let xml = br#"<styleSheet><cellXfs><xf numFmtId="0"/></cellXfs></styleSheet>"#;
+        let sheet = parse(xml);
+        assert_eq!(sheet[&0].borders, Borders::default());
+    }
+
+    #[test]
+    fn borders_resolve_independently_of_fill_font_and_wrap_text() {
+        let xml = br#"<styleSheet>
+<fonts count="1"><font><b/><sz val="14"/></font></fonts>
+<fills count="1"><fill><patternFill patternType="solid"><fgColor rgb="FFFF0000"/></patternFill></fill></fills>
+<borders count="1"><border><left style="thin"/><right/><top/><bottom/></border></borders>
+<cellXfs><xf numFmtId="0" fontId="0" fillId="0" borderId="0"><alignment wrapText="1"/></xf></cellXfs>
+</styleSheet>"#;
+        let sheet = parse(xml);
+        assert!(sheet[&0].borders.left);
+        assert!(!sheet[&0].borders.right);
+        assert_eq!(
+            sheet[&0].font,
+            Font {
+                size_pt: 14.0,
+                bold: true
+            }
+        );
+        assert_eq!(
+            sheet[&0].fill_fg_color,
+            Some(ColorRef::Rgb(Arc::from("FFFF0000")))
+        );
+        assert!(sheet[&0].wrap_text);
     }
 }

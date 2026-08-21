@@ -171,6 +171,27 @@ struct JsonStyle {
     fill_fg_color: Option<JsonColorRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fill_bg_color: Option<JsonColorRef>,
+    /// Omitted when no side carries a border at all (`Borders::any()` is
+    /// `false` — most cells) rather than emitted as
+    /// `{"top":false,"right":false,"bottom":false,"left":false}` (Issue
+    /// #97) — same "nothing to report" treatment as `fillFgColor`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    borders: Option<JsonBorders>,
+}
+
+/// `Borders`'s JSON form (Issue #97) — a plain, non-tagged object (unlike
+/// `JsonColorRef`, no variant to distinguish). All four fields are always
+/// present together when the object itself is present at all (mirrors
+/// `rowSpan`/`colSpan`'s single-value "all or nothing" omission, not
+/// `fillFgColor`/`fillBgColor`'s per-field omission — a per-side `false`
+/// is meaningful information here, not "nothing to report").
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonBorders {
+    top: bool,
+    right: bool,
+    bottom: bool,
+    left: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -229,8 +250,18 @@ fn cell_to_json(sheet: &Sheet, cell_ref: CellRef, cell: &Cell) -> JsonCell {
             number_format: s.number_format.as_deref().map(str::to_string),
             fill_fg_color: s.fill_fg_color.as_ref().map(color_ref_to_json),
             fill_bg_color: s.fill_bg_color.as_ref().map(color_ref_to_json),
+            borders: borders_to_json(&s.borders),
         }),
     }
+}
+
+fn borders_to_json(b: &Borders) -> Option<JsonBorders> {
+    b.any().then_some(JsonBorders {
+        top: b.top,
+        right: b.right,
+        bottom: b.bottom,
+        left: b.left,
+    })
 }
 
 fn cell_value_to_json(value: Option<&CellValue>) -> JsonCellValue {
@@ -288,7 +319,7 @@ fn visibility_tag(v: SheetVisibility) -> &'static str {
 
 ## Dependencies
 
-- Depends on: [`model/workbook.rs`](model/workbook.en.md) (`Workbook`), [`model/sheet.rs`](model/sheet.en.md) (`Sheet::iter_cells`, `Sheet::merged_region_at`, `Sheet::images`, `SheetVisibility`, `Image`, `ImageAnchor`, `AnchorMarker` — Issue #65), [`model/cell.rs`](model/cell.en.md) (`Cell`, `CellRef`, `CellValue`, `DateTimeValue`), [`model/style.rs`](model/style.en.md) (`Alignment` — read via `s.horizontal_alignment` in `cell_to_json`, converted through `alignment_tag` rather than deriving `Serialize` directly, per this file's own no-`serde`-in-`model/` policy below; `ColorRef` — read via `s.fill_fg_color`/`fill_bg_color`, converted through `color_ref_to_json` the same way), [`error.rs`](error.en.md) (`Error::JsonSerialize` — newly added to represent I/O or serialization failure during streaming writes; added as part of the redesign following the [PR #10 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/10#pullrequestreview-4949223332)), the external `serde` crate (manual and derived `Serialize` impls) and `serde_json` (streaming serialization via `to_writer`). `serde` needs its `rc` feature enabled: `CellValue::Text`'s `Arc<str>` field only gets a `Serialize` impl with that feature on (found at implementation time — without it, `Arc<str>` doesn't implement `Serialize` at all, since serde gates `Rc`/`Arc` support behind `rc` to avoid the footgun of silently duplicating shared data across independent serializations).
+- Depends on: [`model/workbook.rs`](model/workbook.en.md) (`Workbook`), [`model/sheet.rs`](model/sheet.en.md) (`Sheet::iter_cells`, `Sheet::merged_region_at`, `Sheet::images`, `SheetVisibility`, `Image`, `ImageAnchor`, `AnchorMarker` — Issue #65), [`model/cell.rs`](model/cell.en.md) (`Cell`, `CellRef`, `CellValue`, `DateTimeValue`), [`model/style.rs`](model/style.en.md) (`Alignment` — read via `s.horizontal_alignment` in `cell_to_json`, converted through `alignment_tag` rather than deriving `Serialize` directly, per this file's own no-`serde`-in-`model/` policy below; `ColorRef` — read via `s.fill_fg_color`/`fill_bg_color`, converted through `color_ref_to_json` the same way; `Borders` — read via `s.borders`, its four `bool` fields copied directly into `JsonBorders` since a plain `bool` needs no `model`→JSON conversion function the way `ColorRef`/`Alignment` do), [`error.rs`](error.en.md) (`Error::JsonSerialize` — newly added to represent I/O or serialization failure during streaming writes; added as part of the redesign following the [PR #10 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/10#pullrequestreview-4949223332)), the external `serde` crate (manual and derived `Serialize` impls) and `serde_json` (streaming serialization via `to_writer`). `serde` needs its `rc` feature enabled: `CellValue::Text`'s `Arc<str>` field only gets a `Serialize` impl with that feature on (found at implementation time — without it, `Arc<str>` doesn't implement `Serialize` at all, since serde gates `Rc`/`Arc` support behind `rc` to avoid the footgun of silently duplicating shared data across independent serializations).
 - Depended on by: `lib.rs` (calls it explicitly on a `Workbook` — see [pipeline.md Open Question 1](pipeline.en.md); `pipeline.rs`'s `run` itself never calls it)
 
 `JsonWorkbook` / `SheetSeq` / `JsonSheet` / `CellSeq` each hold only a borrow of the model (`&'a Workbook` / `&'a Sheet`), never owning a value. Their `Serialize` impls only walk the model once actually invoked, which naturally lines up with the sequential calls `serde_json::to_writer` makes internally — no intermediate data structure representing a whole sheet or the whole book is ever built on the heap.
@@ -321,12 +352,13 @@ fn visibility_tag(v: SheetVisibility) -> &'static str {
 - **Verify a styled cell with a resolved `number_format` serializes `style.numberFormat` as that string, and that a styled cell with `number_format: None` ("General") omits the field entirely even though `style` itself is present** (Issue #41 — the opposite sparseness decision from `font`/`wrap_text` within the same already-present `style` object, since "General" carries no information a downstream consumer needs)
 - **Verify `style.alignment` is always present (never omitted) and serializes each `Alignment` variant as the matching camelCase string, including `"general"` for the default** (Issue #42 — the same "always present" sparseness decision as `font`/`wrap_text`, not `numberFormat`)
 - **Verify a styled cell with `ColorRef::Rgb`/`Theme`/`Indexed` serializes `style.fillFgColor`/`fillBgColor` tagged the same way `JsonCellValue` is (e.g. `{"type":"rgb","value":"FFFF0000"}`), that a `Theme` with no `tint` serializes `tint` as JSON `null` (not omitted — only the outer `fillFgColor`/`fillBgColor` key itself is ever omitted), and that a cell with no fill color omits both fields entirely** (Issue #75 — the same "opposite sparseness decision from `font`/`wrap_text`" `numberFormat` already established)
+- **Verify a cell with `Borders { top: true, ... }` (any side `true`) serializes `style.borders` as `{"top":true,"right":false,"bottom":false,"left":false}` (all four keys present together, `false` sides not individually omitted), and that a cell with `Borders::default()` (no side at all) omits the `borders` key from `style` entirely** (Issue #97)
 
 ## Open Questions
 
 1. ~~Whether to tag value kinds in the JSON structure~~ → **Resolved**: keep the tagged representation, `{"type": "number", "value": 42}` (reflects the [PR #10 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/10#pullrequestreview-4949223332)). Dropping the tag in favor of native JSON types alone would leave the frontend unable to distinguish `dateTime` from a plain string (`Text`), forcing string parsing wherever a date picker or formatting needs to apply; it would also remove the ability to distinguish `error` (a formula error value) from an ordinary string for grid warning styling; and it would prevent a type-safe TypeScript client built on a Discriminated Union keyed by `type`.
 2. ~~Fallback value for non-finite floating-point numbers (`NaN`/`Infinity`)~~ → **Resolved**: falls back to `JsonCellValue::Empty` (equivalent to `null`) rather than `0.0` (reflects the [PR #10 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/10#pullrequestreview-4949223332)). See Error Handling Policy for details.
 3. ~~`DateTime`'s string representation format~~ → **Resolved** (Issue #40): ISO 8601 without a timezone designator or fractional seconds, e.g. `"2024-01-01T13:45:30"`. A date-only cell serializes with a midnight time component (`T00:00:00`) rather than omitting the time — Excel itself doesn't distinguish date-only from date+time as a type, so there is no extra information to report either way, and a uniform shape is simpler for a downstream consumer to parse than a format that varies cell-to-cell. `format_date_time` now reads `DateTimeValue`'s real `year`/`month`/`day`/`hour`/`minute`/`second` fields (see [model/cell.md Open Question 4](model/cell.en.md), also resolved by Issue #40) directly into this format.
-4. **JSON output of style information**: further resolved — `JsonCell.style.font` (Issue #38), `JsonCell.style.wrapText` (Issue #37), `JsonCell.style.numberFormat` (Issue #41), `JsonCell.style.alignment` (Issue #42), and `JsonCell.style.fillFgColor`/`fillBgColor` (Issue #75) are all implemented as described above. Every sub-issue tracked at [model/style.md Open Question 1](model/style.en.md) is now resolved, plus the follow-on fill-color issue. `fillFgColor`/`fillBgColor` are kept raw/unresolved (tagged `rgb`/`theme`/`indexed`, not a final displayed color) — resolving them to an actual RGB value for rendering is Issue #76, out of this file's scope.
+4. **JSON output of style information**: further resolved — `JsonCell.style.font` (Issue #38), `JsonCell.style.wrapText` (Issue #37), `JsonCell.style.numberFormat` (Issue #41), `JsonCell.style.alignment` (Issue #42), `JsonCell.style.fillFgColor`/`fillBgColor` (Issue #75), and `JsonCell.style.borders` (Issue #97) are all implemented as described above. Every sub-issue tracked at [model/style.md Open Question 1](model/style.en.md) is now resolved, plus the follow-on fill-color and border issues. `fillFgColor`/`fillBgColor` are kept raw/unresolved (tagged `rgb`/`theme`/`indexed`, not a final displayed color) — resolving them to an actual RGB value for rendering is Issue #76, out of this file's scope. `borders` reports presence only (not line style/weight/color), matching `model::style::Borders`'s own scope.
 5. ~~Peak memory from batch construction~~ → **Resolved**: switched to a streaming design that never pre-builds a `Vec<JsonCell>` — the iterator from `Sheet::iter_cells` is fed directly into `serde::ser::SerializeSeq` inside `CellSeq::serialize` (reflects the [PR #10 review](https://github.com/MinamiyamaKotaro/xlsxparser/pull/10#pullrequestreview-4949223332)). Note that `to_json_string` (the convenience version backed internally by a `Vec<u8>` buffer) still requires O(n) memory proportional to the output size; a caller that truly wants O(1) additional memory needs to pass `to_json_writer` a real I/O destination such as a `BufWriter<File>`. Also, since `Sheet::iter_cells` makes no `ExactSizeIterator` guarantee, `serialize_seq`'s element-count hint is passed as `None` (this doesn't affect the JSON output's correctness, but forgoes a minor optimization opportunity some serializer implementations could otherwise take) — whether [model/sheet.md](model/sheet.en.md) should commit to `ExactSizeIterator` as part of its public API remains an open consideration there.
 6. **Relationship between `to_json_writer`/`to_json_string` and `lib.rs`'s public API**: how `lib.rs` exposes these functions separately from `parse_workbook` (which returns `Workbook`) is tied to [pipeline.md Open Question 1](pipeline.en.md) and is to be settled when `lib.rs` is designed.

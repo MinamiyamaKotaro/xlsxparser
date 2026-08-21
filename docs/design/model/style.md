@@ -42,6 +42,30 @@ impl Default for Font {
     }
 }
 
+/// セルの各辺に罫線があるかどうか(Issue #97)——線種・太さ・色は
+/// 対象外、`Font` が既に採用している「完全な転写はしない」方針と同じ:
+/// この対応の動機になった方眼紙判定ユースケースは、セルが枠で
+/// 囲まれている**かどうか**だけが必要で、どのような線かは不要。
+/// `<diagonal>`(対角線)は対象外——方眼紙判定に必要という要求が無く、
+/// Excel自身のUIでもほとんど使われない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Borders {
+    pub top: bool,
+    pub right: bool,
+    pub bottom: bool,
+    pub left: bool,
+}
+
+impl Borders {
+    /// いずれかの辺に罫線があるか——`json.rs`がこれを使って`borders`
+    /// オブジェクト自体を出力するかどうかを決める。`col_width_ranges`/
+    /// `fill_fg_color`と同じ疎な出力の原則(ほとんどのセルはどの辺にも
+    /// 罫線を持たない)。
+    pub fn any(&self) -> bool {
+        self.top || self.right || self.bottom || self.left
+    }
+}
+
 /// `<xf><alignment horizontal=".."/></xf>` の水平方向配置
 /// (ECMA-376 `ST_HorizontalAlignmentValues`)、Issue #42。文字列ではなく
 /// 列挙型として持つことで、コピー可能な小サイズに収める(Issue #42の
@@ -93,8 +117,14 @@ pub struct ResolvedStyle {
     pub fill_fg_color: Option<ColorRef>,
     /// `fill_fg_color`と同様、`<bgColor>`用。
     pub fill_bg_color: Option<ColorRef>,
-    // border等その他のプロパティは、各サブIssueの実装が進むにつれて
-    // 追加する(オープンクエスチョン1参照)。
+    /// `<xf borderId="..">`を`<borders>`に対して解決したもの(Issue
+    /// #97)、辺ごとの有無のみ。(`font: Font`と同様に)4つのトップ
+    /// レベルフィールドへ展開せずネストする——`Borders`の4つの真偽値は
+    /// `Font`の`size_pt`/`bold`と同じく自然に1つの概念としてまとまる。
+    /// `fill_fg_color`/`fill_bg_color`が分割されているのは、それぞれを
+    /// 独立した`Option<ColorRef>`として個別にdiffできるようにするための
+    /// 別の理由による。
+    pub borders: Borders,
 }
 
 /// セル塗りつぶしの前景色/背景色を、`<fgColor>`/`<bgColor>`が指定する
@@ -145,5 +175,5 @@ pub type StyleSheet = HashMap<StyleId, Arc<ResolvedStyle>>;
 
 ## 未決事項 / オープンクエスチョン
 
-1. **塗りつぶし/罫線/折返し/配置などの具体的なスタイル要素**: さらに解決が進んだ——`font: Font { size_pt, bold }`(Issue #38)、`wrap_text: bool`(Issue #37、はみ出し判定のゲート条件)、`number_format: Option<Arc<str>>`(Issue #41)、`horizontal_alignment: Alignment`(Issue #42)、`fill_fg_color`/`fill_bg_color: Option<ColorRef>`(Issue #75)をいずれも実装済み。[Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36) 配下のサブIssueに加え、派生の塗りつぶし色Issueも解決済み。`ColorRef`は実RGB値ではなく生の指定(`Rgb`/`Theme{index,tint}`/`Indexed`)のまま保持する——実際の表示色への解決は別の表示用途の関心事(Issue #76)であり、本ファイルのdiff指向のスコープには不要。フォント色・罫線・斜体・下線などその他の `CT_Font`/`CT_Border` プロパティ、および `wrapText`/`horizontal` 以外の `CT_CellAlignment` の属性(垂直方向配置、インデント、テキスト回転等)は、具体的な下流ユースケースが現れるまでスコープ外のまま(`Font` が既に採用している「完全な転写はしない」方針と同じ)。
+1. **塗りつぶし/罫線/折返し/配置などの具体的なスタイル要素**: さらに解決が進んだ——`font: Font { size_pt, bold }`(Issue #38)、`wrap_text: bool`(Issue #37、はみ出し判定のゲート条件)、`number_format: Option<Arc<str>>`(Issue #41)、`horizontal_alignment: Alignment`(Issue #42)、`fill_fg_color`/`fill_bg_color: Option<ColorRef>`(Issue #75)、`borders: Borders`(Issue #97、辺ごとの有無のみ)をいずれも実装済み。[Issue #36](https://github.com/MinamiyamaKotaro/xlsxparser/issues/36) 配下のサブIssueに加え、派生の塗りつぶし色・罫線Issueも解決済み。`ColorRef`は実RGB値ではなく生の指定(`Rgb`/`Theme{index,tint}`/`Indexed`)のまま保持する——実際の表示色への解決は別の表示用途の関心事(Issue #76)であり、本ファイルのdiff指向のスコープには不要。フォント色・罫線の線種/太さ/色(有無自体はIssue #97で対応済み)・斜体・下線などその他の `CT_Font`/`CT_Border` プロパティ、`wrapText`/`horizontal` 以外の `CT_CellAlignment` の属性(垂直方向配置、インデント、テキスト回転等)、`<diagonal>`罫線は、具体的な下流ユースケースが現れるまでスコープ外のまま(`Font` が既に採用している「完全な転写はしない」方針と同じ)。
 2. ~~日付/時刻書式の判定ロジックの置き場所~~ → **解決**: [`parse/styles.rs`](../parse/styles.md) が `numFmtId`/`formatCode` から `ResolvedStyle::is_date_time` を判定するロジックを持つ（[resolve/style.md オープンクエスチョン2](../resolve/style.md) と同一の論点）。判定ヒューリスティックの精度自体は [parse/styles.md オープンクエスチョン2](../parse/styles.md) として引き続き未解決。

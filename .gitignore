@@ -31,3 +31,6 @@ tests/fixtures/other
 # it appears to work locally on macOS's default case-insensitive one.
 /poc/*
 !/poc/README.md
+
+# scripts/generate_real_fixtures.py's own bytecode cache.
+scripts/__pycache__/
