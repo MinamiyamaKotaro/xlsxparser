@@ -445,6 +445,19 @@ is what gets the process killed.
 the number of populated cells, never to the sheet's addressable bounding
 box — so `extreme_sparse.xlsx` costs `xlsxparser` exactly 2 map entries.
 
+The same run, visualized: resident memory (`ps -o rss`, sampled every
+100 ms) for each process from launch to exit —
+
+![xlsxparser finishes in well under a second at 32 KB resident; calamine climbs to 2.35 GB over 32 seconds before the OS kills it](docs/benchmarks/extreme_sparse_memory.svg)
+
+`xlsxparser`'s line is flat at 32 KB because there's nothing to allocate
+beyond the 2 map entries above; `calamine`'s climbs — noisily, as `Vec`
+reallocates while growing — until the OS sends `SIGKILL` at 32.2 s, peaking
+at 2.35 GB resident on a machine with roughly 58 MB free at the start of
+the run (16 GB total). Sampled at 100 ms granularity via a shell loop
+polling `ps`, not a profiler, so brief spikes between samples aren't
+captured and the true peak may be marginally higher than shown.
+
 ### Sparse merged-cell arrangements
 
 A merge-heavy file could hit an unrelated cost even while respecting every
