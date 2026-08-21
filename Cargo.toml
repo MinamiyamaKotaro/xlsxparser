@@ -1,6 +1,6 @@
 [package]
 name = "xlsxparser"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 description = "A lightweight, high-performance .xlsx (OOXML) parser library"
 repository = "https://github.com/MinamiyamaKotaro/xlsxparser"
