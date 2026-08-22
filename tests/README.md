@@ -43,7 +43,7 @@ together end to end.
 `tests/fixtures/other/` (`.gitignore`d, not part of this repo) holds a
 larger ad hoc corpus of real-world files — currently sourced from
 [calamine](https://github.com/tafia/calamine)'s test corpus — used to
-*discover* compatibility gaps by diffing xlsxparser's output against
+*discover* compatibility gaps by diffing exceldiff's output against
 calamine's, cell by cell (see
 [Issue #52](https://github.com/MinamiyamaKotaro/xlsxparser/issues/52)).
 Every gap found this way that warranted a fix got a hand-authored,
@@ -111,7 +111,7 @@ found — don't let it silently go stale.
 | Corrupted OOXML | ✅ Covered | `error.rs`/`real_error.rs` (truncated/malformed worksheet XML — plus, as of this audit, `workbook.xml`/`styles.xml`/`sharedStrings.xml` bodies via `corrupted_workbook_xml_is_reported_as_xml_parse_error`/`corrupted_styles_xml_is_reported_as_xml_parse_error`/`corrupted_shared_strings_xml_is_reported_as_missing_closing_tag` — the last one surfacing a distinct, more specific `Error::MissingRequiredElement { name: "si/is closing tag" }` rather than a raw `Error::XmlParse`, since `concat_rich_text`'s own EOF check catches that particular truncation shape first; see that test's fixture doc comment — dangling relationships, out-of-bounds SST index, invalid column-width/merge ranges) + `security.rs` (zip bomb, zip slip, XXE) + `src/lib.rs`'s `corrupt_xlsx_errors_propagate_unchanged` (non-ZIP garbage bytes) + `src/container/mod.rs`'s `open_reader_rejects_corrupt_zip_bytes` + `src/pipeline.rs`'s `malformed_worksheet_rels_xml_propagates_parse_error`/`malformed_drawing_rels_xml_propagates_parse_error` (malformed `_rels` XML) + `src/parse/mod.rs`'s invalid-UTF-8-in-`<t>`/CDATA tests. |
 
 Two related, already-triaged cases from Issue #52's own investigation are
-*not* listed as gaps: `issue252.xlsx` (checksum-corrupted; both xlsxparser
+*not* listed as gaps: `issue252.xlsx` (checksum-corrupted; both exceldiff
 and calamine fail on it) and `pass_protected.xlsx` (password-protected;
 same) — both were judged out of scope since no reader can be expected to
 open them.
