@@ -7,7 +7,7 @@
 use crate::error::Error;
 use crate::model::{
     Alignment, AnchorMarker, Borders, Cell, CellRef, CellValue, ColWidthRange, ColorRef,
-    DateTimeValue, Hyperlink, Image, ImageAnchor, Sheet, SheetVisibility, Workbook,
+    DateTimeValue, Hyperlink, Image, ImageAnchor, RowHeightRange, Sheet, SheetVisibility, Workbook,
 };
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Serialize, Serializer};
@@ -82,13 +82,15 @@ struct JsonSheet<'a> {
 
 impl Serialize for JsonSheet<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("Sheet", 8)?;
+        let mut state = serializer.serialize_struct("Sheet", 10)?;
         state.serialize_field("name", &self.sheet.name)?;
         state.serialize_field("visibility", visibility_tag(self.sheet.visibility))?;
         state.serialize_field("maxRow", &self.sheet.max_row)?;
         state.serialize_field("maxCol", &self.sheet.max_col)?;
         state.serialize_field("defaultColumnWidth", &self.sheet.default_col_width())?;
         state.serialize_field("columns", &ColumnSeq { sheet: self.sheet })?;
+        state.serialize_field("defaultRowHeight", &self.sheet.default_row_height())?;
+        state.serialize_field("rows", &RowSeq { sheet: self.sheet })?;
         state.serialize_field("cells", &CellSeq { sheet: self.sheet })?;
         state.serialize_field("images", &ImageSeq { sheet: self.sheet })?;
         state.end()
@@ -124,6 +126,36 @@ impl Serialize for JsonColumn<'_> {
         state.serialize_field("min", &self.0.min)?;
         state.serialize_field("max", &self.0.max)?;
         state.serialize_field("width", &self.0.width)?;
+        state.end()
+    }
+}
+
+/// Emits `Sheet::row_height_ranges` as a sheet-level array
+/// (`[{"min":1,"max":5,"heightPt":15.0}, ...]`) — the row-axis
+/// counterpart of `ColumnSeq`, same sparse-output rationale (Issue #51).
+struct RowSeq<'a> {
+    sheet: &'a Sheet,
+}
+
+impl Serialize for RowSeq<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let ranges = self.sheet.row_height_ranges();
+        let mut seq = serializer.serialize_seq(Some(ranges.len()))?;
+        for range in ranges {
+            seq.serialize_element(&JsonRow(range))?;
+        }
+        seq.end()
+    }
+}
+
+struct JsonRow<'a>(&'a RowHeightRange);
+
+impl Serialize for JsonRow<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("Row", 3)?;
+        state.serialize_field("min", &self.0.min)?;
+        state.serialize_field("max", &self.0.max)?;
+        state.serialize_field("heightPt", &self.0.height_pt)?;
         state.end()
     }
 }
@@ -508,6 +540,8 @@ mod tests {
                     "maxCol": 1,
                     "defaultColumnWidth": null,
                     "columns": [],
+                    "defaultRowHeight": null,
+                    "rows": [],
                     "cells": [
                         {"row": 1, "col": 1, "value": {"type": "number", "value": 42.0}}
                     ],
@@ -873,6 +907,42 @@ mod tests {
         );
         // The columns array is sheet-level, not duplicated onto the cell.
         assert!(sheet_json["cells"][0].get("columnWidth").is_none());
+    }
+
+    #[test]
+    fn row_heights_serialize_as_a_sheet_level_array_not_per_cell() {
+        let mut sheet = sheet_with_one_cell("Sheet1", Some(CellValue::Number(1.0)));
+        sheet.set_row_heights(
+            vec![
+                RowHeightRange {
+                    min: 1,
+                    max: 5,
+                    height_pt: 21.0,
+                },
+                RowHeightRange {
+                    min: 10,
+                    max: 20,
+                    height_pt: 30.0,
+                },
+            ],
+            Some(15.0),
+        );
+        let workbook = Workbook::new(vec![sheet], None);
+
+        let json = to_json_string(&workbook).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let sheet_json = &parsed["sheets"][0];
+
+        assert_eq!(sheet_json["defaultRowHeight"], serde_json::json!(15.0));
+        assert_eq!(
+            sheet_json["rows"],
+            serde_json::json!([
+                {"min": 1, "max": 5, "heightPt": 21.0},
+                {"min": 10, "max": 20, "heightPt": 30.0}
+            ])
+        );
+        // The rows array is sheet-level, not duplicated onto the cell.
+        assert!(sheet_json["cells"][0].get("rowHeight").is_none());
     }
 
     #[test]

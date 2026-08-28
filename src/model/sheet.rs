@@ -47,6 +47,24 @@ pub struct ColWidthRange {
     pub width: f64,
 }
 
+/// A run of consecutive rows sharing one explicit height, in points
+/// (Issue #51 on the sister project, exceldiff — this project mirrors the
+/// same model/parse layer). Unlike `<col min=".." max="..">`, `<row r="N"
+/// ht="..">` is never itself a range in the OOXML schema — every row with
+/// an explicit height gets its own `<row>` element — so
+/// `parse/worksheet.rs` is what coalesces consecutive same-height rows
+/// into one `RowHeightRange` while streaming `<sheetData>`, the same way
+/// `MergedRegion`/`ColWidthRange` avoid a per-unit entry. A real
+/// grid-paper-style worksheet with a uniform height stamped across every
+/// row of a 1,048,576-row sheet collapses to a single range this way
+/// rather than one entry per row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RowHeightRange {
+    pub min: u32,
+    pub max: u32,
+    pub height_pt: f64,
+}
+
 /// A cell-anchored image reference (Issue #65). Holds only the anchor
 /// geometry and the resolved target path of the embedded media part — never
 /// the image's own bytes, which stay out of scope (a diff-oriented tool has
@@ -217,6 +235,15 @@ pub struct Sheet {
     /// itself falls back to a font-metric-derived default in that case,
     /// which this library does not compute — see `column_width`'s doc).
     default_col_width: Option<f64>,
+    /// Row-height ranges (Issue #51), sorted by `min` and mutually
+    /// non-overlapping (`resolve::row_height::resolve` guarantees both
+    /// before calling `set_row_heights`) — the row-axis counterpart of
+    /// `col_widths`.
+    row_heights: Vec<RowHeightRange>,
+    /// `<sheetFormatPr defaultRowHeight="..">`, the height in points for
+    /// any row not covered by `row_heights`. `None` when the attribute is
+    /// absent.
+    default_row_height: Option<f64>,
     /// Images anchored to this sheet (Issue #65). Not keyed by cell — an
     /// anchor's position doesn't always align to a single cell's
     /// boundaries, and unlike a merged region's data, an image isn't
@@ -245,6 +272,8 @@ impl Sheet {
             max_col: 0,
             col_widths: Vec::new(),
             default_col_width: None,
+            row_heights: Vec::new(),
+            default_row_height: None,
             images: Vec::new(),
             hyperlinks: HashMap::new(),
         }
@@ -569,6 +598,45 @@ impl Sheet {
 
     pub fn default_col_width(&self) -> Option<f64> {
         self.default_col_width
+    }
+
+    /// Registers this sheet's row-height ranges (Issue #51). Called once
+    /// by `resolve::row_height::resolve`, which guarantees `ranges` is
+    /// already sorted by `min` and mutually non-overlapping — this method
+    /// trusts that precondition rather than re-validating it, the same
+    /// split `set_col_widths` already uses.
+    pub(crate) fn set_row_heights(&mut self, ranges: Vec<RowHeightRange>, default: Option<f64>) {
+        self.row_heights = ranges;
+        self.default_row_height = default;
+    }
+
+    /// The height of row `row` in points, or `None` if it falls in no
+    /// explicit `<row ht="..">` range and no `<sheetFormatPr
+    /// defaultRowHeight>` was set. Binary search over `row_heights`
+    /// (sorted, non-overlapping by construction — see `set_row_heights`),
+    /// the row-axis counterpart of `column_width`.
+    pub fn row_height(&self, row: u32) -> Option<f64> {
+        let idx = self.row_heights.partition_point(|r| r.min <= row);
+        if idx > 0 {
+            let candidate = &self.row_heights[idx - 1];
+            if row <= candidate.max {
+                return Some(candidate.height_pt);
+            }
+        }
+        self.default_row_height
+    }
+
+    /// The raw row-height ranges, for JSON output as a sheet-level `rows`
+    /// array — the row-axis counterpart of `col_width_ranges` (same
+    /// sparse-output rationale: a row-level value repeated onto every
+    /// populated cell in that row would multiply output size for no
+    /// benefit).
+    pub fn row_height_ranges(&self) -> &[RowHeightRange] {
+        &self.row_heights
+    }
+
+    pub fn default_row_height(&self) -> Option<f64> {
+        self.default_row_height
     }
 
     /// Registers this sheet's images (Issue #65). Called once by
@@ -1358,6 +1426,66 @@ mod tests {
             Some(true),
             "the origin should still pick up the folded right border"
         );
+    }
+
+    #[test]
+    fn row_height_with_no_ranges_and_no_default_is_none() {
+        let sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        assert_eq!(sheet.row_height(1), None);
+    }
+
+    #[test]
+    fn row_height_binary_search_across_multiple_ranges() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.set_row_heights(
+            vec![
+                RowHeightRange {
+                    min: 1,
+                    max: 5,
+                    height_pt: 15.0,
+                },
+                RowHeightRange {
+                    min: 10,
+                    max: 20,
+                    height_pt: 30.0,
+                },
+            ],
+            Some(12.0),
+        );
+        assert_eq!(sheet.row_height(1), Some(15.0));
+        assert_eq!(sheet.row_height(5), Some(15.0));
+        assert_eq!(sheet.row_height(6), Some(12.0)); // falls back to default
+        assert_eq!(sheet.row_height(10), Some(30.0));
+        assert_eq!(sheet.row_height(20), Some(30.0));
+        assert_eq!(sheet.row_height(21), Some(12.0));
+    }
+
+    #[test]
+    fn row_height_falls_back_to_default_row_height_outside_every_range() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.set_row_heights(
+            vec![RowHeightRange {
+                min: 1,
+                max: 1,
+                height_pt: 45.0,
+            }],
+            Some(15.0),
+        );
+        assert_eq!(sheet.row_height(1), Some(45.0));
+        assert_eq!(sheet.row_height(2), Some(15.0));
+    }
+
+    #[test]
+    fn row_height_ranges_exposes_the_raw_ranges_for_json_output() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let ranges = vec![RowHeightRange {
+            min: 1,
+            max: 5,
+            height_pt: 21.0,
+        }];
+        sheet.set_row_heights(ranges.clone(), None);
+        assert_eq!(sheet.row_height_ranges(), ranges.as_slice());
+        assert_eq!(sheet.default_row_height(), None);
     }
 
     #[test]

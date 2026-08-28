@@ -164,6 +164,25 @@ pub enum Error {
     #[error("too many column width ranges in one sheet: {count} exceeds limit {limit}")]
     TooManyColumnWidthRanges { count: usize, limit: usize },
 
+    /// A row-height range overlaps another one (Issue #51). Unlike
+    /// `InvalidColumnWidthRange`, this can only happen when a file's
+    /// `<row>` elements aren't in strictly ascending `r` order —
+    /// `parse/worksheet.rs`'s streaming compression (`push_row_height`)
+    /// always builds each individual range with `min <= max`, so there is
+    /// no equivalent of `InvalidColumnWidthRange`'s "reversed" case to
+    /// check for here.
+    #[error("invalid row height range {min}:{max}: {reason}")]
+    InvalidRowHeightRange { min: u32, max: u32, reason: String },
+
+    /// The number of row-height ranges in a single sheet exceeded
+    /// `resolve::row_height::MAX_ROW_HEIGHT_RANGES` — same reasoning as
+    /// `TooManyColumnWidthRanges`, kept as a separate limit since a
+    /// pathological file alternating row heights every row produces one
+    /// range per row (no compression benefit), unlike `<col>` ranges,
+    /// which the file itself already declares pre-compressed.
+    #[error("too many row height ranges in one sheet: {count} exceeds limit {limit}")]
+    TooManyRowHeightRanges { count: usize, limit: usize },
+
     /// A hyperlink range is invalid (overlaps another hyperlink range, or
     /// its start/end coordinates are inverted). Mirrors
     /// `InvalidMergedRange`'s shape exactly (Issue #95); overlap is
@@ -371,6 +390,25 @@ mod tests {
             }
             .to_string(),
             "too many column width ranges in one sheet: 2001 exceeds limit 2000"
+        );
+
+        assert_eq!(
+            Error::InvalidRowHeightRange {
+                min: 1,
+                max: 5,
+                reason: "overlaps another row height range".into(),
+            }
+            .to_string(),
+            "invalid row height range 1:5: overlaps another row height range"
+        );
+
+        assert_eq!(
+            Error::TooManyRowHeightRanges {
+                count: 2_001,
+                limit: 2_000,
+            }
+            .to_string(),
+            "too many row height ranges in one sheet: 2001 exceeds limit 2000"
         );
 
         assert_eq!(

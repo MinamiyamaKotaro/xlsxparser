@@ -97,6 +97,11 @@ impl<'a> Serialize for JsonSheet<'a> {
         // for why (raised during Issue #36's review discussion).
         state.serialize_field("defaultColumnWidth", &self.sheet.default_col_width())?;
         state.serialize_field("columns", &ColumnSeq { sheet: self.sheet })?;
+        // `defaultRowHeight`/`rows` (sister project exceldiff's Issue #51):
+        // the same sheet-level-array design as `columns`, applied
+        // symmetrically to row height.
+        state.serialize_field("defaultRowHeight", &self.sheet.default_row_height())?;
+        state.serialize_field("rows", &RowSeq { sheet: self.sheet })?;
         state.serialize_field("cells", &CellSeq { sheet: self.sheet })?;
         state.end()
     }
@@ -345,6 +350,7 @@ fn visibility_tag(v: SheetVisibility) -> &'static str {
 - **A regression test verifying that calling `to_json_writer` on a sheet with many cells does not cause additional heap allocation to grow significantly beyond `Sheet`'s own memory footprint (i.e. `JsonCell`s are never collected into a `Vec`)** (a test substantiating the peak-memory design intent raised by the PR #10 review; the concrete verification method is to be settled at implementation time, together with the choice of memory-profiling tooling)
 - Verify that `Error::JsonSerialize` propagates when `to_json_writer` is given a `Write` implementation (a test mock) that fails partway through writing
 - **Verify that `Sheet::col_width_ranges`/`default_col_width` serialize as a sheet-level `columns` array / `defaultColumnWidth` field, and are never duplicated onto individual cell objects** (Issue #39; the "sheet-level array, not per-cell" design decision is the thing under test here — see model/sheet.en.md)
+- **Verify that `Sheet::row_height_ranges`/`default_row_height` serialize the same way as a sheet-level `rows` array / `defaultRowHeight` field, never duplicated onto individual cell objects** (sister project exceldiff's Issue #51; the same design decision, symmetric with `columns`)
 - **Verify that `Sheet::images` serializes as a sheet-level `images` array; a `TwoCell` anchor emits `{"type":"twoCell","from":...,"to":...}` and a `OneCell` one `{"type":"oneCell","from":...,"ext":...}`; and `hyperlink` is omitted (not `null`) when the image carries none** (Issue #65)
 - **Verify a styled cell's `font` (`size_pt`/`bold`) serializes nested under a per-cell `style` object, and that an unstyled cell (`Cell.style: None`) omits the `style` field entirely** (Issue #38 — the opposite sparseness decision from `columns`, since font genuinely varies cell-to-cell)
 - **Verify `style.wrapText` serializes alongside `style.font` under the same per-cell `style` object, for both `true` and `false`** (Issue #37 — reuses the same styled/unstyled sparseness wiring `font` already established, since `JsonStyle` now always carries both fields together)
