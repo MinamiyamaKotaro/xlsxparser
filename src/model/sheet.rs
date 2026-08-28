@@ -5,7 +5,9 @@
 //! transparent merged-cell access.
 
 use crate::model::cell::{Cell, CellRef};
+use crate::model::style::{Borders, ResolvedStyle};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 /// A merged range. Holds the top-left (origin cell) and bottom-right
 /// coordinates.
@@ -435,11 +437,12 @@ impl Sheet {
                     if *coord == candidate_start {
                         continue; // it's already this region's own origin.
                     }
-                    let region = self
+                    let region = *self
                         .merged_regions
                         .get(&candidate_start)
                         .expect("active set only ever holds keys currently in merged_regions");
                     if coord.col <= region.end.col {
+                        Self::fold_perimeter_border_into_origin(&mut self.cells, *coord, &region);
                         to_drop.push(*coord);
                     }
                 }
@@ -448,6 +451,66 @@ impl Sheet {
 
         for coord in to_drop {
             self.cells.remove(&coord);
+        }
+    }
+
+    /// Before a covered (non-origin) cell at `coord` is dropped by
+    /// [`Self::finalize_merges`], folds whichever of its own borders face
+    /// outward on `region`'s perimeter into the region's origin cell
+    /// (Issue #50 on the sister project, exceldiff — this project shares
+    /// an identical `finalize_merges`/`resolve_origin` implementation).
+    /// Real workbooks commonly define a merged region's visible edge —
+    /// e.g. the right border of `H2:Q2` — on the perimeter cell that
+    /// touches that edge (`Q2`) rather than on the origin (`H2`) itself;
+    /// Excel composites all of a merge's constituent cells when drawing
+    /// its outline, but this model otherwise keeps only the origin's own
+    /// style once merges are finalized, silently losing that edge. A cell
+    /// not on a given edge (e.g. `coord.row` matching neither
+    /// `region.start.row` nor `region.end.row`) never contributes its
+    /// top/bottom to this fold — only borders that would actually land on
+    /// the merged box's outline are considered.
+    fn fold_perimeter_border_into_origin(
+        cells: &mut BTreeMap<CellRef, Cell>,
+        coord: CellRef,
+        region: &MergedRegion,
+    ) {
+        let Some(covered_borders) = cells.get(&coord).and_then(|c| c.style.as_deref()) else {
+            return;
+        };
+        let mut folded = Borders::default();
+        if coord.row == region.start.row {
+            folded.top = covered_borders.borders.top;
+        }
+        if coord.row == region.end.row {
+            folded.bottom = covered_borders.borders.bottom;
+        }
+        if coord.col == region.start.col {
+            folded.left = covered_borders.borders.left;
+        }
+        if coord.col == region.end.col {
+            folded.right = covered_borders.borders.right;
+        }
+        if !folded.any() {
+            return;
+        }
+
+        let origin_cell = cells
+            .get_mut(&region.start)
+            .expect("insert_merge backfills a blank cell at region.start, so it's always present");
+        match &mut origin_cell.style {
+            Some(style) => {
+                let style = Arc::make_mut(style);
+                style.borders.top |= folded.top;
+                style.borders.right |= folded.right;
+                style.borders.bottom |= folded.bottom;
+                style.borders.left |= folded.left;
+            }
+            None => {
+                origin_cell.style = Some(Arc::new(ResolvedStyle {
+                    borders: folded,
+                    ..Default::default()
+                }));
+            }
         }
     }
 
@@ -1084,6 +1147,216 @@ mod tests {
                 value: Some(crate::model::CellValue::Number(1.0)),
                 style: None,
             })
+        );
+    }
+
+    /// Issue #50 (sister project exceldiff, shares this identical
+    /// `finalize_merges`): a real-world `.xlsx` (a "skill sheet"
+    /// template) defined an `H2:Q2`-shaped merge's right border on `Q2`
+    /// (the perimeter cell, `<right style="medium">` in `styles.xml`)
+    /// rather than on the origin `H2` — a common Excel authoring pattern
+    /// this sweep once silently dropped along with the rest of `Q2`'s own
+    /// style. One-row merge: only the right edge is exercised (left/top
+    /// already come from the origin itself for any merge, since a merge
+    /// only ever extends right/down from its origin — see
+    /// `MergedRegion`'s own doc comment).
+    #[test]
+    fn finalize_merges_folds_the_perimeter_cells_right_border_into_the_origin() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        sheet.insert_cell(
+            r(2, 8), // H2: origin, no border of its own.
+            Cell {
+                value: Some(crate::model::CellValue::Text("弊社個人事業主".into())),
+                style: None,
+            },
+        );
+        sheet.insert_cell(
+            r(2, 17), // Q2: perimeter cell, right border only.
+            Cell {
+                value: None,
+                style: Some(Arc::new(ResolvedStyle {
+                    borders: Borders {
+                        right: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })),
+            },
+        );
+        sheet.insert_merge(MergedRegion {
+            start: r(2, 8),
+            end: r(2, 17),
+        });
+        sheet.finalize_merges();
+
+        let origin = sheet.get(r(2, 8)).expect("origin cell must survive");
+        assert_eq!(
+            origin.style.as_deref().map(|s| s.borders),
+            Some(Borders {
+                right: true,
+                ..Default::default()
+            })
+        );
+        // Querying any covered coordinate resolves back to the same
+        // (now-bordered) origin.
+        assert_eq!(sheet.get(r(2, 17)), Some(origin));
+    }
+
+    /// A genuinely 2D merge, each of the 4 edges' border coming from a
+    /// *different* perimeter cell — the origin (top-left) only ever owns
+    /// its own top/left directly, so this is the case that actually
+    /// exercises all four `if coord.row/col == region.start/end...`
+    /// branches in `fold_perimeter_border_into_origin`, not just the
+    /// single-row "right edge" shape above.
+    #[test]
+    fn finalize_merges_folds_all_four_edges_of_a_2d_merge() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let bordered = |b: Borders| {
+            Some(Arc::new(ResolvedStyle {
+                borders: b,
+                ..Default::default()
+            }))
+        };
+        sheet.insert_cell(
+            r(2, 2), // B2: origin — top+left of its own, deliberately unset.
+            Cell {
+                value: Some(crate::model::CellValue::Boolean(true)),
+                style: None,
+            },
+        );
+        sheet.insert_cell(
+            r(2, 3), // C2: top edge (not a corner).
+            Cell {
+                value: None,
+                style: bordered(Borders {
+                    top: true,
+                    ..Default::default()
+                }),
+            },
+        );
+        sheet.insert_cell(
+            r(3, 2), // B3: left edge (not a corner).
+            Cell {
+                value: None,
+                style: bordered(Borders {
+                    left: true,
+                    ..Default::default()
+                }),
+            },
+        );
+        sheet.insert_cell(
+            r(4, 4), // D4: bottom-right corner — contributes both sides.
+            Cell {
+                value: None,
+                style: bordered(Borders {
+                    bottom: true,
+                    right: true,
+                    ..Default::default()
+                }),
+            },
+        );
+        sheet.insert_cell(
+            r(3, 3), // C3: interior — touches no edge, must not contribute.
+            Cell {
+                value: None,
+                style: bordered(Borders {
+                    top: true,
+                    right: true,
+                    bottom: true,
+                    left: true,
+                }),
+            },
+        );
+        sheet.insert_merge(MergedRegion {
+            start: r(2, 2),
+            end: r(4, 4),
+        });
+        sheet.finalize_merges();
+
+        let origin = sheet.get(r(2, 2)).expect("origin cell must survive");
+        assert_eq!(
+            origin.style.as_deref().map(|s| s.borders),
+            Some(Borders {
+                top: true,
+                right: true,
+                bottom: true,
+                left: true,
+            })
+        );
+    }
+
+    /// The style `Arc` a perimeter cell's border is folded from may be
+    /// shared with cells entirely outside the merge (styles are
+    /// deduplicated via `Arc`, see `Cell::style`'s own doc comment) —
+    /// folding must replace the *origin's* `Arc` with a new one rather
+    /// than mutating the shared style in place, or every other cell
+    /// pointing at that same `Arc` would spuriously grow a border too.
+    #[test]
+    fn finalize_merges_border_fold_never_mutates_a_style_shared_with_unrelated_cells() {
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        // The *origin* (not the perimeter cell) starts out sharing this
+        // Arc with an unrelated cell (I9) — the shape that actually
+        // exercises `Arc::make_mut`'s clone-on-write branch, since the
+        // fold has to mutate an *existing* style rather than manufacture
+        // a fresh one. Snapshotting the value here (not just holding the
+        // Arc) matters too: comparing against `&*shared_before` after the
+        // fact would trivially "pass" even under a broken in-place
+        // mutation, since both sides would alias the same, now-mutated,
+        // allocation.
+        let shared_before = Arc::new(ResolvedStyle::default());
+        let expected_unrelated_style = (*shared_before).clone();
+        sheet.insert_cell(
+            r(1, 1), // A1: origin, shares `shared_before` with I9.
+            Cell {
+                value: Some(crate::model::CellValue::Boolean(true)),
+                style: Some(Arc::clone(&shared_before)),
+            },
+        );
+        sheet.insert_cell(
+            r(9, 9), // I9: unrelated cell, shares `shared_before` with the origin.
+            Cell {
+                value: Some(crate::model::CellValue::Boolean(false)),
+                style: Some(Arc::clone(&shared_before)),
+            },
+        );
+        sheet.insert_cell(
+            r(1, 2), // B1: perimeter cell (right edge), its own distinct style.
+            Cell {
+                value: None,
+                style: Some(Arc::new(ResolvedStyle {
+                    borders: Borders {
+                        right: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })),
+            },
+        );
+        sheet.insert_merge(MergedRegion {
+            start: r(1, 1),
+            end: r(1, 2),
+        });
+        sheet.finalize_merges();
+
+        assert_eq!(
+            sheet.get(r(9, 9)).and_then(|c| c.style.as_deref()),
+            Some(&expected_unrelated_style),
+            "the unrelated cell's shared style must be untouched"
+        );
+        assert!(
+            !Arc::ptr_eq(
+                &shared_before,
+                sheet.get(r(1, 1)).unwrap().style.as_ref().unwrap(),
+            ),
+            "the origin must have split off its own Arc rather than mutating the shared one"
+        );
+        assert_eq!(
+            sheet
+                .get(r(1, 1))
+                .and_then(|c| c.style.as_deref())
+                .map(|s| s.borders.right),
+            Some(true),
+            "the origin should still pick up the folded right border"
         );
     }
 
