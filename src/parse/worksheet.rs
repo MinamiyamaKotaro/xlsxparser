@@ -352,11 +352,26 @@ fn parse_u32_attr(value: &str, attr_name: &str, path: &str) -> Result<u32, Error
         .map_err(|_| Error::InvalidPackage(format!("invalid {attr_name} {value:?} in {path}")))
 }
 
-/// Same as [`parse_u32_attr`], but for `f64` (column width).
+/// Same as [`parse_u32_attr`], but for `f64` (column width, default column
+/// width, row height, default row height). Rejects `NaN`/`±Infinity` and
+/// negative values up front, on top of the usual "did this even parse as a
+/// number" check: a Copilot review on sister project exceldiff's PR #53
+/// pointed out that a malformed or adversarial file could otherwise smuggle
+/// one of these through to `json.rs`'s serialization of `width`/`heightPt`
+/// — `serde_json` errors on a non-finite `f64` (JSON has no representation
+/// for `NaN`/`Infinity`), so this would surface as a confusing JSON-export
+/// failure on an otherwise-successfully-parsed file rather than being
+/// rejected up front where the bad value actually came from.
 fn parse_f64_attr(value: &str, attr_name: &str, path: &str) -> Result<f64, Error> {
-    value
+    let parsed: f64 = value
         .parse()
-        .map_err(|_| Error::InvalidPackage(format!("invalid {attr_name} {value:?} in {path}")))
+        .map_err(|_| Error::InvalidPackage(format!("invalid {attr_name} {value:?} in {path}")))?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err(Error::InvalidPackage(format!(
+            "invalid {attr_name} {value:?} in {path}: must be a finite, non-negative number"
+        )));
+    }
+    Ok(parsed)
 }
 
 /// Finalizes one `<c>`: decides whether it carries enough information to be
@@ -1126,6 +1141,111 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::InvalidPackage(_)));
+    }
+
+    #[test]
+    fn malformed_row_height_is_invalid_package() {
+        let xml = br#"<worksheet><sheetData><row r="1" ht="not-a-number"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#;
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err = parse_worksheet(
+            &xml[..],
+            "xl/worksheets/sheet1.xml",
+            &mut sheet,
+            false,
+            usize::MAX,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
+    }
+
+    #[test]
+    fn malformed_default_row_height_is_invalid_package() {
+        let xml = br#"<worksheet><sheetFormatPr defaultRowHeight="not-a-number"/><sheetData></sheetData></worksheet>"#;
+        let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+        let err = parse_worksheet(
+            &xml[..],
+            "xl/worksheets/sheet1.xml",
+            &mut sheet,
+            false,
+            usize::MAX,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidPackage(_)));
+    }
+
+    #[test]
+    fn non_finite_or_negative_row_height_is_rejected() {
+        // A Copilot review on sister project exceldiff's PR #53 flagged
+        // that `ht`/`defaultRowHeight` parsed straight through to `f64`
+        // without checking for NaN, +/-Infinity, or negative values, which
+        // json.rs's serialization would otherwise fail on (serde_json has
+        // no JSON representation for non-finite floats) instead of
+        // rejecting the bad file up front.
+        for bad_ht in ["NaN", "inf", "-inf", "-1.0"] {
+            let xml = format!(
+                r#"<worksheet><sheetData><row r="1" ht="{bad_ht}"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#
+            );
+            let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+            let err = parse_worksheet(
+                xml.as_bytes(),
+                "xl/worksheets/sheet1.xml",
+                &mut sheet,
+                false,
+                usize::MAX,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidPackage(_)),
+                "ht={bad_ht:?} should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_or_negative_default_row_height_is_rejected() {
+        for bad_default in ["NaN", "inf", "-inf", "-1.0"] {
+            let xml = format!(
+                r#"<worksheet><sheetFormatPr defaultRowHeight="{bad_default}"/><sheetData></sheetData></worksheet>"#
+            );
+            let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+            let err = parse_worksheet(
+                xml.as_bytes(),
+                "xl/worksheets/sheet1.xml",
+                &mut sheet,
+                false,
+                usize::MAX,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidPackage(_)),
+                "defaultRowHeight={bad_default:?} should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_or_negative_column_width_is_also_rejected() {
+        // parse_f64_attr's finite/non-negative check is shared by column
+        // width and row height alike (same helper) — verifying the
+        // pre-existing column-width path picked up the same protection.
+        for bad_width in ["NaN", "inf", "-inf", "-1.0"] {
+            let xml = format!(
+                r#"<worksheet><cols><col min="1" max="1" width="{bad_width}"/></cols><sheetData></sheetData></worksheet>"#
+            );
+            let mut sheet = Sheet::new("Sheet1".into(), SheetVisibility::Visible);
+            let err = parse_worksheet(
+                xml.as_bytes(),
+                "xl/worksheets/sheet1.xml",
+                &mut sheet,
+                false,
+                usize::MAX,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidPackage(_)),
+                "width={bad_width:?} should be rejected, got {err:?}"
+            );
+        }
     }
 
     #[test]

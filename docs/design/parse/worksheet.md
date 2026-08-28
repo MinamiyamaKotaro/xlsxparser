@@ -224,6 +224,7 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 - `<hyperlink ref="...">` の値が単一の正しいA1座標でも `"A1:C3"` 形式の2座標範囲でもない場合は `Error::InvalidCellRef` を伝播する（Issue #95）。範囲としての妥当性（開始・終了の大小関係、他のハイパーリンク範囲との重複）そのものの検証は行わない——`<mergeCells>` と同じ分担で [`resolve/hyperlink.rs`](../resolve/hyperlink.md) に委ねる
 - `<col>` の `width`/`defaultColWidth` が `f64` として、または `min`/`max` が `u32` としてパースできない場合は `Error::InvalidPackage`（上記の数値 `<v>` と同じ暫定方針）を返す。範囲としての妥当性（重複・件数）そのものの検証は行わず、[`resolve/column_width.rs`](../resolve/column_width.md) に委ねる(`<mergeCells>` と同じ分担)
 - `<row>` の `ht`、または `<sheetFormatPr>` の `defaultRowHeight` が `f64` としてパースできない場合も同じく `Error::InvalidPackage` を返す。件数上限の検証(`MAX_ROW_HEIGHT_RANGES`)は行わず[`resolve/row_height.rs`](../resolve/row_height.md)に委ねるが、圧縮そのもの(`push_row_height`)は本ファイルの責務である点が列幅と異なる(上記「責務・スコープ」参照)
+- `width`/`defaultColWidth`/`ht`/`defaultRowHeight` はいずれも共通の `parse_f64_attr` を通るため、単に`f64`としてパースできるだけでなく**有限かつ非負**であることも検証し、`NaN`・`±Infinity`・負数はいずれも`Error::InvalidPackage`として拒否する——`json.rs`が`width`/`heightPt`をそのままシリアライズするため、これを検証しないと不正なファイルが非有限値をそこまで通過させ、`serde_json`側で(JSONには`NaN`/`Infinity`の表現が無いため)分かりにくいJSON出力エラーとして顕在化してしまう(姉妹プロジェクトexceldiffのPR #53のCopilotレビュー指摘。既存の列幅にも同じ保護が及ぶ)
 - `<f>`（数式）要素の内容はパース・保存せず読み飛ばす（要求仕様書のスコープ外。オープンクエスチョン2参照）
 - 実際に `Sheet::insert_cell` されたセル数（`max_cells`引数、`SizeLimits::max_cells_per_sheet`。[container/sanitize.md](../container/sanitize.md)参照）が `max_cells` を超えた場合、`Error::TooManyCells` を返す（Issue [#88](https://github.com/MinamiyamaKotaro/xlsxparser/issues/88)）。値・スタイル・共有文字列参照のいずれも持たず握りつぶされたセルはカウントしない。バッチ収集後にまとめてチェックする `resolve::merge`/`resolve::column_width` とは異なり、`<c>` をストリーミングする最中に逐次カウント・チェックする——セルの場合、メモリコストは挿入された瞬間に発生するため、収集し終えてからのチェックでは手遅れになる
 - **`panic` しない**: 本ファイルが扱う入力は信頼できない外部ファイルであるため、想定外の構造は必ず `Error` のいずれかのバリアントとして伝播させる
@@ -248,6 +249,7 @@ parse::shared_strings ─▶ resolve::shared_strings（SharedStringTableをuse�
 - `<sheetFormatPr defaultRowHeight="..">` が収集されること、および欠落時に `default_row_height: None` のままであることの確認
 - 連続する同じ高さの行が1つの`RowHeightRange`へ圧縮されること、行番号が連続しない(間に`<row ht>`の無い行がある)場合は同じ高さでも新しいレンジになること、`ht`属性の無い行は何も生成しないことの確認(姉妹プロジェクトexceldiffのIssue #51、圧縮アルゴリズム`push_row_height`自体の検証)
 - `<col>`/`<sheetFormatPr>` の不正な数値属性に対し `Error::InvalidPackage` を返すことの確認
+- `ht`/`defaultRowHeight`/`width` それぞれについて、`NaN`・`inf`・`-inf`・負数(`-1.0`)がいずれも`Error::InvalidPackage`として拒否されることの確認(姉妹プロジェクトexceldiffのPR #53のCopilotレビュー指摘。列幅側も同じ`parse_f64_attr`を通るため回帰テストとして追加)
 - `<f>` 要素を含むセル（数式セル）について、`<f>` の内容が無視され `<v>`（計算済みキャッシュ値）のみが `Cell` の値として採用されることの確認
 - `t="d"` セルについて、日付のみ・日付+時刻・時刻のみの3パターンそれぞれが正しい `CellValue::DateTime` として解決されることの確認（時刻のみの場合、日付部分がExcelの規約どおり1899-12-30になることを含む）。不正な形式（範囲外の数値、セグメント数不一致）に対し `Error::InvalidPackage` を返すことの確認(Issue #58。実例として `tests/fixtures/other/date_iso.xlsx` ——calamineテストコーパス由来——で3パターンとも確認済みだが、同ディレクトリは`.gitignore`対象のため、統合テスト自体は同じ3パターンを再現した手書きフィクスチャを用いる)
 - 末尾の `Z`/`+09:00` 等のUTC・オフセット指定子が読み捨てられること、小数秒(`10:10:10.500`)が整数秒へ切り捨てられること、秒省略(`10:10`)が0扱いになることの確認（PR #80レビュー指摘1）
