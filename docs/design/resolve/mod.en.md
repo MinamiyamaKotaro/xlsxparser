@@ -6,8 +6,8 @@ Design doc for `src/resolve/mod.rs`. This is the entry point for Phase 4 (analys
 
 ## Responsibility / Scope
 
-- Declares submodules (`mod shared_strings; mod merge; mod style; mod column_width; mod color;`) and re-exports public types
-- Provides the entry function `resolve_sheet`, which takes one sheet's worth of unresolved data (the `model::Sheet` built by Phase 3, the pending lists of shared-string indices / style IDs, the `<cols>` range list plus `defaultColWidth`, and the `<mergeCells>` range list) and invokes the resolution steps in the order [shared_strings.md](shared_strings.en.md) → [style.md](style.en.md) → [column_width.md](column_width.en.md) → [merge.md](merge.en.md)
+- Declares submodules (`mod shared_strings; mod merge; mod style; mod column_width; mod row_height; mod color;`) and re-exports public types
+- Provides the entry function `resolve_sheet`, which takes one sheet's worth of unresolved data (the `model::Sheet` built by Phase 3, the pending lists of shared-string indices / style IDs, the `<cols>` range list plus `defaultColWidth`, the row-height range list — already compressed while streaming `<sheetData>`, sister project exceldiff's Issue #51 — plus `defaultRowHeight`, and the `<mergeCells>` range list) and invokes the resolution steps in the order [shared_strings.md](shared_strings.en.md) → [style.md](style.en.md) → [column_width.md](column_width.en.md) → [row_height.md](row_height.en.md) → [merge.md](merge.en.md)
 - Re-exports [`resolve/color.rs`](color.en.md) (`resolve_color`. Issue #76) so it can be called directly from outside the crate — unlike the four steps up to [column_width.md](column_width.en.md), `resolve_sheet` itself never calls it (see Dependencies below)
 - **Not responsible for**: the resolution logic itself (looking up shared-string indices, applying styles, validating/registering column-width ranges or merged ranges, or resolving a color, are each submodule's responsibility), XML parsing itself (`parse/worksheet.rs`, etc.), building `SharedStringTable` / `StyleSheet` (`parse/shared_strings.rs` / `parse/styles.rs`)
 
@@ -18,12 +18,13 @@ mod shared_strings;
 mod merge;
 mod style;
 mod column_width;
+mod row_height;
 mod color;
 
 pub use color::resolve_color;
 
 use crate::error::Error;
-use crate::model::sheet::{ColWidthRange, MergedRegion, Sheet};
+use crate::model::sheet::{ColWidthRange, MergedRegion, RowHeightRange, Sheet};
 use crate::model::style::StyleSheet;
 // PendingSharedString/PendingStyle are Phase 3's own output data, so
 // parse/worksheet.rs defines them (reflects the PR #9 review — see
@@ -45,11 +46,14 @@ pub fn resolve_sheet(
     stylesheet: &StyleSheet,
     col_width_ranges: Vec<ColWidthRange>,
     default_col_width: Option<f64>,
+    row_height_ranges: Vec<RowHeightRange>,
+    default_row_height: Option<f64>,
     merge_regions: Vec<MergedRegion>,
 ) -> Result<(), Error> {
     shared_strings::resolve(sheet, pending_shared_strings, shared_string_table)?;
     style::resolve(sheet, pending_styles, stylesheet)?;
     column_width::resolve(sheet, col_width_ranges, default_col_width)?;
+    row_height::resolve(sheet, row_height_ranges, default_row_height)?;
     merge::resolve(sheet, merge_regions)?;
     Ok(())
 }
@@ -57,12 +61,12 @@ pub fn resolve_sheet(
 
 ## Dependencies
 
-- Depends on: [`resolve/shared_strings.rs`](shared_strings.en.md), [`resolve/merge.rs`](merge.en.md), [`resolve/style.rs`](style.en.md), [`resolve/column_width.rs`](column_width.en.md), [`resolve/color.rs`](color.en.md) (all as `mod` declarations), [`model/sheet.rs`](../model/sheet.en.md) (`Sheet`, `MergedRegion`, `ColWidthRange`), [`error.rs`](../error.en.md). It also depends on [`parse::shared_strings::SharedStringTable`](../parse/shared_strings.en.md) and [`parse::worksheet::{PendingSharedString, PendingStyle}`](../parse/worksheet.en.md), but these are not the kind of "dependency on I/O" that architecture.md design principle 2 forbids; they are dependencies on in-memory structured data that Phase 3 has already built. This therefore does not contradict `resolve/`'s I/O-independence policy (there is no dependency on actual I/O or XML structure such as quick-xml or `std::fs`).
+- Depends on: [`resolve/shared_strings.rs`](shared_strings.en.md), [`resolve/merge.rs`](merge.en.md), [`resolve/style.rs`](style.en.md), [`resolve/column_width.rs`](column_width.en.md), [`resolve/row_height.rs`](row_height.en.md), [`resolve/color.rs`](color.en.md) (all as `mod` declarations), [`model/sheet.rs`](../model/sheet.en.md) (`Sheet`, `MergedRegion`, `ColWidthRange`, `RowHeightRange`), [`error.rs`](../error.en.md). It also depends on [`parse::shared_strings::SharedStringTable`](../parse/shared_strings.en.md) and [`parse::worksheet::{PendingSharedString, PendingStyle}`](../parse/worksheet.en.md), but these are not the kind of "dependency on I/O" that architecture.md design principle 2 forbids; they are dependencies on in-memory structured data that Phase 3 has already built. This therefore does not contradict `resolve/`'s I/O-independence policy (there is no dependency on actual I/O or XML structure such as quick-xml or `std::fs`).
 - Depended on by: `pipeline.rs` (calls `resolve_sheet` once Phase 3 completes for each sheet), external callers outside the crate (call the re-exported `resolve_color` directly, combined with `Workbook::theme()`/`ResolvedStyle.fill_fg_color` and similar, at a time of their own choosing — Issue #76 "Option A")
 
 Why `resolve_color` (Issue #76) is never called from `resolve_sheet`: [resolve/color.md](color.en.md)'s "Option A: on-demand resolve API" deliberately decouples color resolution from full-cell traversal (Phase 4), computing it only where a display-oriented caller actually needs it, to avoid any per-cell CPU/memory overhead (see [Issue #76 design proposal](https://github.com/MinamiyamaKotaro/xlsxparser/issues/76#issuecomment-5352309575)). This differs from the other four (`shared_strings`/`style`/`column_width`/`merge`), each of which is mandatory — leaving Phase 3's pending state unresolved would leave cells incomplete — whereas color resolution is an optional, additional conversion performed only when needed, *after* the complete `ColorRef` information already sits on `ResolvedStyle`.
 
-There is no strong ordering requirement among shared-string resolution, style application, and column-width resolution, because each reads/writes independent state. Merge resolution is placed last as a defensive ordering choice: [merge.md](merge.en.md)'s `insert_merge` assumes the origin cell already exists in `cells` at call time, and — since Issue #43 — `Sheet::finalize_merges` (called as the final step of `merge::resolve`) rewrites `cells` to drop every non-origin entry, which must happen only after every other step that might still touch a virtual (non-origin) coordinate has already run.
+There is no strong ordering requirement among shared-string resolution, style application, column-width resolution, and row-height resolution, because each reads/writes independent state. Merge resolution is placed last as a defensive ordering choice: [merge.md](merge.en.md)'s `insert_merge` assumes the origin cell already exists in `cells` at call time, and — since Issue #43 — `Sheet::finalize_merges` (called as the final step of `merge::resolve`) rewrites `cells` to drop every non-origin entry, which must happen only after every other step that might still touch a virtual (non-origin) coordinate has already run.
 
 ## Error Handling Policy
 

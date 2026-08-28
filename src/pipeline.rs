@@ -195,6 +195,8 @@ pub(crate) fn run<R: Read + Seek>(reader: R, limits: SizeLimits) -> Result<Workb
             date1904,
             output.col_width_ranges,
             output.default_col_width,
+            output.row_height_ranges,
+            output.default_row_height,
             output.merge_regions,
         )?;
 

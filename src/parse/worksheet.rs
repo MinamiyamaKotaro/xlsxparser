@@ -8,7 +8,8 @@
 
 use crate::error::Error;
 use crate::model::{
-    Cell, CellRef, CellValue, ColWidthRange, DateTimeValue, MergedRegion, Sheet, StyleId,
+    Cell, CellRef, CellValue, ColWidthRange, DateTimeValue, MergedRegion, RowHeightRange, Sheet,
+    StyleId,
 };
 use crate::parse::{
     concat_rich_text, create_secure_reader, optional_attr, read_event, read_leaf_text,
@@ -70,6 +71,13 @@ pub(crate) struct WorksheetParseOutput {
     pub pending_styles: Vec<PendingStyle>,
     pub col_width_ranges: Vec<ColWidthRange>,
     pub default_col_width: Option<f64>,
+    /// Row-height ranges (Issue #51), already compressed inline while
+    /// streaming `<sheetData>` (`push_row_height`) — unlike
+    /// `col_width_ranges`, which is read pre-compressed straight off
+    /// `<cols>`, `<row>` is never itself a range in the OOXML schema, so
+    /// this module does the compression rather than `resolve/`.
+    pub row_height_ranges: Vec<RowHeightRange>,
+    pub default_row_height: Option<f64>,
     pub merge_regions: Vec<MergedRegion>,
     /// The `r:id` from `<drawing r:id="rIdX"/>`, if this worksheet has one.
     /// `pipeline.rs` resolves it against `xl/worksheets/_rels/sheetN.xml.rels`
@@ -121,6 +129,8 @@ pub(crate) fn parse_worksheet(
     let mut pending_styles = Vec::new();
     let mut col_width_ranges = Vec::new();
     let mut default_col_width = None;
+    let mut row_height_ranges: Vec<RowHeightRange> = Vec::new();
+    let mut default_row_height = None;
     let mut merge_regions = Vec::new();
     let mut drawing_r_id = None;
     let mut pending_hyperlinks = Vec::new();
@@ -155,6 +165,17 @@ pub(crate) fn parse_worksheet(
                     return Err(Error::InvalidCellRef(format!("row {cur_row} in {path}")));
                 }
                 cur_col = 0;
+
+                // `ht` is read regardless of `customHeight` (Issue #51):
+                // `customHeight="1"` marks a height the *user* explicitly
+                // set, as opposed to Excel's own auto-calculated estimate,
+                // but either way `ht` is what Excel actually renders that
+                // row at — this library reproduces the visible result, not
+                // which of the two the file's author chose.
+                if let Some(ht) = optional_attr(e, path, "ht")? {
+                    let height_pt = parse_f64_attr(&ht, "ht", path)?;
+                    push_row_height(&mut row_height_ranges, cur_row, height_pt);
+                }
             }
             Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"c" => {
                 let is_empty = matches!(&event, Event::Empty(_));
@@ -242,6 +263,9 @@ pub(crate) fn parse_worksheet(
                 if let Some(w) = optional_attr(e, path, "defaultColWidth")? {
                     default_col_width = Some(parse_f64_attr(&w, "defaultColWidth", path)?);
                 }
+                if let Some(h) = optional_attr(e, path, "defaultRowHeight")? {
+                    default_row_height = Some(parse_f64_attr(&h, "defaultRowHeight", path)?);
+                }
             }
             Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"col" => {
                 if let Some(width_str) = optional_attr(e, path, "width")? {
@@ -276,10 +300,35 @@ pub(crate) fn parse_worksheet(
         pending_styles,
         col_width_ranges,
         default_col_width,
+        row_height_ranges,
+        default_row_height,
         merge_regions,
         drawing_r_id,
         pending_hyperlinks,
     })
+}
+
+/// Extends `ranges`' last entry if `row` continues it (same `height_pt`,
+/// immediately following row) — the row-axis equivalent of a `<col min=".."
+/// max="..">` range, computed here rather than read pre-compressed off the
+/// file (see [`WorksheetParseOutput::row_height_ranges`]'s doc comment for
+/// why). Starts a new range otherwise, including when a file's `<row>`
+/// elements aren't in strictly ascending order (malformed input degrades to
+/// a fresh range rather than an error — this only affects display fidelity,
+/// not diff correctness, the same graceful-degradation policy `numFmtId`/
+/// `fontId` resolution already follows for a bad reference).
+fn push_row_height(ranges: &mut Vec<RowHeightRange>, row: u32, height_pt: f64) {
+    if let Some(last) = ranges.last_mut() {
+        if last.max + 1 == row && last.height_pt == height_pt {
+            last.max = row;
+            return;
+        }
+    }
+    ranges.push(RowHeightRange {
+        min: row,
+        max: row,
+        height_pt,
+    });
 }
 
 /// Parses a `<row r="...">` attribute value as `u32`. Unlike
@@ -984,6 +1033,84 @@ mod tests {
         let xml = br#"<worksheet><sheetData></sheetData></worksheet>"#;
         let (_sheet, output) = parse(xml);
         assert_eq!(output.default_col_width, None);
+    }
+
+    #[test]
+    fn sheet_format_pr_default_row_height_is_collected() {
+        let xml = br#"<worksheet><sheetFormatPr defaultColWidth="9.1" defaultRowHeight="15"/><sheetData></sheetData></worksheet>"#;
+        let (_sheet, output) = parse(xml);
+        assert_eq!(output.default_row_height, Some(15.0));
+    }
+
+    #[test]
+    fn missing_sheet_format_pr_leaves_default_row_height_none() {
+        let xml = br#"<worksheet><sheetData></sheetData></worksheet>"#;
+        let (_sheet, output) = parse(xml);
+        assert_eq!(output.default_row_height, None);
+    }
+
+    #[test]
+    fn consecutive_rows_with_the_same_height_are_collected_as_one_range() {
+        // Issue #51: <row> is never itself a range in the OOXML schema
+        // (unlike <col min max>), so this module has to do the
+        // compression itself while streaming <sheetData>.
+        let xml = br#"<worksheet><sheetData>
+<row r="1" ht="15" customHeight="1"><c r="A1"><v>1</v></c></row>
+<row r="2" ht="15" customHeight="1"><c r="A2"><v>2</v></c></row>
+<row r="3" ht="21" customHeight="1"><c r="A3"><v>3</v></c></row>
+</sheetData></worksheet>"#;
+        let (_sheet, output) = parse(xml);
+        assert_eq!(
+            output.row_height_ranges,
+            vec![
+                RowHeightRange {
+                    min: 1,
+                    max: 2,
+                    height_pt: 15.0
+                },
+                RowHeightRange {
+                    min: 3,
+                    max: 3,
+                    height_pt: 21.0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_gap_between_rows_starts_a_new_range_even_at_the_same_height() {
+        // Row 5 follows row 1 (rows 2-4 have no explicit <row ht="..">
+        // element at all) — not contiguous, so this must not silently
+        // extend row 1's range to cover the gap.
+        let xml = br#"<worksheet><sheetData>
+<row r="1" ht="15" customHeight="1"><c r="A1"><v>1</v></c></row>
+<row r="5" ht="15" customHeight="1"><c r="A5"><v>2</v></c></row>
+</sheetData></worksheet>"#;
+        let (_sheet, output) = parse(xml);
+        assert_eq!(
+            output.row_height_ranges,
+            vec![
+                RowHeightRange {
+                    min: 1,
+                    max: 1,
+                    height_pt: 15.0
+                },
+                RowHeightRange {
+                    min: 5,
+                    max: 5,
+                    height_pt: 15.0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn row_without_ht_attribute_contributes_no_range() {
+        let xml = br#"<worksheet><sheetData>
+<row r="1"><c r="A1"><v>1</v></c></row>
+</sheetData></worksheet>"#;
+        let (_sheet, output) = parse(xml);
+        assert_eq!(output.row_height_ranges, vec![]);
     }
 
     #[test]

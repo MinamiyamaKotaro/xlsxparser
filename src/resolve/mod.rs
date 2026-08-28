@@ -9,13 +9,14 @@ mod color;
 mod column_width;
 pub(crate) mod hyperlink;
 mod merge;
+mod row_height;
 mod shared_strings;
 mod style;
 
 pub use color::resolve_color;
 
 use crate::error::Error;
-use crate::model::{ColWidthRange, MergedRegion, Sheet, StyleSheet};
+use crate::model::{ColWidthRange, MergedRegion, RowHeightRange, Sheet, StyleSheet};
 use crate::parse::{PendingSharedString, PendingStyle, SharedStringTable};
 
 /// Runs Phase 4 resolution over one sheet's worth of unresolved data.
@@ -27,9 +28,9 @@ use crate::parse::{PendingSharedString, PendingStyle, SharedStringTable};
 /// `style: None`.
 ///
 /// Runs shared-string resolution, then style application, then column
-/// width, then merge resolution; if any step fails, the remaining steps do
-/// not run, so a partially-resolved sheet is never returned to the caller
-/// (fail closed).
+/// width, then row height, then merge resolution; if any step fails, the
+/// remaining steps do not run, so a partially-resolved sheet is never
+/// returned to the caller (fail closed).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_sheet(
     sheet: &mut Sheet,
@@ -40,11 +41,14 @@ pub(crate) fn resolve_sheet(
     date1904: bool,
     col_width_ranges: Vec<ColWidthRange>,
     default_col_width: Option<f64>,
+    row_height_ranges: Vec<RowHeightRange>,
+    default_row_height: Option<f64>,
     merge_regions: Vec<MergedRegion>,
 ) -> Result<(), Error> {
     shared_strings::resolve(sheet, pending_shared_strings, shared_string_table)?;
     style::resolve(sheet, pending_styles, stylesheet, date1904)?;
     column_width::resolve(sheet, col_width_ranges, default_col_width)?;
+    row_height::resolve(sheet, row_height_ranges, default_row_height)?;
     merge::resolve(sheet, merge_regions)?;
     Ok(())
 }
@@ -112,6 +116,12 @@ mod tests {
                 width: 12.0,
             }],
             None,
+            vec![RowHeightRange {
+                min: 3,
+                max: 3,
+                height_pt: 30.0,
+            }],
+            None,
             merge_regions,
         )
         .unwrap();
@@ -126,6 +136,7 @@ mod tests {
             sheet.get(CellRef { row: 3, col: 1 })
         );
         assert_eq!(sheet.column_width(1), Some(12.0));
+        assert_eq!(sheet.row_height(3), Some(30.0));
     }
 
     #[test]
@@ -159,6 +170,8 @@ mod tests {
             false,
             vec![],
             None,
+            vec![],
+            None,
             bad_merge_regions,
         )
         .unwrap_err();
@@ -180,6 +193,8 @@ mod tests {
             &[],
             &stylesheet,
             false,
+            vec![],
+            None,
             vec![],
             None,
             vec![],

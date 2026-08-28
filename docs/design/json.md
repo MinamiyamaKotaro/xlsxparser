@@ -96,6 +96,11 @@ impl<'a> Serialize for JsonSheet<'a> {
         // （Issue #36のレビュー議論で提起）。
         state.serialize_field("defaultColumnWidth", &self.sheet.default_col_width())?;
         state.serialize_field("columns", &ColumnSeq { sheet: self.sheet })?;
+        // `defaultRowHeight`/`rows`（姉妹プロジェクトexceldiffのIssue #51）:
+        // `columns`と全く同じ「シート単位の配列」設計を行の高さにも
+        // 対称に適用したもの。
+        state.serialize_field("defaultRowHeight", &self.sheet.default_row_height())?;
+        state.serialize_field("rows", &RowSeq { sheet: self.sheet })?;
         state.serialize_field("cells", &CellSeq { sheet: self.sheet })?;
         state.end()
     }
@@ -341,6 +346,7 @@ fn visibility_tag(v: SheetVisibility) -> &'static str {
 - **多数のセルを持つシートに対し `to_json_writer` を呼び出した際、`Sheet` 自体のメモリ使用量に対して追加のヒープ確保が有意に増加しない（`JsonCell` のVec化が行われていない）ことを検証する回帰テスト**（PR #10 レビューで指摘されたピークメモリ抑制の設計意図を裏付けるテスト。具体的な検証手法はメモリプロファイリングツールの選定と合わせて実装時に確定させる）
 - `to_json_writer` に書き込み途中で失敗する `Write` 実装（テスト用のモック）を渡した場合に `Error::JsonSerialize` が伝播することの確認
 - **`Sheet::col_width_ranges`/`default_col_width` がシート単位の `columns` 配列/`defaultColumnWidth` フィールドとしてシリアライズされ、個々のセルオブジェクトに複製されないことの確認**（Issue #39。「セルごとではなくシート単位の配列」という設計判断そのものを検証する。model/sheet.md参照）
+- **`Sheet::row_height_ranges`/`default_row_height` が同様にシート単位の `rows` 配列/`defaultRowHeight` フィールドとしてシリアライズされ、個々のセルオブジェクトに複製されないことの確認**（姉妹プロジェクトexceldiffのIssue #51。`columns`と対称な設計判断の検証）
 - **`Sheet::images` がシート単位の `images` 配列としてシリアライズされること、`TwoCell` アンカーが `{"type":"twoCell","from":...,"to":...}`、`OneCell` アンカーが `{"type":"oneCell","from":...,"ext":...}` を出力すること、画像がハイパーリンクを持たない場合は `hyperlink` が(`null` ではなく)省略されることの確認**（Issue #65）
 - **スタイルを持つセルの `font`(`size_pt`/`bold`)がセル単位の `style` オブジェクトの下にネストしてシリアライズされ、スタイルを持たないセル(`Cell.style: None`)では `style` フィールド自体が省略されることの確認**（Issue #38。フォントは同じ列内でもセルごとに本当に変わりうるため、`columns` とは逆の疎性判断になる）
 - **`style.wrapText` が `style.font` と同じセル単位の `style` オブジェクトの下に、`true`/`false` いずれの場合もシリアライズされることの確認**（Issue #37。`JsonStyle` が常に両フィールドを一緒に持つようになったため、`font` で確立済みの「スタイルあり/なし」の疎性配線をそのまま再利用する）
